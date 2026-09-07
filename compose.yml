@@ -84,5 +84,27 @@ services:
       - traefik.http.routers.backend-http.rule=Host(`${DOMAIN:-localhost}`)
       - traefik.http.routers.backend-http.entrypoints=http
 
+  agent:
+    image: agent:latest
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+        restart: true
+    environment:
+      # Own settings DB: dedicated `agent` database on the project's Postgres.
+      AGENT_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Variable not set}@db:5432/agent
+      # Binance read-only market DB (see agent/README.md).
+      BINANCE_DB_URL: ${BINANCE_DB_URL:-}
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET:-}
+      BINANCE_TESTNET_API_KEY: ${BINANCE_TESTNET_API_KEY:-}
+      BINANCE_TESTNET_API_SECRET: ${BINANCE_TESTNET_API_SECRET:-}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    # NOTE: no public ports / Traefik labels on purpose.
+    # The UI must reach the agent only through the backend.
+
 volumes:
   app-db-data:
