@@ -8,6 +8,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.0,<3.0.0",
     "psycopg[binary]>=3.3.4,<4.0.0",
     "httpx<1.0.0,>=0.25.1",
+    "binance-sdk-spot>=11.3.0",
 ]
 
 [dependency-groups]
