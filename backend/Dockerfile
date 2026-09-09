@@ -62,4 +62,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 WORKDIR /app/backend/
 
+# Apply migrations + initial data on start, then run the real command (CMD or a
+# Compose `command:` override). See scripts/entrypoint.sh.
+ENTRYPOINT ["bash", "/app/backend/scripts/entrypoint.sh"]
+
 CMD ["fastapi", "run", "--workers", "4"]

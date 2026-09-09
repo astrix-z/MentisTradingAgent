@@ -59,15 +59,20 @@ function Trading() {
   const { data: status, isLoading } = useQuery(tradingStatusQueryOptions())
   const runningIntent = status?.running ?? false
 
-  // Start parameters (network + strategy) are edited locally and sent along
-  // with the start command. Seed them once from the server snapshot.
+  // Start parameters (network + strategy + protector + symbols) are edited
+  // locally and sent along with the start command. Seed them once from the
+  // server snapshot.
   const [network, setNetwork] = useState<Network>("testnet")
   const [strategy, setStrategy] = useState("")
+  const [protector, setProtector] = useState("")
+  const [symbolsInput, setSymbolsInput] = useState("")
   const seeded = useRef(false)
   useEffect(() => {
     if (!seeded.current && status) {
       setNetwork(status.network ?? "testnet")
       setStrategy(status.strategy ?? "")
+      setProtector(status.protector ?? "")
+      setSymbolsInput((status.symbols ?? []).join(", "))
       seeded.current = true
     }
   }, [status])
@@ -97,6 +102,23 @@ function Trading() {
     }
   }, [requestTick, queryClient])
 
+  // Selectable strategies/protectors come from the agent (via the backend).
+  const { data: strategies } = useQuery({
+    queryKey: ["trading-strategies"],
+    queryFn: async () => (await TradingService.listStrategies()).data,
+  })
+  const { data: protectors } = useQuery({
+    queryKey: ["trading-protectors"],
+    queryFn: async () => (await TradingService.listProtectors()).data,
+  })
+  const strategyOptions = strategies ?? []
+  const protectorOptions = protectors ?? []
+
+  const parsedSymbols = symbolsInput
+    .split(",")
+    .map((symbol) => symbol.trim().toUpperCase())
+    .filter(Boolean)
+
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: ["trading-status"] })
 
@@ -121,11 +143,25 @@ function Trading() {
   const trimmedStrategy = strategy.trim()
 
   const startWith = (nextNetwork: Network, nextStrategy: string) => {
-    if (!nextStrategy) {
+    const name = nextStrategy.trim()
+    if (!name) {
       showErrorToast("Strategy name is required to start trading")
       return
     }
-    startMutation.mutate({ network: nextNetwork, strategy: nextStrategy })
+    if (!protector.trim()) {
+      showErrorToast("Choose a protector (position protection)")
+      return
+    }
+    if (parsedSymbols.length === 0) {
+      showErrorToast("Enter at least one symbol to trade (e.g. BTCUSDT)")
+      return
+    }
+    startMutation.mutate({
+      network: nextNetwork,
+      strategy: name,
+      protector,
+      symbols: parsedSymbols,
+    })
   }
 
   const onRunningChange = (checked: boolean) => {
@@ -146,6 +182,19 @@ function Trading() {
 
   const onStrategyApply = () => {
     if (runningIntent && strategy !== status?.strategy) {
+      startWith(network, trimmedStrategy)
+    }
+  }
+
+  const onProtectorApply = () => {
+    if (runningIntent && protector !== (status?.protector ?? "")) {
+      startWith(network, trimmedStrategy)
+    }
+  }
+
+  const onSymbolsApply = () => {
+    const current = (status?.symbols ?? []).join(",")
+    if (runningIntent && parsedSymbols.join(",") !== current) {
       startWith(network, trimmedStrategy)
     }
   }
@@ -221,11 +270,57 @@ function Trading() {
                   <Label htmlFor="strategy">Strategy name</Label>
                   <Input
                     id="strategy"
+                    list="strategies-list"
                     placeholder="e.g. grid"
                     value={strategy}
                     disabled={pending}
                     onChange={(event) => setStrategy(event.target.value)}
                     onBlur={onStrategyApply}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.currentTarget.blur()
+                      }
+                    }}
+                  />
+                  <datalist id="strategies-list">
+                    {strategyOptions.map((option) => (
+                      <option key={option} value={option} />
+                    ))}
+                  </datalist>
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="protector">Protector</Label>
+                  <Input
+                    id="protector"
+                    list="protectors-list"
+                    placeholder="e.g. trailing_stop"
+                    value={protector}
+                    disabled={pending}
+                    onChange={(event) => setProtector(event.target.value)}
+                    onBlur={onProtectorApply}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.currentTarget.blur()
+                      }
+                    }}
+                  />
+                  <datalist id="protectors-list">
+                    {protectorOptions.map((option) => (
+                      <option key={option} value={option} />
+                    ))}
+                  </datalist>
+                </div>
+
+                <div className="flex flex-col gap-2">
+                  <Label htmlFor="symbols">Symbols</Label>
+                  <Input
+                    id="symbols"
+                    placeholder="e.g. BTCUSDT, ETHUSDT"
+                    value={symbolsInput}
+                    disabled={pending}
+                    onChange={(event) => setSymbolsInput(event.target.value)}
+                    onBlur={onSymbolsApply}
                     onKeyDown={(event) => {
                       if (event.key === "Enter") {
                         event.currentTarget.blur()
@@ -287,6 +382,20 @@ function Trading() {
                   <span className="text-muted-foreground">Strategy</span>
                   <span className="font-medium">{status?.strategy ?? "—"}</span>
                 </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-muted-foreground">Protector</span>
+                  <span className="font-medium">
+                    {status?.protector ?? "—"}
+                  </span>
+                </div>
+                {(status?.symbols?.length ?? 0) > 0 && (
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-muted-foreground">Symbols</span>
+                    <span className="truncate text-right font-medium">
+                      {status?.symbols?.join(", ")}
+                    </span>
+                  </div>
+                )}
                 {status?.message && (
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-muted-foreground">Message</span>

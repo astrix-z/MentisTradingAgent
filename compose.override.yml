@@ -71,12 +71,14 @@ services:
       SMTP_TLS: "false"
 
   mailpit:
+    profiles: ["extras"]
     image: axllent/mailpit
     ports:
       - "8025:8025"
       - "1025:1025"
 
   playwright:
+    profiles: ["extras"]
     build:
       context: .
       dockerfile: frontend/Dockerfile.playwright

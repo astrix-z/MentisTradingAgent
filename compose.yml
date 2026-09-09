@@ -5,6 +5,10 @@ name: mentis
 services:
 
   proxy:
+    # Runs only when explicitly enabled (avoids needing the privileged host port
+    # 80 and the docker.sock mount for a plain local `docker compose up`).
+    # Enable with: docker compose --profile extras up -d
+    profiles: ["extras"]
     image: traefik:v3.7
     volumes:
       # Add Docker as a mounted volume, so that Traefik can read the labels of other services
@@ -45,6 +49,7 @@ services:
       timeout: 5s
 
   adminer:
+    profiles: ["extras"]
     image: adminer
     depends_on:
       - db

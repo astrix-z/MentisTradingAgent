@@ -251,7 +251,7 @@ export type PrivateUserCreate = {
 /**
  * StartPayload
  *
- * Payload of the ``start`` command.
+ * Payload of the ``start`` command (strategy/protector/symbols/params).
  */
 export type StartPayload = {
     /**
@@ -262,6 +262,20 @@ export type StartPayload = {
      * Strategy
      */
     strategy: string;
+    /**
+     * Protector
+     */
+    protector?: string | null;
+    /**
+     * Symbols
+     */
+    symbols?: Array<string>;
+    /**
+     * Params
+     */
+    params?: {
+        [key: string]: unknown;
+    };
 };
 
 /**
@@ -296,6 +310,14 @@ export type TradingStatus = {
      * Strategy
      */
     strategy?: string | null;
+    /**
+     * Protector
+     */
+    protector?: string | null;
+    /**
+     * Symbols
+     */
+    symbols?: Array<string>;
     /**
      * State
      */
@@ -1064,6 +1086,42 @@ export type itemsUpdateItemResponses = {
 };
 
 export type itemsUpdateItemResponse = itemsUpdateItemResponses[keyof itemsUpdateItemResponses];
+
+export type tradingListStrategiesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/strategies/';
+};
+
+export type tradingListStrategiesResponses = {
+    /**
+     * Response Trading-List Strategies
+     *
+     * Successful Response
+     */
+    200: Array<string>;
+};
+
+export type tradingListStrategiesResponse = tradingListStrategiesResponses[keyof tradingListStrategiesResponses];
+
+export type tradingListProtectorsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/protectors/';
+};
+
+export type tradingListProtectorsResponses = {
+    /**
+     * Response Trading-List Protectors
+     *
+     * Successful Response
+     */
+    200: Array<string>;
+};
+
+export type tradingListProtectorsResponse = tradingListProtectorsResponses[keyof tradingListProtectorsResponses];
 
 export type tradingIssueCommandData = {
     body: CommandRequest;

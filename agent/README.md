@@ -49,11 +49,20 @@ two Alembic trees fighting over one catalog:
 
 - `agent/main.py` — asyncio entry point / daemon loop. Subscribes to the
   command channel and dispatches commands to their handlers; reports liveness.
-- `agent/engine.py` — the trading engine (holds network/strategy + state) and
-  the Redis keys/heartbeat. ``_trading_loop`` is a placeholder for the real
-  trading logic.
+- `agent/engine.py` — the trading engine: `start_run()` composes the trading
+  pipeline (market feed, execution, portfolio, risk, fill tracker) and drives it
+  with a tick loop `_run_loop()` (quote -> fills -> strategy -> protector);
+  reports liveness through Redis keys/heartbeat. A legacy `start()` keeps the
+  account balance refreshed for backends that don't send a full run yet.
 - `agent/commands.py` — command envelope + handler registry (``@command``
   decorator) and boot-time resume from the runtime snapshot.
+- `agent/marketdata.py`, `agent/portfolio.py`, `agent/risk.py`, `agent/fills.py`
+  — shared quote cache, position book, risk gate and fill detection.
+- `agent/strategies/` — decision strategies (registry `@strategy`, e.g. `grid`).
+- `agent/protection/` — position-protection algorithms (registry `@protector`,
+  e.g. `trailing_stop`).
 - `agent/core/config.py` — pydantic-settings.
 - `agent/core/db.py` — async engines (own settings DB + external read-only DB).
-- `agent/exchange/` — exchange REST/websocket clients (to be implemented).
+- `agent/exchange/` — Binance Spot REST (`binance.py`), order execution
+  (`execution.py`), order types (`order_types.py`) and market-data websocket
+  (`streams.py`).

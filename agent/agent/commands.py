@@ -32,8 +32,24 @@ from redis.exceptions import RedisError
 
 from agent.engine import REDIS_RESULT_KEY, REDIS_RUNTIME_KEY, Engine
 from agent.exchange import ExchangeError
+from agent.protection import PROTECTORS
+from agent.strategies import STRATEGIES
 
 logger = logging.getLogger(__name__)
+
+
+def _default_protector() -> str:
+    """Fallback protector when the command does not name one."""
+    if "trailing_stop" in PROTECTORS:
+        return "trailing_stop"
+    return next(iter(PROTECTORS), "")
+
+
+def _as_params(value: Any) -> dict[str, Any]:
+    """Coerce a command payload slice into a ``str -> Any`` params dict."""
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): val for key, val in value.items()}
 
 
 class AgentCommand:
@@ -138,7 +154,45 @@ async def dispatch(engine: Engine, redis: Redis, raw: str) -> None:
 async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
     network = str(payload.get("network") or "testnet")
     strategy = str(payload.get("strategy") or "")
-    logger.info("command start: network=%s strategy=%s", network, strategy)
+    protector = str(payload.get("protector") or _default_protector())
+    symbols_raw = payload.get("symbols") or []
+    symbols = [str(s).upper() for s in symbols_raw]
+    params = _as_params(payload.get("params"))
+    logger.info(
+        "command start: network=%s strategy=%s protector=%s symbols=%s",
+        network,
+        strategy,
+        protector,
+        symbols,
+    )
+
+    # A full run needs symbols (and a registered strategy/protector); backends
+    # that do not send them yet keep the legacy balance mode via ``start``.
+    if symbols:
+        try:
+            await ctx.engine.start_run(
+                network=network,
+                strategy=strategy,
+                protector=protector,
+                symbols=symbols,
+                params=params,
+            )
+        except ValueError as exc:
+            logger.warning("start_run rejected: %s", exc)
+            await ctx.report(ok=False, message=str(exc))
+            return
+        await ctx.report(
+            ok=True,
+            data={
+                "running": True,
+                "network": network,
+                "strategy": strategy,
+                "protector": protector,
+                "symbols": symbols,
+            },
+        )
+        return
+
     await ctx.engine.start(network=network, strategy=strategy)
     await ctx.report(
         ok=True, data={"running": True, "network": network, "strategy": strategy}
@@ -185,7 +239,24 @@ async def resume_from_runtime(engine: Engine, redis: Redis) -> None:
     if data.get("running"):
         network = str(data.get("network") or "testnet")
         strategy = str(data.get("strategy") or "")
+        symbols = [str(s).upper() for s in (data.get("symbols") or [])]
+        protector = str(data.get("protector") or _default_protector())
+        params = _as_params(data.get("params"))
         logger.info(
-            "resuming engine from snapshot: network=%s strategy=%s", network, strategy
+            "resuming engine from snapshot: network=%s strategy=%s protector=%s "
+            "symbols=%s",
+            network,
+            strategy,
+            protector,
+            symbols,
         )
-        await engine.start(network=network, strategy=strategy)
+        if symbols and strategy in STRATEGIES and protector in PROTECTORS:
+            await engine.start_run(
+                network=network,
+                strategy=strategy,
+                protector=protector,
+                symbols=symbols,
+                params=params,
+            )
+        else:
+            await engine.start(network=network, strategy=strategy)
