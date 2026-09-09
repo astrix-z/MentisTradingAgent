@@ -1,3 +1,7 @@
+# Fixed project name so containers/networks/volumes are namespaced under
+# `mentis_*` and cannot clash with other Docker Compose projects on this host.
+name: mentis
+
 services:
 
   proxy:
@@ -31,6 +35,15 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Variable not set}
       - POSTGRES_DB=app
 
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+      timeout: 5s
+
   adminer:
     image: adminer
     depends_on:
@@ -47,11 +60,13 @@ services:
       - traefik.http.services.adminer.loadbalancer.server.port=8080
 
   backend:
-    image: backend:latest
+    image: mentis-backend:latest
     depends_on:
       db:
         condition: service_healthy
         restart: true
+      redis:
+        condition: service_healthy
     environment:
       PROJECT_NAME: ${PROJECT_NAME:?Variable not set}
       SECRET_KEY: ${SECRET_KEY:?Variable not set}
@@ -62,6 +77,8 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       EMAILS_FROM_EMAIL: ${EMAILS_FROM_EMAIL}
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Variable not set}@db:5432/app
+      # Control/status plane between backend and agent (commands + liveness).
+      REDIS_URL: redis://redis:6379/0
       SENTRY_DSN: ${SENTRY_DSN:-}
 
     healthcheck:
@@ -85,7 +102,7 @@ services:
       - traefik.http.routers.backend-http.entrypoints=http
 
   agent:
-    image: agent:latest
+    image: mentis-agent:latest
     build:
       context: .
       dockerfile: agent/Dockerfile
@@ -93,7 +110,11 @@ services:
       db:
         condition: service_healthy
         restart: true
+      redis:
+        condition: service_healthy
     environment:
+      # Control/status plane between backend and agent (commands + liveness).
+      REDIS_URL: redis://redis:6379/0
       # Own settings DB: dedicated `agent` database on the project's Postgres.
       AGENT_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Variable not set}@db:5432/agent
       # Binance read-only market DB (see agent/README.md).

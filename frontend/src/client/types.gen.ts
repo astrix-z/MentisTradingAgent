@@ -35,6 +35,84 @@ export type Body_login_login_access_token = {
 };
 
 /**
+ * CommandEnvelope
+ *
+ * A command as it travels over the channel to the agent.
+ */
+export type CommandEnvelope = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Type
+     */
+    type: string;
+    /**
+     * Payload
+     */
+    payload?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Issued At
+     */
+    issued_at: string;
+};
+
+/**
+ * CommandRequest
+ *
+ * Generic command request: ``{"type": "...", "payload": {...}}``.
+ */
+export type CommandRequest = {
+    /**
+     * Type
+     */
+    type: 'start' | 'stop' | 'balance';
+    /**
+     * Payload
+     */
+    payload?: {
+        [key: string]: unknown;
+    };
+};
+
+/**
+ * CommandResult
+ *
+ * The most recent command result produced by the agent.
+ */
+export type CommandResult = {
+    /**
+     * Command Id
+     */
+    command_id: string;
+    /**
+     * Type
+     */
+    type: string;
+    /**
+     * Ok
+     */
+    ok: boolean;
+    /**
+     * Data
+     */
+    data?: {
+        [key: string]: unknown;
+    } | Array<unknown> | null;
+    /**
+     * Message
+     */
+    message?: string | null;
+    /**
+     * At
+     */
+    at: string;
+};
+
+/**
  * HTTPValidationError
  */
 export type HTTPValidationError = {
@@ -123,6 +201,18 @@ export type Message = {
 };
 
 /**
+ * NetworkRequest
+ *
+ * Optional body carrying the target network (e.g. for ``balance``).
+ */
+export type NetworkRequest = {
+    /**
+     * Network
+     */
+    network?: 'testnet' | 'live';
+};
+
+/**
  * NewPassword
  */
 export type NewPassword = {
@@ -159,6 +249,22 @@ export type PrivateUserCreate = {
 };
 
 /**
+ * StartPayload
+ *
+ * Payload of the ``start`` command.
+ */
+export type StartPayload = {
+    /**
+     * Network
+     */
+    network?: 'testnet' | 'live';
+    /**
+     * Strategy
+     */
+    strategy: string;
+};
+
+/**
  * Token
  */
 export type Token = {
@@ -170,6 +276,44 @@ export type Token = {
      * Token Type
      */
     token_type?: string;
+};
+
+/**
+ * TradingStatus
+ *
+ * Intent (snapshot) + agent liveness (heartbeat) for the UI.
+ */
+export type TradingStatus = {
+    /**
+     * Running
+     */
+    running?: boolean;
+    /**
+     * Network
+     */
+    network?: 'testnet' | 'live' | null;
+    /**
+     * Strategy
+     */
+    strategy?: string | null;
+    /**
+     * State
+     */
+    state?: 'running' | 'idle' | 'error' | null;
+    /**
+     * Message
+     */
+    message?: string | null;
+    /**
+     * Balances
+     */
+    balances?: {
+        [key: string]: number;
+    } | null;
+    /**
+     * Online
+     */
+    online: boolean;
 };
 
 /**
@@ -920,6 +1064,134 @@ export type itemsUpdateItemResponses = {
 };
 
 export type itemsUpdateItemResponse = itemsUpdateItemResponses[keyof itemsUpdateItemResponses];
+
+export type tradingIssueCommandData = {
+    body: CommandRequest;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/commands/';
+};
+
+export type tradingIssueCommandErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type tradingIssueCommandError = tradingIssueCommandErrors[keyof tradingIssueCommandErrors];
+
+export type tradingIssueCommandResponses = {
+    /**
+     * Successful Response
+     */
+    202: CommandEnvelope;
+};
+
+export type tradingIssueCommandResponse = tradingIssueCommandResponses[keyof tradingIssueCommandResponses];
+
+export type tradingStartTradingData = {
+    body: StartPayload;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/start/';
+};
+
+export type tradingStartTradingErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type tradingStartTradingError = tradingStartTradingErrors[keyof tradingStartTradingErrors];
+
+export type tradingStartTradingResponses = {
+    /**
+     * Successful Response
+     */
+    202: CommandEnvelope;
+};
+
+export type tradingStartTradingResponse = tradingStartTradingResponses[keyof tradingStartTradingResponses];
+
+export type tradingStopTradingData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/stop/';
+};
+
+export type tradingStopTradingResponses = {
+    /**
+     * Successful Response
+     */
+    202: CommandEnvelope;
+};
+
+export type tradingStopTradingResponse = tradingStopTradingResponses[keyof tradingStopTradingResponses];
+
+export type tradingFetchBalanceData = {
+    /**
+     * Request
+     */
+    body?: NetworkRequest | null;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/balance/';
+};
+
+export type tradingFetchBalanceErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type tradingFetchBalanceError = tradingFetchBalanceErrors[keyof tradingFetchBalanceErrors];
+
+export type tradingFetchBalanceResponses = {
+    /**
+     * Successful Response
+     */
+    202: CommandEnvelope;
+};
+
+export type tradingFetchBalanceResponse = tradingFetchBalanceResponses[keyof tradingFetchBalanceResponses];
+
+export type tradingGetCommandResultData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/result/';
+};
+
+export type tradingGetCommandResultResponses = {
+    /**
+     * Response Trading-Get Command Result
+     *
+     * Successful Response
+     */
+    200: CommandResult | null;
+};
+
+export type tradingGetCommandResultResponse = tradingGetCommandResultResponses[keyof tradingGetCommandResultResponses];
+
+export type tradingGetStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/status/';
+};
+
+export type tradingGetStatusResponses = {
+    /**
+     * Successful Response
+     */
+    200: TradingStatus;
+};
+
+export type tradingGetStatusResponse = tradingGetStatusResponses[keyof tradingGetStatusResponses];
 
 export type privateCreateUserData = {
     body: PrivateUserCreate;

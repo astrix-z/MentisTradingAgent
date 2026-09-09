@@ -22,9 +22,12 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    AGENT_NAME: str = "agent"
+    AGENT_NAME: str = "MentisAgent"
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     ENVIRONMENT: Literal["development", "production"] = "development"
+
+    # Control/status plane between backend and agent (commands + liveness).
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     # Own settings DB: a dedicated database on the project's Postgres.
     # Optional at boot so the daemon can start and report a warning if missing.
@@ -48,4 +51,4 @@ class Settings(BaseSettings):
         return _normalize_db_url(value)
 
 
-settings = Settings()  # type: ignore # ty: ignore[unused-ignore-comment]
+settings = Settings()

@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     SENTRY_DSN: HttpUrl | None = None
     DATABASE_URL: PostgresDsn
 
+    # Control/status plane between backend and agent (commands + liveness).
+    REDIS_URL: str = "redis://localhost:6379/0"
+
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
     def _use_psycopg_driver(cls, value: str | PostgresDsn) -> str:

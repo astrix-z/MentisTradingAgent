@@ -8,6 +8,8 @@ ENV/
 env.bak/
 venv.bak/
 
+tmp/
+
 .vscode/*
 !.vscode/extensions.json
 node_modules/
