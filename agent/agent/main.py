@@ -18,7 +18,7 @@ import signal
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from agent import commands
+from agent.common import commands
 from agent.core import db
 from agent.core.config import settings
 from agent.engine import HEARTBEAT_INTERVAL, REDIS_COMMAND_CHANNEL, Engine

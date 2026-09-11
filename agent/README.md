@@ -54,9 +54,9 @@ two Alembic trees fighting over one catalog:
   with a tick loop `_run_loop()` (quote -> fills -> strategy -> protector);
   reports liveness through Redis keys/heartbeat. A legacy `start()` keeps the
   account balance refreshed for backends that don't send a full run yet.
-- `agent/commands.py` — command envelope + handler registry (``@command``
+- `agent/common/commands.py` — command envelope + handler registry (``@command``
   decorator) and boot-time resume from the runtime snapshot.
-- `agent/marketdata.py`, `agent/portfolio.py`, `agent/risk.py`, `agent/fills.py`
+- `agent/marketdata.py`, `agent/portfolio.py`, `agent/common/risk.py`, `agent/fills.py`
   — shared quote cache, position book, risk gate and fill detection.
 - `agent/strategies/` — decision strategies (registry `@strategy`, e.g. `grid`).
 - `agent/protection/` — position-protection algorithms (registry `@protector`,

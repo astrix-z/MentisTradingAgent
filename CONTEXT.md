@@ -26,7 +26,7 @@
 | Слой | Точки входа (главное) |
 |---|---|
 | Backend API | `backend/app/api/routes/trading.py` (командный контур), `backend/app/api/main.py` (регистрация роутеров), `backend/app/core/redis_client.py`, `backend/app/main.py` (lifespan), `backend/app/core/config.py` |
-| Agent | `agent/agent/main.py` (подписка/диспетчер), `agent/agent/commands.py` (реестр `@command`), `agent/agent/engine.py` (движок, heartbeat), `agent/agent/exchange/binance.py` (обёртка `binance-sdk-spot`), `agent/agent/core/config.py` |
+| Agent | `agent/agent/main.py` (подписка/диспетчер), `agent/agent/common/commands.py` (реестр `@command`), `agent/agent/engine.py` (движок, heartbeat), `agent/agent/exchange/binance.py` (обёртка `binance-sdk-spot`), `agent/agent/core/config.py` |
 | Frontend | `frontend/src/routes/_layout/trading.tsx` (страница Trading), `frontend/src/client/*` (сгенерировано, НЕ править руками) |
 | Deploy | `compose.yml` + `compose.override.yml` (имя проекта `mentis`, образы `mentis-backend`/`mentis-agent`), `.env` |
 
@@ -223,7 +223,7 @@ place 4), stop гасит лэддер — ок. **Хвост:** engine ещё �
 торгового цикла). Следующий шаг — protection/ (первый алгоритм trailing_stop).
 
 ### [2026-09-09] Шаг 4: risk.py (риск-гейт между решением и исполнением)
-По DESIGN.md шаг 4. **Файл:** `agent/agent/risk.py` (новый). `RiskLimits` (max_symbols,
+По DESIGN.md шаг 4. **Файл:** `agent/agent/common/risk.py` (новый). `RiskLimits` (max_symbols,
 max_position_notional, max_total_notional, max_open_orders, max_daily_loss), `RiskDecision`
 (ok/reject), `RiskError(ExchangeError)`, `RiskManager(portfolio, market, limits, orders_provider)`. 
 `can_place(order, quote_price)` / `assert_can_place` (raise). Правила: SELL (снижение риска)
@@ -310,7 +310,7 @@ Status (`status.balances` из heartbeat агента) и в Command Result (`co
 **Решение:** команда `balance` теперь несёт целевую сеть; движок умеет запрашивать
 баланс по произвольной сети; ошибки пробрасываются и показываются в UI.
 **Файлы:** `agent/agent/engine.py` (`fetch_account_balance(network=...)`, свойство
-`network`, `_connected_network`), `agent/agent/commands.py` (`_balance` + `ExchangeError`),
+`network`, `_connected_network`), `agent/agent/common/commands.py` (`_balance` + `ExchangeError`),
 `backend/app/api/routes/trading.py` (`NetworkRequest`, `POST /trading/balance` c телом,
 передача payload в generic-ручке), frontend `trading.tsx` + перегенерация клиента.
 **Проверено:** ruff+mypy (обоих), biome+tsc+vite build; по API live-баланс вернул
