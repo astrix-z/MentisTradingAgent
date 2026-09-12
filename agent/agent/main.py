@@ -29,9 +29,7 @@ _POLL_QUANTUM = 0.2  # how often the listener wakes to check the stop flag
 _RECONNECT_DELAY = 2.0
 
 
-async def _listen(
-    redis: Redis, engine: Engine, stop: asyncio.Event
-) -> None:
+async def _listen(redis: Redis, engine: Engine, stop: asyncio.Event) -> None:
     """Subscribe to the command channel and dispatch incoming commands."""
     while not stop.is_set():
         try:

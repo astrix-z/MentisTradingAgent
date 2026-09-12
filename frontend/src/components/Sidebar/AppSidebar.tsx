@@ -1,4 +1,4 @@
-import { Activity, Briefcase, Home, Users } from "lucide-react"
+import { Activity, Briefcase, Crosshair, Home, Users } from "lucide-react"
 
 import { SidebarAppearance } from "@/components/Common/Appearance"
 import { Logo } from "@/components/Common/Logo"
@@ -27,6 +27,11 @@ export function AppSidebar() {
           icon: Activity,
           title: "Trading",
           path: "/trading",
+        },
+        {
+          icon: Crosshair,
+          title: "Strategy",
+          path: "/strategy",
         },
         { icon: Users, title: "Admin", path: "/admin" },
       ]

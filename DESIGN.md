@@ -1,155 +1,171 @@
 # Agent trading logic — DESIGN
 
-Документ описывает, **как и куда** встраивается логика работы агента (торговый цикл)
-поверх существующей командной модели (Redis) в `agent/`. Он задаёт границы модулей,
-чтобы добавлять новую стратегию/защитника можно было новым файлом + декоратором, не
-трогая движок и команды.
+Документ описывает, **как организован агент**: Стратегия — это его ядро,
+а всё остальное — сервисная обвязка вокруг неё. Здесь зафиксированы границы
+модулей и жёсткое требование по работе с биржей, чтобы новые стратегии и
+сервисные функции добавлялись предсказуемо.
 
-## Терминология
+## Ключевые принципы
 
-| Термин | Смысл |
+1. **Стратегия — основа Агента.** Стратегия анализирует данные и принимает
+   решения. Обвязка (потоки данных, ордера, жизненный цикл, heartbeat) не
+   содержит торговой логики и существует, чтобы обслуживать Стратегию.
+2. **Работа с биржей — только через `binance_sdk_spot`.** Никаких своих моделей
+   (`Quote`, `MarketData`, `NewOrder`, `OrderStatus`, ...): всё это есть в SDK.
+   Разрешены лишь тонкие адаптеры над SDK (см. §3). Документация и примеры —
+   в `binance-spot/docs/`, `binance-spot/examples/`.
+3. **Boot-off.** Система стартует с выключенной Стратегией; запуск — только
+   командой `start` с настройками со страницы UI.
+4. **Один канал backend↔agent — Redis** (команды + снапшот + heartbeat + события).
+   У каждого сервиса своя БД; чужую схему никто не читает и не пишет.
+
+## Роли
+
+| Слой | Смысл |
 |---|---|
-| Decision / strategy | «что хочу сделать» — решает, когда входить/выходить; выдаёт *intent*. |
-| Execution / orders | «как сделать» — единый слой работы с ордерами биржи. |
-| Market data | websocket-потоки котировок отслеживаемых пар. |
-| Protection / protector | оверлей защиты поверх открытых позиций (SL/trailing). |
-| Portfolio | локальное состояние открытых позиций/сделок (единый источник правды). |
-| Risk | глобальный guard между решением и исполнением (лимиты). |
+| Strategy | ядро: анализ данных, эмиссия `Signal(ENTRY/EXIT/HOLD)` + provenance |
+| Engine | жизненный цикл Стратегии, сборка сервисов, heartbeat, события |
+| Commands | конверт команды + реестр обработчиков (`start`/`stop`/`balance`) |
+| Exchange (adapters) | тонкие async-обёртки над `binance_sdk_spot` (REST + WS) |
+| Backend | публикует команды, хранит снапшот намерения, отдаёт статус/результат |
+| Frontend | страница `/strategy`: настройки Стратегии + Start/Stop |
 
-## Ключевой принцип
+Стратегия **не обращается к бирже напрямую** и **не определяет** размер позиции,
+тип ордера, цену исполнения или защиту (`D-SIGNAL-ONLY`). Эти слои — следующие
+шаги (см. §6).
 
-Разделить **решение**, **исполнение**, **защиту** и **лимиты**. Стратегия и защитник
-**никогда не трогают биржу напрямую** — только через слой исполнения. Поэтому ордера,
-websocket и позиции общие для всех стратегий.
-
-```
-marketdata (websocket котировки)
-   │  tick по каждому отслеживаемому символу
-   ▼
-Engine._run_loop ──► Стратегия (решает)            [strategies/]
-        │                       │  intent
-        │                       ▼
-        │                Risk-гейт (лимиты)             [risk.py]
-        │                       │  одобрено
-        │                       ▼
-        │                Execution / OrderService       [exchange/orders или методы BinanceSpot]
-        │                       │  fill / ордер
-        │                       ▼
-        └──► Portfolio (позиции, pnl) ──► Protector (защитные ордера)   [protection/]
-                                            (над любой позицией, независимо от стратегии)
-```
-
-## Структура пакета `agent/agent/`
+## 1. Структура пакета `agent/agent/`
 
 ```
 agent/agent/
-├── commands.py        # (сущ.) start/stop/balance; + выбор strategy/protector, switch_strategy
-├── engine.py          # (сущ.) ТОЧКА ПОДКЛЮЧЕНИЯ: Engine.start_run()/._run_loop()
-├── core/config.py     # (сущ.) + дефолтные пары, protector, риск-параметры
+├── main.py                    # демон: подписка на Redis + heartbeat
+├── engine.py                  # Engine: lifecycle, сборка сервисов, heartbeat, events
+├── common/
+│   └── commands.py            # конверт/реестр @command + start/stop/balance + resume
 ├── exchange/
-│   ├── binance.py     # (сущ.) BinanceSpot: сеть + баланс; + методы ОРДЕРОВ
-│   ├── streams.py     # [НОВОЕ] websocket-клиент (обёртка SpotWebSocketStreams)
-│   └── __init__.py
-├── strategies/        # [НОВЫЙ пакет] стратегии принятия решений
-│   ├── base.py        #    абстрактный Strategy + декоратор @strategy("name")
-│   ├── __init__.py    #    реестр STRATEGIES
-│   └── grid.py        #    @strategy("grid")
-├── protection/        # [НОВЫЙ пакет] алгоритмы защиты позиции
-│   ├── base.py        #    абстрактный Protector + декоратор @protector("name")
-│   ├── __init__.py    #    реестр PROTECTORS
-│   └── trailing_stop.py
-├── risk.py            # [НОВОЕ] guard/лимиты поверх исполнения
-├── portfolio.py       # [НОВОЕ] состояние открытых позиций/сделок
-└── marketdata.py      # [НОВОЕ] общий кэш котировок на символ (последняя цена/книга)
+│   ├── rest.py                # ExchangeRest — async-обёртка Spot.rest_api
+│   └── streams.py             # MarketDataStreams — обёртка Spot.websocket_streams
+├── strategies/
+│   ├── base.py                # Strategy ABC, StrategyServices, Signal
+│   ├── registry.py            # @strategy(name), build_strategy
+│   ├── __init__.py            # публичный API + авто-импорт стратегий
+│   └── tripple_screen/        # конкретная Стратегия (spec STRATEGY_TRIPPLE_SCREEN)
+│       ├── settings.py        # TripleScreenSettings (параметры spec §10)
+│       ├── indicators.py      # EMA/SMA/Stochastic/Force Index (Decimal)
+│       └── strategy.py        # @strategy("tripple_screen")
+└── core/
+    ├── config.py              # pydantic-settings (.env)
+    └── db.py                  # движки БД (опционально)
 ```
 
-## Где подключаем логику
+Точка подключения торговой логики — **`strategies/`**. Движок и команды её не
+знают по имени: они резолвят имя стратегии через реестр.
 
-Точка подключения — `Engine` (`engine.py`). Режим **run** собирает пайплайн в
-`start_run(...)` и гонит его тик-циклом `_run_loop`:
+## 2. Поток запуска Стратегии
+
+```mermaid
+sequenceDiagram
+    participant UI as Frontend /strategy
+    participant BE as Backend
+    participant R as Redis
+    participant AG as Agent
+    participant EX as binance_sdk_spot
+    UI->>BE: Start {network, symbols, params}
+    BE->>R: publish agent:commands {type:"start", payload}
+    BE->>R: set agent:runtime (running=true, ...)
+    R-->>AG: сообщение канала
+    AG->>AG: build_strategy("tripple_screen", params)
+    AG->>EX: create_connection (ws streams)
+    AG->>EX: klines (bootstrap H4/H1/M15) + подписки
+    AG->>R: set trading:heartbeat (running)
+    EX-->>AG: kline close -> Signal(ENTRY/HOLD)
+    AG->>R: publish agent:events (signal)
+```
+
+- Старт идёт от кнопки на `/strategy`; настройки = `params` в команде `start`.
+- `Engine.start_run` валидирует `params` (через `TripleScreenSettings`), создаёт
+  Стретегию, собирает `StrategyServices` и вызывает `strategy.on_start`.
+- `Engine.stop` (или команда `stop`) гасит Стратегию и потоки, публикует `idle`.
+- `resume_from_runtime` при старте агента читает `agent:runtime`: если там
+  `running=true` и стратегия известна — восстанавливает ран с теми же настройками.
+
+## 3. Работа с биржей (обязательно через SDK)
+
+Два адаптера — единственное место, где агент говорит с Binance:
+
+- `exchange/rest.py` — `ExchangeRest`: `account`, `balances`, `klines`,
+  `ticker_price`, `exchange_info`, `new_order`, `cancel_order`, `open_orders`,
+  `get_order`. REST SDK блокирующий → всё через `asyncio.to_thread`. Возвращает
+  **родные модели** (`GetAccountResponseBalancesInner`, `NewOrderResponse`, ...).
+- `exchange/streams.py` — `MarketDataStreams`: одна WS-сессия
+  (`Spot.websocket_streams.create_connection`), подписки `kline`/`ticker`/
+  `book_ticker`; колбэки получают родные сообщения SDK (`KlineResponse`, ...).
+
+Конфигурация клиента: `Spot(config_rest_api=ConfigurationRestAPI(api_key,
+api_secret, base_path=<URL по сети>))` и
+`Spot(config_ws_streams=ConfigurationWebSocketStreams(stream_url=<URL по сети>))`,
+где URL и креды выбираются по `network` (`testnet`/`live`).
+
+**Анти-паттерн (запрещено):** собственные dataclass/pydantic-модели ордеров,
+котировок, баланса, свечей; ручной парсинг/маппинг enum'ов вместо SDK-enum;
+своя реализация переподключений WS (SDK уже это делает).
+
+## 4. Контракт Стратегии
 
 ```python
-async def start_run(self, *, network, strategy, protector, symbols, params):
-    market = MarketData(); feed = MarketDataFeed(market)
-    execution = ExecutionService(self._ensure_exchange(network))
-    portfolio = Portfolio()
-    risk = RiskManager(portfolio, market, ...)          # риск-гейт
-    fills = FillTracker(portfolio, execution)           # источник филлов
-    self._strategy  = STRATEGIES[strategy](params)
-    self._protector = PROTECTORS[protector](params)
-    await feed.start(network, symbols)                  # websocket
-    await strategy.on_start(sctx); await protector.on_start(pctx)
-
-async def _run_loop(self):
-    while running:
-        await self._market.wait_updated()               # свежий тик
-        await self._fills.reconcile()                   # филлы -> Portfolio
-        for symbol in self._symbols:
-            await self._strategy.on_tick(sctx, symbol)  # решение
-            await self._protector.on_tick(pctx, symbol) # защита
+class Strategy(abc.ABC):
+    name: ClassVar[str]                                  # ключ реестра
+    def __init__(self, params: dict[str, Any]) -> None: ...
+    async def on_start(self, services: StrategyServices) -> None: ...
+    async def on_stop(self) -> None: ...
+    # опционально: on_kline(symbol, interval, kline), on_price(symbol, price)
 ```
 
-Слои (marketdata/portfolio/execution/risk/fills) собраны по шагам 1–6 + филлы;
-текущий инкремент-статус — см. ЖУРНАЛ в `CONTEXT.md`.
+- `StrategyServices` — готовые `rest`, `streams`, `emit` (sink сигналов), сеть и
+  список символов. Стратегия не строит клиентов сама.
+- `Signal` — `type ∈ {ENTRY, EXIT, HOLD}`, `symbol`, `emitted_at`, а также
+  `reason`/`epoch_id`/`entry_ref`/`swing_low_ref`/`tp_rule`/`valid_until`/
+  `provenance`. Это выходной контракт стратегии, не модель биржи.
 
-Реестры (`STRATEGIES`, `PROTECTORS`) — по образцу `HANDLERS` из `commands.py`
-(декоратор + dict). `start`-команда валидирует имена и кладёт их в снапшот
-`agent:runtime` для resume после рестарта.
+## 5. Triple Screen (текущая Стратегия)
 
-## Части
+Спецификация: `docs/STRATEGY_TRIPPLE_SCREEN.md`. Реализация:
+`strategies/tripple_screen/`.
 
-### 1. Стратегии принятия решений — `strategies/` (выбираемые)
-- Базовый `Strategy` с хуками `on_start`, `on_tick(symbol, quote)`, `on_fill`, `on_stop`.
-- Стратегия возвращает **intent** (сигнал: buy/sell, символ, объём, лимит), исполнение — ниже.
-- Реестр `@strategy("name")`; выбор передаётся в `start {strategy}`.
-- Чтобы UI мог выбирать — GET `/trading/strategies` отдаёт имена из реестра.
+- `settings.py` — все параметры §10 (timeframes, EMA, Stochastic, FI, пороги,
+  стопы/TP, cooldown, лимиты данных) с дефолтами; `from_params` отбрасывает
+  незнакомые ключи.
+- `indicators.py` — чистые функции (`ema_series`, `sma_series`, `stochastic_k_series`,
+  `force_index_series`) и внутренний `Candle`; всё на `Decimal`.
+  **Seed-конвенция EMA — provisional** (SMA-seed), до `STRATEGY-05`.
+- `strategy.py` — `on_start` бутстрапит H4/H1/M15 через REST и подписывается на
+  WS kline; оценка на закрытии M15 (`BullishTide` → `PullbackUp` → триггер) даёт
+  `ENTRY`/`HOLD` с reason-кодами (`no_pullback`, `no_trigger`, `position_open`,
+  `cooldown`, `epoch_consumed`). Позиция/cooldown помечаются движком через
+  `mark_position_open`/`mark_position_closed` (execution lane — следующий шаг).
 
-### 2. Работа с ордерами биржи — `exchange/` + ExecutionService (независима от стратегии)
-- Методы на `BinanceSpot` (тонкие, network-aware, через `asyncio.to_thread`, т.к. REST блокирует):
-  `new_order`, `delete_order`, `get_order`, `get_open_orders`, `cancel_all(symbol)`, `order_oco`.
-- Над ним `ExecutionService`: единое место постановки/снятия, ретраи, защита от дублей.
-- Стратегия и защитник зовут только его → новые алгоритмы переиспользуют ордерный слой.
+## 6. Что ещё не реализовано (следующие слои обвязки)
 
-### 3. Реальные данные через websocket — `exchange/streams.py` + `marketdata.py`
-- Обёртка над `SpotWebSocketStreams` из SDK (есть `ticker`, `book_ticker`, `agg_trade`,
-  `diff_book_depth`, `kline`, авто-reconnect).
-- asyncio-фасад: `subscribe(symbols)`, колбэк на тик, `get_price(symbol)`.
-- Сеть выбирается по `network` (ws-URL prod/testnet разные).
-- `user_data`-поток (по listen-key) даёт реальные fills и изменения аккаунта → кормит Portfolio.
+Порядок — по спецификации:
 
-### 4. Логика защиты позиции — `protection/` (выбираемые алгоритмы, оверлей)
-- Работает **поверх любой стратегии**: следит за открытыми позициями и ценой,
-  переставляет защитные ордера (stop-loss, trailing, take-profit, тайм-выход).
-- Тот же паттерн `@protector("name")`; выбор в `start {protector}`.
+1. **Execution lane** — по `Signal` считать размер и ставить ордера через
+   `ExchangeRest` (округление под фильтры Binance, идемпотентные client-id).
+2. **Position monitoring (spec §7)** — initial stop, trailing, TP по live-цене;
+   приоритет ≥ входной оценки; инвариант `stop < fill < tp`.
+3. **Universe scan (spec §1)** — eligible-фильтры, H4 slope, top-N по 24h volume,
+   динамический WS-set.
+4. **Fills/портфель** — user-data stream или REST-реконсиляция; персистентный
+   cooldown через рестарт.
+5. **Audit chain (spec §8)** — market state → signal → intent → risk → order →
+   outcome, включая no-order `HOLD`.
 
-## Дополнительно (добавлено по собственному решению)
+Каждый слой — сервис **вокруг** Стратегии; Стратегия остаётся ядром и не знает
+деталей исполнения.
 
-1. `risk.py` — риск-гейт между решением и исполнением (лимиты по позициям/notional,
-   число открытых ордеров, стоп по дневному убытку, аварийный flatt). Рекомендуется сразу.
-2. `portfolio.py` — локальное состояние позиций/сделок (вход, объём, средняя цена, pnl) —
-   общий источник для стратегии, защитника и UI.
-3. Общий кэш котировок (`marketdata.py`) — один объект «последняя цена/книга по символу».
-4. Канал `agent:events` в Redis — live-события (fills, движение защитных ордеров, ошибки)
-   отдельно от одноразового `agent:result`.
-5. Снапшот `agent:runtime` расширяется полями `protector`, `symbols`, риск-лимиты →
-   полный resume после рестарта.
+## 7. Влияние на backend/frontend
 
-## Влияние на другие слои (кратко)
-
-- `backend/app/api/routes/trading.py`: расширить `start`-payload и статус полями
-  `protector`, `symbols`; GET `/trading/strategies` и `/trading/protectors`.
-- `frontend`: выбор стратегии/защитника, показ активных символов.
-- `commands.py`/`engine.py`: команда `switch_strategy` (смена на лету) — пример из
-  «Открыто» в CONTEXT.md.
-
-## Порядок внедрения
-
-1. `exchange/streams.py` (websocket котировки) + общий кэш (`marketdata.py`).
-2. Ордерные методы на `BinanceSpot` + `ExecutionService`.
-3. `portfolio.py`.
-4. `risk.py` (включить сразу).
-5. `strategies/` с первой стратегией (`grid`).
-6. `protection/` с первым защитником (`trailing_stop`).
-7. Провязка выбора сквозь команды/статус/UI + resume.
-
-> TODO по мере реализации: фиксировать здесь принятые сигнатуры контекстов и событий.
+- `backend/app/api/routes/trading.py`: команды/снапшот/статус/результат;
+  `KNOWN_STRATEGIES` синхронизирован с реестром агента. `protector` удалён.
+- `frontend/src/routes/_layout/strategy.tsx`: настройки Стратегии (жёстко под
+  параметры Triple Screen) + Start/Stop; шлёт `start {network, strategy, symbols, params}`.
+- Клиент генерируется из openapi (см. `CONTEXT.md` §5); вручную не правится.

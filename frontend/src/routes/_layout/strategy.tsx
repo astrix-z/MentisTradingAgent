@@ -1,0 +1,429 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { createFileRoute, redirect } from "@tanstack/react-router"
+import { CircleCheck, CircleX, Play, Square } from "lucide-react"
+import { useEffect, useRef, useState } from "react"
+
+import { type StartPayload, TradingService, UsersService } from "@/client"
+import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import useCustomToast from "@/hooks/useCustomToast"
+import { cn } from "@/lib/utils"
+import { handleError } from "@/utils"
+
+type Network = NonNullable<StartPayload["network"]>
+
+const STRATEGY = "tripple_screen"
+
+// Triple Screen defaults (must match agent/agent/strategies/tripple_screen/settings.py).
+const DEFAULT_PARAMS = {
+  quote_asset: "USDT",
+  tide_interval: "4h",
+  wave_interval: "1h",
+  ripple_interval: "15m",
+  ema_tide_periods: [5, 13, 34],
+  stochastic_k_period: 5,
+  stochastic_d_period: 3,
+  stochastic_slow_period: 3,
+  fi_ema_period: 2,
+  oversold_threshold: 20,
+  swing_low_h1_n: 2,
+  trail_m15_n: 2,
+  stop_buffer_pct: 0.1,
+  min_stop_distance_pct: 1,
+  tp_pct: 10,
+  cooldown_minutes: 60,
+  signal_validity_minutes: 15,
+  rest_concurrency: 3,
+  ws_top_n: 50,
+  volume_window: "24h",
+  kline_window: 1000,
+} satisfies Record<string, string | number | number[]>
+
+type ParamKey = keyof typeof DEFAULT_PARAMS
+type FieldType = "string" | "number" | "numberArray"
+
+type FieldDef = {
+  key: ParamKey
+  label: string
+  type: FieldType
+}
+
+const FIELDS: FieldDef[] = [
+  { key: "quote_asset", label: "Quote asset", type: "string" },
+  { key: "tide_interval", label: "Tide interval", type: "string" },
+  { key: "wave_interval", label: "Wave interval", type: "string" },
+  { key: "ripple_interval", label: "Ripple interval", type: "string" },
+  { key: "ema_tide_periods", label: "EMA tide periods", type: "numberArray" },
+  { key: "stochastic_k_period", label: "Stochastic %K period", type: "number" },
+  { key: "stochastic_d_period", label: "Stochastic %D period", type: "number" },
+  {
+    key: "stochastic_slow_period",
+    label: "Stochastic slow period",
+    type: "number",
+  },
+  { key: "fi_ema_period", label: "Force index EMA period", type: "number" },
+  { key: "oversold_threshold", label: "Oversold threshold", type: "number" },
+  { key: "swing_low_h1_n", label: "Swing low H1 N", type: "number" },
+  { key: "trail_m15_n", label: "Trail M15 N", type: "number" },
+  { key: "stop_buffer_pct", label: "Stop buffer %", type: "number" },
+  {
+    key: "min_stop_distance_pct",
+    label: "Min stop distance %",
+    type: "number",
+  },
+  { key: "tp_pct", label: "Take profit %", type: "number" },
+  { key: "cooldown_minutes", label: "Cooldown (minutes)", type: "number" },
+  {
+    key: "signal_validity_minutes",
+    label: "Signal validity (minutes)",
+    type: "number",
+  },
+  { key: "rest_concurrency", label: "REST concurrency", type: "number" },
+  { key: "ws_top_n", label: "WS top N symbols", type: "number" },
+  { key: "volume_window", label: "Volume window", type: "string" },
+  { key: "kline_window", label: "Kline window", type: "number" },
+]
+
+const initialValues = (): Record<ParamKey, string> => {
+  const values = {} as Record<ParamKey, string>
+  for (const field of FIELDS) {
+    const value = DEFAULT_PARAMS[field.key]
+    values[field.key] = Array.isArray(value) ? value.join(", ") : String(value)
+  }
+  return values
+}
+
+const tradingStatusQueryOptions = () => ({
+  queryFn: async () => (await TradingService.getStatus()).data,
+  queryKey: ["trading-status"],
+  refetchInterval: 5000,
+})
+
+export const Route = createFileRoute("/_layout/strategy")({
+  component: Strategy,
+  beforeLoad: async () => {
+    const { data: user } = await UsersService.readUserMe()
+    if (!user.is_superuser) {
+      throw redirect({
+        to: "/",
+      })
+    }
+  },
+  head: () => ({
+    meta: [
+      {
+        title: "Strategy - FastAPI Template",
+      },
+    ],
+  }),
+})
+
+function Strategy() {
+  const queryClient = useQueryClient()
+  const { showSuccessToast, showErrorToast } = useCustomToast()
+
+  const { data: status, isLoading } = useQuery(tradingStatusQueryOptions())
+  const runningIntent = status?.running ?? false
+
+  const [network, setNetwork] = useState<Network>("testnet")
+  const [symbolsInput, setSymbolsInput] = useState("")
+  const [values, setValues] = useState<Record<ParamKey, string>>(initialValues)
+
+  // Seed once from the server snapshot when it carries params (the current
+  // TradingStatus does not, so this usually keeps the defaults above).
+  const seeded = useRef(false)
+  useEffect(() => {
+    const snapshot = status as
+      | { params?: Record<string, unknown>; symbols?: string[] }
+      | undefined
+    if (seeded.current || !snapshot?.params) return
+    const snapshotParams = snapshot.params
+    setValues((current) => {
+      const next = { ...current }
+      for (const field of FIELDS) {
+        const value = snapshotParams[field.key]
+        if (value === undefined) continue
+        next[field.key] = Array.isArray(value)
+          ? value.join(", ")
+          : String(value)
+      }
+      return next
+    })
+    setSymbolsInput((snapshot.symbols ?? []).join(", "))
+    seeded.current = true
+  }, [status])
+
+  const parsedSymbols = Array.from(
+    new Set(
+      symbolsInput
+        .split(",")
+        .map((symbol) => symbol.trim().toUpperCase())
+        .filter(Boolean),
+    ),
+  )
+
+  const invalidate = () =>
+    queryClient.invalidateQueries({ queryKey: ["trading-status"] })
+
+  const startMutation = useMutation({
+    mutationFn: (body: StartPayload) => TradingService.startTrading({ body }),
+    onSuccess: () => {
+      showSuccessToast("Strategy started")
+      invalidate()
+    },
+    onError: handleError.bind(showErrorToast),
+  })
+  const stopMutation = useMutation({
+    mutationFn: () => TradingService.stopTrading(),
+    onSuccess: () => {
+      showSuccessToast("Strategy stopped")
+      invalidate()
+    },
+    onError: handleError.bind(showErrorToast),
+  })
+
+  const pending = startMutation.isPending || stopMutation.isPending
+
+  const setValue = (key: ParamKey, value: string) =>
+    setValues((current) => ({ ...current, [key]: value }))
+
+  const buildParams = (): Record<string, unknown> | null => {
+    const params: Record<string, unknown> = {}
+    for (const field of FIELDS) {
+      const raw = values[field.key].trim()
+      if (field.type === "number") {
+        const parsed = Number(raw)
+        if (raw === "" || Number.isNaN(parsed)) {
+          showErrorToast(`${field.label} must be a number`)
+          return null
+        }
+        params[field.key] = parsed
+      } else if (field.type === "numberArray") {
+        const parsed = raw
+          .split(",")
+          .map((part) => Number(part.trim()))
+          .filter((part) => !Number.isNaN(part))
+        if (parsed.length === 0) {
+          showErrorToast(`${field.label} must be a list of numbers`)
+          return null
+        }
+        params[field.key] = parsed
+      } else {
+        if (raw === "") {
+          showErrorToast(`${field.label} is required`)
+          return null
+        }
+        params[field.key] = raw
+      }
+    }
+    return params
+  }
+
+  const onStart = () => {
+    if (parsedSymbols.length === 0) {
+      showErrorToast("Enter at least one symbol to trade (e.g. BTCUSDT)")
+      return
+    }
+    const params = buildParams()
+    if (params === null) return
+    startMutation.mutate({
+      network,
+      strategy: STRATEGY,
+      symbols: parsedSymbols,
+      params,
+    })
+  }
+
+  const online = status?.online ?? false
+  const agentState = status?.state ?? null
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight">Strategy</h1>
+        <p className="text-muted-foreground">
+          Configure the Triple Screen strategy and start or stop the agent
+        </p>
+      </div>
+
+      <div className="grid gap-6 md:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Status</CardTitle>
+            <CardDescription>Agent liveness and current state</CardDescription>
+          </CardHeader>
+          <CardContent>
+            {isLoading ? (
+              <p className="text-muted-foreground text-sm">Loading…</p>
+            ) : (
+              <div className="flex flex-col gap-4 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-muted-foreground">Agent</span>
+                  {online ? (
+                    <Badge
+                      variant="default"
+                      className="bg-emerald-600 text-white"
+                    >
+                      <CircleCheck className="mr-1 size-3.5" />
+                      online
+                    </Badge>
+                  ) : (
+                    <Badge variant="destructive">
+                      <CircleX className="mr-1 size-3.5" />
+                      offline
+                    </Badge>
+                  )}
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-muted-foreground">State</span>
+                  <span className="font-medium capitalize">
+                    {agentState ?? "unknown"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-muted-foreground">Running</span>
+                  <span className="font-medium">
+                    {runningIntent ? "on" : "off"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-muted-foreground">Network</span>
+                  <span className="font-medium uppercase">
+                    {status?.network ?? "—"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-muted-foreground">Strategy</span>
+                  <span className="font-medium">
+                    {status?.strategy ?? STRATEGY}
+                  </span>
+                </div>
+                {(status?.symbols?.length ?? 0) > 0 && (
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-muted-foreground">Symbols</span>
+                    <span className="truncate text-right font-medium">
+                      {status?.symbols?.join(", ")}
+                    </span>
+                  </div>
+                )}
+                {status?.message && (
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-muted-foreground">Message</span>
+                    <span className="truncate text-right font-medium">
+                      {status.message}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Control</CardTitle>
+            <CardDescription>
+              Start the strategy with the settings below, or stop the agent
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-6">
+            <div className="flex flex-col gap-2">
+              <Label>Network</Label>
+              <div className="flex w-fit overflow-hidden rounded-md border">
+                {(["testnet", "live"] as const).map((option) => {
+                  const active = network === option
+                  return (
+                    <Button
+                      key={option}
+                      type="button"
+                      size="sm"
+                      variant={active ? "default" : "ghost"}
+                      disabled={pending}
+                      className={cn(
+                        "rounded-none",
+                        active ? "font-semibold" : "text-muted-foreground",
+                      )}
+                      onClick={() => setNetwork(option)}
+                    >
+                      {option.toUpperCase()}
+                    </Button>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <Label htmlFor="symbols">Symbols</Label>
+              <Input
+                id="symbols"
+                placeholder="e.g. BTCUSDT, ETHUSDT"
+                value={symbolsInput}
+                disabled={pending}
+                onChange={(event) => setSymbolsInput(event.target.value)}
+              />
+              <span className="text-muted-foreground text-xs">
+                Comma-separated, uppercased and de-duplicated automatically
+              </span>
+            </div>
+
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                disabled={pending}
+                onClick={onStart}
+                className="flex-1"
+              >
+                <Play className="mr-1 size-4" />
+                {startMutation.isPending ? "Starting…" : "Start"}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={pending || !runningIntent}
+                onClick={() => stopMutation.mutate()}
+                className="flex-1"
+              >
+                <Square className="mr-1 size-4" />
+                {stopMutation.isPending ? "Stopping…" : "Stop"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Triple Screen settings</CardTitle>
+          <CardDescription>
+            Fixed at start; the agent validates them before the strategy runs
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {FIELDS.map((field) => (
+              <div key={field.key} className="flex flex-col gap-2">
+                <Label htmlFor={field.key}>{field.label}</Label>
+                <Input
+                  id={field.key}
+                  value={values[field.key]}
+                  disabled={pending}
+                  inputMode={field.type === "string" ? undefined : "decimal"}
+                  onChange={(event) => setValue(field.key, event.target.value)}
+                />
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}

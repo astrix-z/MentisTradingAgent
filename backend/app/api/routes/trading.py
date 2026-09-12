@@ -47,11 +47,11 @@ SuperUserDep = Annotated[User, Depends(get_current_active_superuser)]
 Network = Literal["testnet", "live"]
 CommandType = Literal["start", "stop", "balance"]
 
-# Strategy/protector names the UI can pick from. Keep in sync with the agent
-# registries: ``agent/agent/strategies`` (@strategy) and
-# ``agent/agent/protection`` (@protector). The agent validates unknown names.
-KNOWN_STRATEGIES = ("grid",)
-KNOWN_PROTECTORS = ("trailing_stop",)
+# Strategy names the UI can pick from. Keep in sync with the agent registry
+# ``agent/agent/strategies`` (@strategy). The agent validates unknown names.
+# Position protection is part of the strategy, so there is no separate
+# protector concept.
+KNOWN_STRATEGIES = ("tripple_screen",)
 
 
 def _now() -> datetime:
@@ -62,11 +62,10 @@ def _now() -> datetime:
 
 
 class StartPayload(BaseModel):
-    """Payload of the ``start`` command (strategy/protector/symbols/params)."""
+    """Payload of the ``start`` command (strategy/symbols/params)."""
 
     network: Network = "testnet"
     strategy: str
-    protector: str | None = None
     symbols: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -99,7 +98,6 @@ class RuntimeSnapshot(BaseModel):
     running: bool = False
     network: Network = "testnet"
     strategy: str | None = None
-    protector: str | None = None
     symbols: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
     last_command: str | None = None
@@ -126,7 +124,6 @@ class TradingStatus(BaseModel):
     running: bool = False
     network: Network | None = None
     strategy: str | None = None
-    protector: str | None = None
     symbols: list[str] = Field(default_factory=list)
     state: AgentState | None = None
     message: str | None = None
@@ -193,15 +190,12 @@ async def _apply_command(type_: CommandType, payload: dict[str, Any]) -> Command
             snapshot.running = True
             snapshot.network = payload["network"]
             snapshot.strategy = payload["strategy"]
-            snapshot.protector = payload.get("protector") or None
             snapshot.symbols = [str(s).upper() for s in (payload.get("symbols") or [])]
             snapshot.params = dict(payload.get("params") or {})
         elif type_ == "stop":
             snapshot.running = False
-            snapshot.protector = None
             snapshot.symbols = []
             snapshot.params = {}
-            snapshot.running = False
         snapshot.last_command = type_
         snapshot.updated_at = _now()
         await _set_snapshot(snapshot)
@@ -213,7 +207,6 @@ def _start_command_payload(parsed: StartPayload) -> dict[str, Any]:
     return {
         "network": parsed.network,
         "strategy": parsed.strategy,
-        "protector": parsed.protector,
         "symbols": [str(s).upper() for s in parsed.symbols],
         "params": dict(parsed.params),
     }
@@ -234,12 +227,6 @@ def _start_payload(request: CommandRequest) -> dict[str, Any]:
 async def list_strategies(_: CurrentUser) -> list[str]:
     """Names of selectable trading strategies (see ``KNOWN_STRATEGIES``)."""
     return list(KNOWN_STRATEGIES)
-
-
-@router.get("/protectors/", response_model=list[str])
-async def list_protectors(_: CurrentUser) -> list[str]:
-    """Names of selectable position-protection algorithms."""
-    return list(KNOWN_PROTECTORS)
 
 
 @router.post("/commands/", status_code=202, response_model=CommandEnvelope)
@@ -320,7 +307,6 @@ async def get_status(_: CurrentUser) -> TradingStatus:
         running=bool(snapshot.running) if snapshot else False,
         network=snapshot.network if snapshot else None,
         strategy=snapshot.strategy if snapshot else None,
-        protector=snapshot.protector if snapshot else None,
         symbols=snapshot.symbols if snapshot else [],
         state=state,
         message=message,
