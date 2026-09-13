@@ -14,8 +14,10 @@
    (`Quote`, `MarketData`, `NewOrder`, `OrderStatus`, ...): всё это есть в SDK.
    Разрешены лишь тонкие адаптеры над SDK (см. §3). Документация и примеры —
    в `binance-spot/docs/`, `binance-spot/examples/`.
-3. **Boot-off.** Система стартует с выключенной Стратегией; запуск — только
-   командой `start` с настройками со страницы UI.
+3. **Boot-off без сохранённого намерения.** При отсутствии `agent:runtime.running=true`
+   агент остаётся idle; новый запуск — командой `start` со страницы `/strategy`.
+   Существующая семантика resume сохранена: ранее подтверждённое пользователем
+   намерение `running=true` автоматически восстанавливается, в том числе для LIVE.
 4. **Один канал backend↔agent — Redis** (команды + снапшот + heartbeat + события).
    У каждого сервиса своя БД; чужую схему никто не читает и не пишет.
 
@@ -71,12 +73,11 @@ sequenceDiagram
     participant AG as Agent
     participant EX as binance_sdk_spot
     UI->>BE: Start {network, symbols, params}
-    BE->>R: publish agent:commands {type:"start", payload}
-    BE->>R: set agent:runtime (running=true, ...)
+    BE->>R: atomic CAS: runtime revision + publish agent:commands
     R-->>AG: сообщение канала
     AG->>AG: build_strategy("tripple_screen", params)
     AG->>EX: create_connection (ws streams)
-    AG->>EX: klines (bootstrap H4/H1/M15) + подписки
+    AG->>EX: подписки с буферизацией, затем bootstrap закрытых H4/H1/M15
     AG->>R: set trading:heartbeat (running)
     EX-->>AG: kline close -> Signal(ENTRY/HOLD)
     AG->>R: publish agent:events (signal)
@@ -86,6 +87,9 @@ sequenceDiagram
 - `Engine.start_run` валидирует `params` (через `TripleScreenSettings`), создаёт
   Стретегию, собирает `StrategyServices` и вызывает `strategy.on_start`.
 - `Engine.stop` (или команда `stop`) гасит Стратегию и потоки, публикует `idle`.
+  Lifecycle сериализован; ошибка старта откатывает частичные ресурсы и публикует
+  `error`. Listener и heartbeat работают во время bootstrap; Stop отменяет
+  активный и более ранние ожидающие Start, не отменяя Start после себя.
 - `resume_from_runtime` при старте агента читает `agent:runtime`: если там
   `running=true` и стратегия известна — восстанавливает ран с теми же настройками.
 
@@ -132,14 +136,18 @@ class Strategy(abc.ABC):
 Спецификация: `docs/STRATEGY_TRIPPLE_SCREEN.md`. Реализация:
 `strategies/tripple_screen/`.
 
-- `settings.py` — все параметры §10 (timeframes, EMA, Stochastic, FI, пороги,
-  стопы/TP, cooldown, лимиты данных) с дефолтами; `from_params` отбрасывает
-  незнакомые ключи.
+- `settings.py` — параметры §10 с дефолтами, доменными и межполевыми проверками.
+  Конфигурация frozen, EMA-периоды — tuple; интервалы проверяются SDK-enum.
+  Некорректные настройки отклоняются до остановки действующего запуска.
 - `indicators.py` — чистые функции (`ema_series`, `sma_series`, `stochastic_k_series`,
   `force_index_series`) и внутренний `Candle`; всё на `Decimal`.
   **Seed-конвенция EMA — provisional** (SMA-seed), до `STRATEGY-05`.
-- `strategy.py` — `on_start` бутстрапит H4/H1/M15 через REST и подписывается на
-  WS kline; оценка на закрытии M15 (`BullishTide` → `PullbackUp` → триггер) даёт
+- `strategy.py` — `on_start` сохраняет сервисы, подписывает WS с буферизацией
+  закрытий и собирает полное настроенное окно через SDK REST. Окна дедуплицируются;
+  snapshot ограничен временем конкретного M15, пропуски требуют backfill.
+  Актуальность триггера ограничена закрытием следующего ripple или меньшим
+  интервалом validity; backfill не продлевает её. Оценка
+  (`BullishTide` → `PullbackUp` → триггер) даёт
   `ENTRY`/`HOLD` с reason-кодами (`no_pullback`, `no_trigger`, `position_open`,
   `cooldown`, `epoch_consumed`). Позиция/cooldown помечаются движком через
   `mark_position_open`/`mark_position_closed` (execution lane — следующий шаг).
@@ -168,4 +176,15 @@ class Strategy(abc.ABC):
   `KNOWN_STRATEGIES` синхронизирован с реестром агента. `protector` удалён.
 - `frontend/src/routes/_layout/strategy.tsx`: настройки Стратегии (жёстко под
   параметры Triple Screen) + Start/Stop; шлёт `start {network, strategy, symbols, params}`.
+- `/trading` — только наблюдение и отдельный запрос баланса; никаких неявных Start.
+- `GET /trading/status/` (superuser) возвращает `{desired, actual, online}`.
+  `desired` содержит params и revision, `actual` — последний heartbeat со своей
+  сетью/стратегией/балансом. Offline heartbeat не подтверждает текущий запуск.
+- HTTP 202 подтверждает приём, не исполнение. UI отслеживает результат по ID;
+  `GET /trading/result/?command_id=UUID` доступен superuser. Агент сохраняет
+  `agent:result:<id>` на 3600 секунд и legacy `agent:result`.
+- Событие Redis: `{"kind":"signal", **signal.transport()}` — полный контракт,
+  цены Decimal сериализуются строками. Retry в памяти сохраняет `signal_id`;
+  эпоха потребляется после успешного emit. Просроченные сигналы не повторяются.
+  Pub/Sub не предоставляет durable/exactly-once; потребители дедуплицируют ID.
 - Клиент генерируется из openapi (см. `CONTEXT.md` §5); вручную не правится.

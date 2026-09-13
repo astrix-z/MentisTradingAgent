@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import abc
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, ClassVar, Literal
+from uuid import uuid4
 
 from agent.exchange.rest import ExchangeRest
 from agent.exchange.streams import MarketDataStreams
@@ -39,14 +42,44 @@ class Signal:
     reason: str | None = None
     # ENTRY
     epoch_id: str | None = None
-    entry_ref: float | None = None
-    swing_low_ref: float | None = None
+    entry_ref: Decimal | None = None
+    swing_low_ref: Decimal | None = None
     tp_rule: str | None = None
     valid_until: datetime | None = None
     # EXIT
     exit_reason: str | None = None
     # Full per-screen provenance (bools, indicator values, timestamps).
     provenance: dict[str, Any] = field(default_factory=dict)
+    signal_id: str = field(default_factory=lambda: str(uuid4()))
+    side: Literal["LONG"] = "LONG"
+    config_version: str | None = None
+    market_window_versions: dict[str, str] = field(default_factory=dict)
+
+    def transport(self) -> dict[str, Any]:
+        """Full JSON-ready signal, without the event envelope (e.g. ``kind``).
+
+        All fields are present, including nulls. Decimal uses str (never float),
+        datetime uses ISO 8601, and nested mappings/sequences follow the same
+        rules. A retry must reuse this signal_id; sinks must deduplicate by it
+        and raise on failed delivery. Exactly-once delivery cannot be inferred
+        from a sink exception after an ambiguous acknowledgement.
+        """
+        return {key: transport_value(value) for key, value in asdict(self).items()}
+
+
+def transport_value(value: Any) -> Any:
+    """Convert strategy values at the JSON boundary, preserving decimal digits."""
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {key: transport_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [transport_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"unsupported signal transport value: {type(value).__name__}")
 
 
 SignalSink = Callable[[Signal], Awaitable[None]]
@@ -74,7 +107,7 @@ class Strategy(abc.ABC):
     name: ClassVar[str] = ""
 
     def __init__(self, params: dict[str, Any]) -> None:
-        self._params = params
+        self._params = deepcopy(params)
         self._services: StrategyServices | None = None
 
     @property
@@ -85,7 +118,7 @@ class Strategy(abc.ABC):
 
     @property
     def params(self) -> dict[str, Any]:
-        return dict(self._params)
+        return deepcopy(self._params)
 
     @abc.abstractmethod
     async def on_start(self, services: StrategyServices) -> None:

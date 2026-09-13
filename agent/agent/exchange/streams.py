@@ -121,12 +121,14 @@ class MarketDataStreams:
             except Exception:  # noqa: BLE001 - best-effort teardown
                 logger.debug("stream unsubscribe failed", exc_info=True)
 
-        connection, self._connection = self._connection, None
-        if connection is not None:
-            try:
-                await self._client.close_connection(connection, close_session=True)
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                logger.debug("websocket close failed", exc_info=True)
+        self._connection = None
+        # create_connection may allocate a session/pool entry before failing or
+        # being cancelled. Let the SDK close the entire owned pool even when it
+        # never returned a connection handle.
+        try:
+            await self._client.close_connection(close_session=True)
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            logger.debug("websocket close failed", exc_info=True)
         logger.info("market streams stopped network=%s", self._network)
 
 

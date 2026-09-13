@@ -5,6 +5,40 @@ export type ClientOptions = {
 };
 
 /**
+ * AgentHeartbeat
+ *
+ * Liveness + account state reported by the agent.
+ */
+export type AgentHeartbeat = {
+    /**
+     * State
+     */
+    state: 'running' | 'idle' | 'error';
+    /**
+     * Message
+     */
+    message?: string | null;
+    /**
+     * Network
+     */
+    network?: 'testnet' | 'live' | null;
+    /**
+     * Strategy
+     */
+    strategy?: string | null;
+    /**
+     * Balances
+     */
+    balances?: {
+        [key: string]: number;
+    } | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
  * Body_login-login_access_token
  */
 export type Body_login_login_access_token = {
@@ -81,7 +115,7 @@ export type CommandRequest = {
 /**
  * CommandResult
  *
- * The most recent command result produced by the agent.
+ * Execution outcome produced by the agent, not an acceptance receipt.
  */
 export type CommandResult = {
     /**
@@ -249,6 +283,48 @@ export type PrivateUserCreate = {
 };
 
 /**
+ * RuntimeSnapshot
+ *
+ * What the agent is *supposed* to be doing (drive from commands).
+ */
+export type RuntimeSnapshot = {
+    /**
+     * Running
+     */
+    running?: boolean;
+    /**
+     * Network
+     */
+    network?: 'testnet' | 'live';
+    /**
+     * Strategy
+     */
+    strategy?: string | null;
+    /**
+     * Symbols
+     */
+    symbols?: Array<string>;
+    /**
+     * Params
+     */
+    params?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Last Command
+     */
+    last_command?: string | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+    /**
+     * Revision
+     */
+    revision?: number;
+};
+
+/**
  * StartPayload
  *
  * Payload of the ``start`` command (strategy/symbols/params).
@@ -294,36 +370,8 @@ export type Token = {
  * Intent (snapshot) + agent liveness (heartbeat) for the UI.
  */
 export type TradingStatus = {
-    /**
-     * Running
-     */
-    running?: boolean;
-    /**
-     * Network
-     */
-    network?: 'testnet' | 'live' | null;
-    /**
-     * Strategy
-     */
-    strategy?: string | null;
-    /**
-     * Symbols
-     */
-    symbols?: Array<string>;
-    /**
-     * State
-     */
-    state?: 'running' | 'idle' | 'error' | null;
-    /**
-     * Message
-     */
-    message?: string | null;
-    /**
-     * Balances
-     */
-    balances?: {
-        [key: string]: number;
-    } | null;
+    desired: RuntimeSnapshot;
+    actual: AgentHeartbeat | null;
     /**
      * Online
      */
@@ -1194,9 +1242,25 @@ export type tradingFetchBalanceResponse = tradingFetchBalanceResponses[keyof tra
 export type tradingGetCommandResultData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Command Id
+         *
+         * Command ID; agent retains per-command results for 3600 seconds.
+         */
+        command_id?: string | null;
+    };
     url: '/api/v1/trading/result/';
 };
+
+export type tradingGetCommandResultErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type tradingGetCommandResultError = tradingGetCommandResultErrors[keyof tradingGetCommandResultErrors];
 
 export type tradingGetCommandResultResponses = {
     /**

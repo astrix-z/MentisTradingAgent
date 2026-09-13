@@ -141,11 +141,13 @@ def stochastic_k_series(candles: list[Candle], period: int) -> list[Decimal | No
 
 def force_index_series(candles: list[Candle], ema_period: int) -> list[Decimal | None]:
     """Elder's Force Index: ``EMA((close - prev_close) * volume, ema_period)``."""
-    raw: list[Decimal] = [Decimal(0)]
+    if not candles:
+        return []
+    raw: list[Decimal] = []
     for i in range(1, len(candles)):
         delta = candles[i].close - candles[i - 1].close
         raw.append(delta * candles[i].volume)
-    return ema_series(raw, ema_period)
+    return [None, *ema_series(raw, ema_period)]
 
 
 __all__ = [

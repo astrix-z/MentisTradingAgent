@@ -39,8 +39,21 @@ Key variables:
 - `BINANCE_API_KEY` / `BINANCE_API_SECRET` — Binance credentials (live).
 - `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET` — Binance testnet.
 
-The agent boots with **no strategy running**; a `start` command (from the
-`/strategy` page via the backend) starts the strategy with the supplied settings.
+Without a saved running intent, the agent boots **idle**. A `start` command from
+`/strategy` supplies the configuration. Existing resume behavior is preserved:
+`agent:runtime.running=true` restores that configuration on restart, including LIVE.
+Stop records `running=false`. The command listener and heartbeat stay available
+during bootstrap; Stop cancels unfinished earlier starts.
+
+The backend status separates `desired` configuration from `actual` heartbeat.
+HTTP 202 only acknowledges acceptance. Results are correlated through
+`agent:result:<command_id>` (3600-second TTL), with `agent:result` retained for
+legacy readers. Financial status/results require a superuser.
+
+Signals carry exact Decimal strings, provenance and `signal_id`. Failed emission
+is retried in memory with the same ID while still fresh/valid; consumers must
+deduplicate. Redis Pub/Sub is not a durable queue. Execution, sizing, position
+protection and universe scanning remain unimplemented.
 
 ## Structure
 

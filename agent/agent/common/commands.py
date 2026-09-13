@@ -10,7 +10,8 @@ adding a command is just adding a decorated handler here — the subscription lo
 in :mod:`agent.main` never changes.
 
 Every command may report a *result* (``CommandContext.report``), which the agent
-writes to ``agent:result`` for the backend to surface in the UI.
+writes atomically to ``agent:result`` (last result) and
+``agent:result:<command_id>`` (TTL 3600 seconds) for correlated polling.
 
 The runtime snapshot (``agent:runtime``) lets the agent restore its intent after
 a restart: on boot we read it and, if it says ``running``, start the strategy
@@ -46,7 +47,9 @@ def _as_params(value: Any) -> dict[str, Any]:
 def _as_symbols(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [str(symbol).upper() for symbol in value]
+    if any(not isinstance(symbol, str) for symbol in value):
+        return []
+    return [symbol.upper() for symbol in value]
 
 
 class AgentCommand:
@@ -67,6 +70,8 @@ class AgentCommand:
     @classmethod
     def from_json(cls, raw: str) -> AgentCommand:
         data = json.loads(raw)
+        if not isinstance(data, dict) or not isinstance(data.get("payload", {}), dict):
+            raise ValueError("command and payload must be objects")
         return cls(
             id=str(data["id"]),
             type_=str(data["type"]),
@@ -102,7 +107,10 @@ class CommandContext:
             }
         )
         try:
-            await self.redis.set(REDIS_RESULT_KEY, payload)
+            async with self.redis.pipeline(transaction=True) as pipe:
+                pipe.set(REDIS_RESULT_KEY, payload)
+                pipe.set(f"{REDIS_RESULT_KEY}:{self.command.id}", payload, ex=3600)
+                await pipe.execute()
         except RedisError:
             logger.warning("cannot publish command result (Redis unavailable)")
 
@@ -138,9 +146,9 @@ async def dispatch(engine: Engine, redis: Redis, raw: str) -> None:
     ctx = CommandContext(engine=engine, redis=redis, command=envelope)
     try:
         await handler(ctx, envelope.payload)
-    except Exception:
+    except Exception as exc:
         logger.exception("command type=%r failed", envelope.type)
-        await ctx.report(ok=False, message="command handler failed")
+        await ctx.report(ok=False, message=str(exc))
 
 
 # --- Built-in commands ------------------------------------------------------
@@ -205,7 +213,11 @@ async def _balance(ctx: CommandContext, payload: dict[str, Any]) -> None:
 
 
 async def resume_from_runtime(engine: Engine, redis: Redis) -> None:
-    """Re-apply the last runtime snapshot so the run survives agent restarts."""
+    """Boot idle unless the saved snapshot has exactly ``running=true``.
+
+    Preserve the existing opt-in-by-snapshot resume behavior; no new boot mode.
+    Failure is isolated from the listener and heartbeat, and startup is cancellable.
+    """
     try:
         raw = await redis.get(REDIS_RUNTIME_KEY)
     except RedisError:
@@ -219,7 +231,7 @@ async def resume_from_runtime(engine: Engine, redis: Redis) -> None:
         logger.warning("ignoring malformed runtime snapshot")
         return
 
-    if not data.get("running"):
+    if not isinstance(data, dict) or data.get("running") is not True:
         return
     network = str(data.get("network") or "testnet")
     strategy = str(data.get("strategy") or "")
@@ -238,5 +250,5 @@ async def resume_from_runtime(engine: Engine, redis: Redis) -> None:
         await engine.start_run(
             network=network, strategy=strategy, symbols=symbols, params=params
         )
-    except ValueError as exc:
-        logger.warning("resume failed: %s", exc)
+    except Exception as exc:
+        logger.exception("resume failed: %s", exc)

@@ -1,10 +1,11 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { useMutation, useQuery } from "@tanstack/react-query"
 import { createFileRoute, redirect } from "@tanstack/react-router"
-import { CircleCheck, CircleX, Play, Square } from "lucide-react"
-import { useEffect, useRef, useState } from "react"
+import { Play, Square } from "lucide-react"
+import { useEffect, useState } from "react"
 
 import { type StartPayload, TradingService, UsersService } from "@/client"
-import { Badge } from "@/components/ui/badge"
+import { CommandTrackingView } from "@/components/CommandTrackingView"
+import { TradingStatusView } from "@/components/TradingStatusView"
 import { Button } from "@/components/ui/button"
 import {
   Card,
@@ -15,6 +16,7 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useCommandTracking } from "@/hooks/useCommandTracking"
 import useCustomToast from "@/hooks/useCustomToast"
 import { cn } from "@/lib/utils"
 import { handleError } from "@/utils"
@@ -128,39 +130,34 @@ export const Route = createFileRoute("/_layout/strategy")({
 })
 
 function Strategy() {
-  const queryClient = useQueryClient()
-  const { showSuccessToast, showErrorToast } = useCustomToast()
-
-  const { data: status, isLoading } = useQuery(tradingStatusQueryOptions())
-  const runningIntent = status?.running ?? false
+  const { showErrorToast } = useCustomToast()
+  const { commands, track } = useCommandTracking()
+  const { data: status, isError } = useQuery(tradingStatusQueryOptions())
 
   const [network, setNetwork] = useState<Network>("testnet")
   const [symbolsInput, setSymbolsInput] = useState("")
   const [values, setValues] = useState<Record<ParamKey, string>>(initialValues)
 
-  // Seed once from the server snapshot when it carries params (the current
-  // TradingStatus does not, so this usually keeps the defaults above).
-  const seeded = useRef(false)
+  const [dirty, setDirty] = useState(false)
+  const [strategy, setStrategy] = useState(STRATEGY)
+  const [savedParams, setSavedParams] = useState<Record<string, unknown>>({})
   useEffect(() => {
-    const snapshot = status as
-      | { params?: Record<string, unknown>; symbols?: string[] }
-      | undefined
-    if (seeded.current || !snapshot?.params) return
-    const snapshotParams = snapshot.params
-    setValues((current) => {
-      const next = { ...current }
-      for (const field of FIELDS) {
-        const value = snapshotParams[field.key]
-        if (value === undefined) continue
+    if (dirty || !status) return
+    const snapshot = status.desired
+    const next = initialValues()
+    for (const field of FIELDS) {
+      const value = snapshot.params?.[field.key]
+      if (value !== undefined)
         next[field.key] = Array.isArray(value)
           ? value.join(", ")
           : String(value)
-      }
-      return next
-    })
+    }
+    setValues(next)
+    setNetwork(snapshot.network ?? "testnet")
+    setStrategy(snapshot.strategy ?? STRATEGY)
     setSymbolsInput((snapshot.symbols ?? []).join(", "))
-    seeded.current = true
-  }, [status])
+    setSavedParams(snapshot.params ?? {})
+  }, [status, dirty])
 
   const parsedSymbols = Array.from(
     new Set(
@@ -171,33 +168,26 @@ function Strategy() {
     ),
   )
 
-  const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: ["trading-status"] })
-
   const startMutation = useMutation({
     mutationFn: (body: StartPayload) => TradingService.startTrading({ body }),
-    onSuccess: () => {
-      showSuccessToast("Strategy started")
-      invalidate()
-    },
+    onSuccess: ({ data }) => track(data),
     onError: handleError.bind(showErrorToast),
   })
   const stopMutation = useMutation({
     mutationFn: () => TradingService.stopTrading(),
-    onSuccess: () => {
-      showSuccessToast("Strategy stopped")
-      invalidate()
-    },
+    onSuccess: ({ data }) => track(data),
     onError: handleError.bind(showErrorToast),
   })
 
   const pending = startMutation.isPending || stopMutation.isPending
 
-  const setValue = (key: ParamKey, value: string) =>
+  const setValue = (key: ParamKey, value: string) => {
+    setDirty(true)
     setValues((current) => ({ ...current, [key]: value }))
+  }
 
   const buildParams = (): Record<string, unknown> | null => {
-    const params: Record<string, unknown> = {}
+    const params: Record<string, unknown> = { ...savedParams }
     for (const field of FIELDS) {
       const raw = values[field.key].trim()
       if (field.type === "number") {
@@ -237,14 +227,11 @@ function Strategy() {
     if (params === null) return
     startMutation.mutate({
       network,
-      strategy: STRATEGY,
+      strategy,
       symbols: parsedSymbols,
       params,
     })
   }
-
-  const online = status?.online ?? false
-  const agentState = status?.state ?? null
 
   return (
     <div className="flex flex-col gap-6">
@@ -255,6 +242,23 @@ function Strategy() {
         </p>
       </div>
 
+      <CommandTrackingView commands={commands} />
+      <p>
+        {dirty
+          ? "Unsaved local draft — background updates will not overwrite it"
+          : "Saved desired configuration"}
+      </p>
+      {dirty && (
+        <Button variant="outline" onClick={() => setDirty(false)}>
+          Reload desired configuration
+        </Button>
+      )}
+      {strategy !== STRATEGY && (
+        <p role="alert">
+          Saved strategy {strategy} is not supported by this form. Start
+          disabled.
+        </p>
+      )}
       <div className="grid gap-6 md:grid-cols-2">
         <Card>
           <CardHeader>
@@ -262,69 +266,7 @@ function Strategy() {
             <CardDescription>Agent liveness and current state</CardDescription>
           </CardHeader>
           <CardContent>
-            {isLoading ? (
-              <p className="text-muted-foreground text-sm">Loading…</p>
-            ) : (
-              <div className="flex flex-col gap-4 text-sm">
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground">Agent</span>
-                  {online ? (
-                    <Badge
-                      variant="default"
-                      className="bg-emerald-600 text-white"
-                    >
-                      <CircleCheck className="mr-1 size-3.5" />
-                      online
-                    </Badge>
-                  ) : (
-                    <Badge variant="destructive">
-                      <CircleX className="mr-1 size-3.5" />
-                      offline
-                    </Badge>
-                  )}
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground">State</span>
-                  <span className="font-medium capitalize">
-                    {agentState ?? "unknown"}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground">Running</span>
-                  <span className="font-medium">
-                    {runningIntent ? "on" : "off"}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground">Network</span>
-                  <span className="font-medium uppercase">
-                    {status?.network ?? "—"}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground">Strategy</span>
-                  <span className="font-medium">
-                    {status?.strategy ?? STRATEGY}
-                  </span>
-                </div>
-                {(status?.symbols?.length ?? 0) > 0 && (
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-muted-foreground">Symbols</span>
-                    <span className="truncate text-right font-medium">
-                      {status?.symbols?.join(", ")}
-                    </span>
-                  </div>
-                )}
-                {status?.message && (
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-muted-foreground">Message</span>
-                    <span className="truncate text-right font-medium">
-                      {status.message}
-                    </span>
-                  </div>
-                )}
-              </div>
-            )}
+            <TradingStatusView status={status} error={isError} />
           </CardContent>
         </Card>
 
@@ -352,7 +294,11 @@ function Strategy() {
                         "rounded-none",
                         active ? "font-semibold" : "text-muted-foreground",
                       )}
-                      onClick={() => setNetwork(option)}
+                      aria-pressed={active}
+                      onClick={() => {
+                        setDirty(true)
+                        setNetwork(option)
+                      }}
                     >
                       {option.toUpperCase()}
                     </Button>
@@ -368,7 +314,10 @@ function Strategy() {
                 placeholder="e.g. BTCUSDT, ETHUSDT"
                 value={symbolsInput}
                 disabled={pending}
-                onChange={(event) => setSymbolsInput(event.target.value)}
+                onChange={(event) => {
+                  setDirty(true)
+                  setSymbolsInput(event.target.value)
+                }}
               />
               <span className="text-muted-foreground text-xs">
                 Comma-separated, uppercased and de-duplicated automatically
@@ -378,7 +327,7 @@ function Strategy() {
             <div className="flex gap-2">
               <Button
                 type="button"
-                disabled={pending}
+                disabled={pending || !status || strategy !== STRATEGY}
                 onClick={onStart}
                 className="flex-1"
               >
@@ -388,7 +337,7 @@ function Strategy() {
               <Button
                 type="button"
                 variant="outline"
-                disabled={pending || !runningIntent}
+                disabled={pending}
                 onClick={() => stopMutation.mutate()}
                 className="flex-1"
               >

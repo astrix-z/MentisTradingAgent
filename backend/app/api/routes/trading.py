@@ -21,7 +21,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError
 from redis.exceptions import RedisError
 
@@ -36,6 +36,18 @@ REDIS_COMMAND_CHANNEL = "agent:commands"
 REDIS_RUNTIME_KEY = "agent:runtime"
 REDIS_HEARTBEAT_KEY = "trading:heartbeat"
 REDIS_RESULT_KEY = "agent:result"
+
+# Compare the exact document read by this worker, then commit and publish without
+# interleaving with another worker. JSON stays in Python to preserve empty arrays.
+COMMIT_RUNTIME_LUA = """
+local current = redis.call('GET', KEYS[1])
+if (current or '') ~= ARGV[1] then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[2])
+redis.call('PUBLISH', ARGV[3], ARGV[4])
+return 1
+"""
 
 # How old an agent heartbeat may be before the agent is considered offline.
 # Must be greater than the agent's heartbeat interval (agent/agent/engine.py).
@@ -102,6 +114,7 @@ class RuntimeSnapshot(BaseModel):
     params: dict[str, Any] = Field(default_factory=dict)
     last_command: str | None = None
     updated_at: datetime
+    revision: int = Field(default=0, ge=0)
 
 
 AgentState = Literal["running", "idle", "error"]
@@ -121,18 +134,13 @@ class AgentHeartbeat(BaseModel):
 class TradingStatus(BaseModel):
     """Intent (snapshot) + agent liveness (heartbeat) for the UI."""
 
-    running: bool = False
-    network: Network | None = None
-    strategy: str | None = None
-    symbols: list[str] = Field(default_factory=list)
-    state: AgentState | None = None
-    message: str | None = None
-    balances: dict[str, float] | None = None
+    desired: RuntimeSnapshot
+    actual: AgentHeartbeat | None
     online: bool
 
 
 class CommandResult(BaseModel):
-    """The most recent command result produced by the agent."""
+    """Execution outcome produced by the agent, not an acceptance receipt."""
 
     command_id: uuid.UUID
     type: str
@@ -157,14 +165,6 @@ async def _publish(envelope: CommandEnvelope) -> None:
         raise _redis_unavailable(exc) from exc
 
 
-async def _set_snapshot(snapshot: RuntimeSnapshot) -> None:
-    redis = get_redis()
-    try:
-        await redis.set(REDIS_RUNTIME_KEY, snapshot.model_dump_json())
-    except RedisError as exc:
-        raise _redis_unavailable(exc) from exc
-
-
 async def _get_snapshot() -> RuntimeSnapshot | None:
     redis = get_redis()
     try:
@@ -174,32 +174,52 @@ async def _get_snapshot() -> RuntimeSnapshot | None:
     return RuntimeSnapshot.model_validate_json(raw) if raw else None
 
 
-async def _apply_command(type_: CommandType, payload: dict[str, Any]) -> CommandEnvelope:
-    """Build+publish an envelope and fold runtime-changing commands into the snapshot."""
+async def _apply_command(
+    type_: CommandType, payload: dict[str, Any]
+) -> CommandEnvelope:
+    """Accept intent; publication does not confirm agent execution."""
     envelope = CommandEnvelope(
         id=uuid.uuid4(), type=type_, payload=payload, issued_at=_now()
     )
-    await _publish(envelope)
+    if type_ == "balance":
+        await _publish(envelope)
+        return envelope
 
-    # Only commands that change what *should* be running touch the snapshot.
-    if type_ in ("start", "stop"):
-        snapshot = await _get_snapshot()
-        if snapshot is None:
-            snapshot = RuntimeSnapshot(updated_at=_now())
-        if type_ == "start":
-            snapshot.running = True
-            snapshot.network = payload["network"]
-            snapshot.strategy = payload["strategy"]
-            snapshot.symbols = [str(s).upper() for s in (payload.get("symbols") or [])]
-            snapshot.params = dict(payload.get("params") or {})
-        elif type_ == "stop":
-            snapshot.running = False
-            snapshot.symbols = []
-            snapshot.params = {}
-        snapshot.last_command = type_
-        snapshot.updated_at = _now()
-        await _set_snapshot(snapshot)
-    return envelope
+    redis = get_redis()
+    try:
+        while True:
+            raw = await redis.get(REDIS_RUNTIME_KEY)
+            snapshot = (
+                RuntimeSnapshot.model_validate_json(raw)
+                if raw is not None
+                else RuntimeSnapshot(updated_at=_now())
+            )
+            if type_ == "start":
+                snapshot.running = True
+                snapshot.network = payload["network"]
+                snapshot.strategy = payload["strategy"]
+                snapshot.symbols = list(payload["symbols"])
+                snapshot.params = dict(payload["params"])
+            else:
+                # Stopping changes intent, not the saved configuration for the UI.
+                snapshot.running = False
+            snapshot.last_command = type_
+            snapshot.updated_at = _now()
+            snapshot.revision += 1
+            committed = await redis.execute_command(  # type: ignore[no-untyped-call]
+                "EVAL",
+                COMMIT_RUNTIME_LUA,
+                1,
+                REDIS_RUNTIME_KEY,
+                raw if raw is not None else "",
+                snapshot.model_dump_json(),
+                REDIS_COMMAND_CHANNEL,
+                envelope.model_dump_json(),
+            )
+            if committed:
+                return envelope
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
 
 
 def _start_command_payload(parsed: StartPayload) -> dict[str, Any]:
@@ -264,20 +284,40 @@ async def fetch_balance(
 
 
 @router.get("/result/", response_model=CommandResult | None)
-async def get_command_result(_: CurrentUser) -> CommandResult | None:
-    """Return the most recent command result produced by the agent."""
+async def get_command_result(
+    _: SuperUserDep,
+    command_id: Annotated[
+        uuid.UUID | None,
+        Query(
+            description="Command ID; agent retains per-command results for 3600 seconds."
+        ),
+    ] = None,
+) -> CommandResult | None:
+    """Read a correlated result, or the legacy latest result if no ID is supplied.
+
+    Null means no retained result (pending, unknown, or expired), not success.
+    Reads do not refresh the TTL owned by the agent.
+    """
     redis = get_redis()
+    key = (
+        f"{REDIS_RESULT_KEY}:{command_id}"
+        if command_id is not None
+        else REDIS_RESULT_KEY
+    )
     try:
-        raw = await redis.get(REDIS_RESULT_KEY)
+        raw = await redis.get(key)
     except RedisError as exc:
         raise _redis_unavailable(exc) from exc
     if raw is None:
         return None
-    return CommandResult.model_validate_json(raw)
+    result = CommandResult.model_validate_json(raw)
+    if command_id is not None and result.command_id != command_id:
+        return None
+    return result
 
 
 @router.get("/status/", response_model=TradingStatus)
-async def get_status(_: CurrentUser) -> TradingStatus:
+async def get_status(_: SuperUserDep) -> TradingStatus:
     """Return intent (snapshot) plus agent liveness derived from heartbeat."""
     snapshot = await _get_snapshot()
     redis = get_redis()
@@ -293,23 +333,12 @@ async def get_status(_: CurrentUser) -> TradingStatus:
     )
 
     online = False
-    state: AgentState | None = None
-    message: str | None = None
-    balances: dict[str, float] | None = None
     if heartbeat is not None:
         age = (_now() - heartbeat.updated_at).total_seconds()
-        online = age <= HEARTBEAT_STALE_SECONDS
-        state = heartbeat.state
-        message = heartbeat.message
-        balances = heartbeat.balances
+        online = 0 <= age <= HEARTBEAT_STALE_SECONDS
 
     return TradingStatus(
-        running=bool(snapshot.running) if snapshot else False,
-        network=snapshot.network if snapshot else None,
-        strategy=snapshot.strategy if snapshot else None,
-        symbols=snapshot.symbols if snapshot else [],
-        state=state,
-        message=message,
-        balances=balances,
+        desired=snapshot or RuntimeSnapshot(updated_at=_now()),
+        actual=heartbeat,
         online=online,
     )

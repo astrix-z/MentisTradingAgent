@@ -1,0 +1,112 @@
+import { useQueryClient } from "@tanstack/react-query"
+import { useCallback, useEffect, useRef, useState } from "react"
+
+import {
+  type CommandEnvelope,
+  type CommandResult,
+  TradingService,
+} from "@/client"
+
+export type CommandPhase =
+  | "accepted"
+  | "pending"
+  | "succeeded"
+  | "failed"
+  | "timeout"
+export type TrackedCommand = {
+  envelope: CommandEnvelope
+  phase: CommandPhase
+  deadline: number
+  result?: CommandResult
+  pollError?: string
+}
+
+// Lack of confirmation is not proof that execution failed.
+export const COMMAND_TIMEOUT_MS = 120_000
+
+export function useCommandTracking() {
+  const queryClient = useQueryClient()
+  const [commands, setCommands] = useState<TrackedCommand[]>([])
+  const active = useRef(new Map<string, TrackedCommand>())
+  const track = useCallback(
+    (envelope: CommandEnvelope) => {
+      const command: TrackedCommand = {
+        envelope,
+        phase: "accepted",
+        deadline: Date.now() + COMMAND_TIMEOUT_MS,
+      }
+      active.current.set(envelope.id, command)
+      setCommands((current) => [...current, command])
+      void queryClient.invalidateQueries({ queryKey: ["trading-status"] })
+    },
+    [queryClient],
+  )
+
+  useEffect(() => {
+    let cancelled = false
+    const requests = new Map<string, AbortController>()
+    const update = (id: string, patch: Partial<TrackedCommand>) => {
+      if (!cancelled)
+        setCommands((current) =>
+          current.map((c) => (c.envelope.id === id ? { ...c, ...patch } : c)),
+        )
+    }
+    const timer = setInterval(() => {
+      for (const [id, command] of active.current) {
+        if (Date.now() >= command.deadline) {
+          active.current.delete(id)
+          requests.get(id)?.abort()
+          update(id, { phase: "timeout", pollError: undefined })
+          continue
+        }
+        if (requests.has(id)) continue
+        const controller = new AbortController()
+        requests.set(id, controller)
+        update(id, { phase: "pending" })
+        void TradingService.getCommandResult({
+          query: { command_id: id },
+          signal: controller.signal,
+        })
+          .then(({ data }) => {
+            if (cancelled || !active.current.has(id)) return
+            if (Date.now() >= command.deadline) {
+              active.current.delete(id)
+              update(id, { phase: "timeout", pollError: undefined })
+              return
+            }
+            if (
+              data?.command_id === id &&
+              data.type === command.envelope.type
+            ) {
+              active.current.delete(id)
+              update(id, {
+                phase: data.ok ? "succeeded" : "failed",
+                result: data,
+                pollError: undefined,
+              })
+              void queryClient.invalidateQueries({
+                queryKey: ["trading-status"],
+              })
+            } else {
+              update(id, { phase: "pending", pollError: undefined })
+            }
+          })
+          .catch(() => {
+            if (active.current.has(id))
+              update(id, {
+                phase: "pending",
+                pollError: "Result temporarily unavailable; retrying",
+              })
+          })
+          .finally(() => requests.delete(id))
+      }
+    }, 1500)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+      for (const controller of requests.values()) controller.abort()
+    }
+  }, [queryClient])
+
+  return { commands, track }
+}

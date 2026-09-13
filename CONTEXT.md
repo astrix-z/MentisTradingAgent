@@ -51,7 +51,9 @@
   (`D-SIGNAL-ONLY`). Sizing/тип ордера/защита — вне стратегии.
 
 **Запуск Стратегии (главный сценарий):**
-1. Система стартует с **выключенной** Стратегией (движок `idle`, стратегия не создана).
+1. Без сохранённого `agent:runtime.running=true` система стартует с **выключенной**
+   Стратегией. Существующий resume сохранён: намерение `running=true` восстанавливается
+   после рестарта, включая LIVE; Stop сохраняет `running=false`.
 2. Отдельная страница UI `/strategy` — единственное место настройки и пуск/стоп.
    Поля страницы жёстко привязаны к параметрам Стратегии (spec §10).
 3. Кнопка **Start** → backend публикует команду `start` → Redis → агент.
@@ -66,13 +68,16 @@
   `stop`, `balance` `{network}`.
 - Агент слушает канал и вызывает обработчик по типу (реестр + `@command`).
   **Новая команда = новый обработчик в `common/commands.py`**, цикл подписки не трогается.
-- `start`/`stop` пишут снапшот `agent:runtime` (resume после рестарта + статус UI);
+- Backend атомарно через Redis CAS записывает revision снапшота `agent:runtime`
+  и публикует `start`/`stop` (resume после рестарта + статус UI);
   `balance` снапшот не трогает.
-- Результат команды → `agent:result` (`CommandContext.report`), backend отдаёт
-  `GET /trading/result`.
+- Результат команды → `agent:result:<id>` с TTL 3600 секунд и legacy `agent:result`.
+  Backend отдаёт `GET /trading/result/?command_id=UUID` только superuser.
+  UI различает приём (202), выполнение, отказ и timeout (120 секунд).
 - События сигналов → канал `agent:events` (`Engine._publish_event`).
 - Живость: heartbeat `trading:heartbeat` (TTL 30 c). `GET /trading/status` =
-  намерение (снапшот) + факт (heartbeat) + balances.
+  `{desired, actual, online}` только для superuser. `desired` включает params/revision;
+  сеть/стратегия/balances факта берутся исключительно из `actual` heartbeat.
 - Redis-ключи/канал держать в синхроне между
   `backend/app/api/routes/trading.py` и `agent/agent/engine.py`.
 
@@ -121,7 +126,8 @@
 - Вспомогательные сервисы (proxy, adminer, mailpit, playwright) — profile `extras`.
 - Приложение: **http://127.0.0.1:8000/** (порт 80 занят системным httpd).
 - Креды/ключи — в `.env` (не хардкодить).
-- Стратегия стартует **только** кнопкой Start на странице `/strategy` (boot-off).
+- Новый запуск — кнопкой Start на `/strategy`; после рестарта сохраняется resume
+  ранее записанного `running=true`. Для boot-off сначала отправить Stop.
 
 ## 7. Быстрые проверки (среда)
 
@@ -133,6 +139,26 @@
 ---
 
 ## ЖУРНАЛ (последняя задача сверху)
+
+### [2026-09-12] Исправления R01–R14 из REVIEW.md (без новых торговых слоёв)
+- Стратегия: сервисы/эмиссия, snapshot по времени M15, дедуп и backfill полных окон,
+  stale/expired gating, FI без вымышленного нуля, frozen-настройки, Decimal transport
+  и полный provenance. Retry в памяти сохраняет signal_id и не потребляет эпоху до emit.
+- Lifecycle/команды: rollback старта/отмены, listener+heartbeat во время resume,
+  Stop прерывает bootstrap; результаты по ID с TTL 3600; полный Signal в Redis.
+- Backend: атомарный CAS snapshot+publish с revision, superuser GET, типизированные
+  desired/actual. UI: `/trading` без Start, `/strategy` восстанавливает конфигурацию
+  и бережёт draft; корреляция команд, failed/timeout вместо ложного успеха 202.
+- Файлы: `agent/agent/{strategies,engine.py,main.py,common/commands.py,exchange/streams.py}`,
+  `agent/tests/`, `backend/app/api/routes/trading.py`, `backend/tests/test_trading_contract.py`,
+  `frontend/src/{routes/_layout,components/TradingStatusView.tsx,hooks/useCommandTracking.ts,client}`,
+  `frontend/tests/trading-contract.spec.ts`, `frontend/playwright.mock.config.ts`.
+- Проверено: agent 74 tests; backend trading 26 tests; Playwright mock API 5 tests;
+  ruff/format, strict mypy, tsc/biome, Vite build. Есть интеграционный тест настоящих
+  backend commands → Engine → Strategy → Signal с Redis/SDK-заглушками.
+- **Ограничения:** живые Redis/Lua/Binance и полный DB-suite не проверены;
+  Pub/Sub не durable, REST worker thread нельзя принудительно прервать asyncio cancel.
+  Execution/universe/protection/fills/audit storage не реализовывались. См. статус REVIEW.md.
 
 ### [2026-09-12] Ревью готового кода — задания в REVIEW.md
 - Прочитаны `CONTEXT.md`, `DESIGN.md` и спецификация стратегии; проверены сигнальное ядро, lifecycle/команды/SDK-адаптеры, trading API и UI.
@@ -163,7 +189,9 @@
 - **Запуск Стратегии.** Boot-off; страница `/strategy` (frontend) собирает
   параметры и шлёт `start {network, strategy:"tripple_screen", symbols, params}`;
   агент валидирует и запускает. Снапшот `agent:runtime` → resume.
-- **Protector убран.** Защита позиции — часть Стратегии (spec §7). Из backend
+- **Protector убран.** Прежняя формулировка «защита — часть Стратегии» уточнена:
+  spec §7 описывает правила, но их исполнение остаётся будущим слоем вне Signal-only
+  стратегии (DESIGN §6); этот слой пока не реализован. Из backend
   (`StartPayload`/`RuntimeSnapshot`/`TradingStatus`, `/trading/protectors`),
   клиента и UI удалено; `KNOWN_STRATEGIES = ("tripple_screen",)`.
 - **Документация.** `CONTEXT.md` §4 — обязательное требование

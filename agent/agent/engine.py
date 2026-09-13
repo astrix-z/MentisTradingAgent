@@ -5,8 +5,8 @@ plane (heartbeat + signals), builds the SDK-backed services the strategy needs,
 and starts/stops the strategy on command. The strategy is the core; the engine
 contains no trading logic.
 
-The system boots with **no strategy running**. A ``start`` command carrying the
-UI settings starts one; ``stop`` tears it down. Exchange access is exclusively
+The system boots idle unless the saved runtime explicitly has ``running=true``.
+A ``start`` command carrying the UI settings starts one; ``stop`` tears it down. Exchange access is exclusively
 through the adapters in :mod:`agent.exchange`, which wrap ``binance_sdk_spot``.
 """
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -54,6 +55,8 @@ class Engine:
     def __init__(self, redis: Redis) -> None:
         self._redis = redis
         self._task: asyncio.Task[None] | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._startup: asyncio.Task[None] | None = None
         self._network: str = "testnet"
         self._strategy_name: str = ""
         self._state: AgentState = "idle"
@@ -121,49 +124,83 @@ class Engine:
         params: dict[str, Any],
     ) -> None:
         """Start a strategy with the UI settings; raises ValueError if invalid."""
-        normalized = [str(symbol).upper() for symbol in symbols]
-        if not normalized:
-            raise ValueError("at least one symbol is required to start a strategy")
-
+        if network not in ("testnet", "live"):
+            raise ValueError(f"unknown network: {network!r}")
+        if (
+            not isinstance(symbols, list)
+            or not symbols
+            or any(
+                not isinstance(symbol, str)
+                or re.fullmatch(r"[A-Za-z0-9]+", symbol) is None
+                for symbol in symbols
+            )
+        ):
+            raise ValueError("symbols must be non-empty alphanumeric strings")
+        normalized = list(dict.fromkeys(symbol.upper() for symbol in symbols))
         strategy_obj = build_strategy(strategy, params)
 
-        await self.stop()
+        async with self._lifecycle_lock:
+            self._startup = asyncio.create_task(
+                self._start_run(network, strategy, normalized, strategy_obj)
+            )
+            try:
+                await self._startup
+            finally:
+                self._startup = None
 
-        self._network = network
-        self._strategy_name = strategy
-        self._balances = {}
-        self._message = None
-
-        rest = self._ensure_rest(network)
-        streams = MarketDataStreams(network)  # type: ignore[arg-type]
+    async def _start_run(
+        self, network: str, strategy: str, symbols: list[str], strategy_obj: Strategy
+    ) -> None:
         try:
-            await streams.start()
-        except Exception as exc:  # noqa: BLE001 - surface a clear start failure
-            self._state = "error"
-            self._message = f"websocket connect failed: {exc}"
+            await self._stop_run()
+            self._network = network
+            self._strategy_name = strategy
+            self._balances = {}
+            self._message = None
+            rest = self._ensure_rest(network)
+            self._streams = MarketDataStreams(network)  # type: ignore[arg-type]
+            await self._streams.start()
+            # Register before on_start: it can acquire resources and then fail.
+            self._strategy = strategy_obj
+            services = StrategyServices(
+                network=network,
+                symbols=symbols,
+                rest=rest,
+                streams=self._streams,
+                emit=self._on_signal,
+            )
+            await strategy_obj.on_start(services)
+            self._task = asyncio.create_task(self._run_loop())
+            self._state = "running"
             await self.publish_heartbeat()
-            raise ValueError(self._message) from exc
-
-        self._streams = streams
-        self._strategy = strategy_obj
-        services = StrategyServices(
-            network=network,
-            symbols=normalized,
-            rest=rest,
-            streams=streams,
-            emit=self._on_signal,
-        )
-        await strategy_obj.on_start(services)
-
-        self._state = "running"
-        await self.publish_heartbeat()
+        except (Exception, asyncio.CancelledError) as exc:
+            # Shield teardown from repeated Stop/shutdown cancellation requests.
+            cleanup = asyncio.create_task(self._rollback_start(exc))
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            await cleanup
+            raise
         logger.info(
             "strategy started network=%s strategy=%s symbols=%s",
             network,
             strategy,
-            normalized,
+            symbols,
         )
-        self._task = asyncio.create_task(self._run_loop())
+
+    async def _rollback_start(self, exc: BaseException) -> None:
+        self._state = "error"
+        self._message = (
+            "strategy start cancelled"
+            if isinstance(exc, asyncio.CancelledError)
+            else f"strategy start failed: {exc}"
+        )
+        await self._stop_run(reset_state=False)
+        self._rest = None
+        self._rest_network = None
+        await self.publish_heartbeat()
 
     async def _run_loop(self) -> None:
         """Keep the run alive; data arrives through the strategy's WS callbacks."""
@@ -192,23 +229,31 @@ class Engine:
         await self._publish_event("signal", signal)
 
     async def _publish_event(self, kind: str, signal: Signal) -> None:
-        payload = {
-            "kind": kind,
-            "type": signal.type,
-            "symbol": signal.symbol,
-            "reason": signal.reason,
-            "exit_reason": signal.exit_reason,
-            "epoch_id": signal.epoch_id,
-            "emitted_at": signal.emitted_at.isoformat(),
-            "provenance": signal.provenance,
-        }
-        try:
-            await self._redis.publish(REDIS_EVENTS_CHANNEL, json.dumps(payload))
-        except RedisError:
-            logger.warning("cannot publish event (Redis unavailable)")
+        payload = {"kind": kind, **signal.transport()}
+        await self._redis.publish(REDIS_EVENTS_CHANNEL, json.dumps(payload))
 
     async def stop(self) -> None:
-        """Stop the running strategy and release its services."""
+        """Cancel bootstrap before waiting for the serialized lifecycle lock."""
+        if self._startup is not None and not self._startup.done():
+            self._startup.cancel()
+        async with self._lifecycle_lock:
+            await self._stop_run()
+
+    async def _stop_run(self, *, reset_state: bool = True) -> None:
+        """Complete teardown even if its caller is cancelled repeatedly."""
+        cleanup = asyncio.create_task(self._release_run(reset_state=reset_state))
+        cancelled = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+        await cleanup
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _release_run(self, *, reset_state: bool) -> None:
+        """Release a run, including partially initialized services."""
         if self._task is not None and not self._task.done():
             self._task.cancel()
             try:
@@ -231,10 +276,10 @@ class Engine:
             except Exception:  # noqa: BLE001 - best-effort teardown
                 logger.debug("streams stop failed", exc_info=True)
 
-        if self._state != "idle":
+        self._balances = {}
+        if reset_state and self._state != "idle":
             self._state = "idle"
             self._message = None
-            self._balances = {}
             await self.publish_heartbeat()
 
     async def shutdown(self) -> None:
