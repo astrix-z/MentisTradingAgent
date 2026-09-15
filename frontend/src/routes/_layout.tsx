@@ -1,5 +1,6 @@
 import { createFileRoute, Outlet, redirect } from "@tanstack/react-router"
 
+import { UsersService } from "@/client"
 import { Footer } from "@/components/Common/Footer"
 import AppSidebar from "@/components/Sidebar/AppSidebar"
 import {
@@ -7,7 +8,7 @@ import {
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar"
-import { isLoggedIn } from "@/hooks/useAuth"
+import { clearRejectedToken, isLoggedIn } from "@/hooks/useAuth"
 import { CommandTrackingProvider } from "@/hooks/useCommandTracking"
 
 export const Route = createFileRoute("/_layout")({
@@ -17,6 +18,20 @@ export const Route = createFileRoute("/_layout")({
       throw redirect({
         to: "/login",
       })
+    }
+    try {
+      // A present token is not a valid session. Checking here, once for the
+      // whole shell, means the pages below never run with a token the API
+      // rejects — they would otherwise throw out of their own beforeLoad and
+      // render an error instead of asking for a fresh login.
+      await UsersService.readUserMe()
+    } catch (error) {
+      if (clearRejectedToken(error)) {
+        throw redirect({
+          to: "/login",
+        })
+      }
+      throw error
     }
   },
 })

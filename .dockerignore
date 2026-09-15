@@ -1,6 +1,10 @@
 .git
 **/__pycache__
 **/.venv
+# Build output for the served frontend: the image builds its own copy, and
+# copying this one in as well used to leave two generations of hashed chunks
+# side by side (the COPY below does not delete files it does not overwrite).
+backend/app/frontend
 backend/htmlcov
 frontend/blob-report
 frontend/dist
