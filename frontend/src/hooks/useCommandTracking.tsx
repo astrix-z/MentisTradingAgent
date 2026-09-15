@@ -144,3 +144,21 @@ export function useCommandTracking(): CommandTrackingContextValue {
     )
   return context
 }
+
+/**
+ * The most recent tracked command matching `match`, or undefined.
+ *
+ * The provider keeps every tracked command so polling survives navigation, but
+ * a page should show only the command it owns — and only the latest one, so a
+ * repeated request replaces its section instead of piling up.
+ */
+export function latestTrackedCommand(
+  commands: TrackedCommand[],
+  match: (command: TrackedCommand) => boolean,
+): TrackedCommand | undefined {
+  for (let index = commands.length - 1; index >= 0; index -= 1) {
+    const command = commands[index]
+    if (match(command)) return command
+  }
+  return undefined
+}

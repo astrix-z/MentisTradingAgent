@@ -184,7 +184,7 @@ test("strategy seeds desired config, preserves dirty draft and reports rejected 
   await expect(page.getByLabel("Take profit %")).toHaveValue("25")
 })
 
-test("parallel balance commands stay correlated beyond seven seconds", async ({
+test("only the latest balance request is shown, and results stay correlated", async ({
   page,
 }) => {
   const api = await mock(page)
@@ -195,14 +195,24 @@ test("parallel balance commands stay correlated beyond seven seconds", async ({
   await expect(page.getByText("balance — accepted")).toBeVisible()
   await page.getByRole("button", { name: "TESTNET", exact: true }).click()
   await page.getByRole("button", { name: "Check balance", exact: true }).click()
-  await expect(page.getByTestId("command")).toHaveCount(2)
-  api.results.set(firstId, {
-    command_id: secondId,
+  // The newer request replaces the older section instead of adding one.
+  await expect(page.getByTestId("command")).toHaveCount(1)
+  const section = page.getByTestId("command")
+  await expect(section).toContainText(secondId)
+  await expect(section).toContainText("Requested balance network: TESTNET")
+
+  // A result correlated to a different command is never accepted as this one.
+  api.results.set(secondId, {
+    command_id: firstId,
     type: "balance",
     ok: true,
     data: { wrong: true },
     at,
   })
+  await page.clock.runFor(9000)
+  await expect(section).toContainText("pending")
+  await expect(section).not.toContainText("wrong")
+
   api.results.set(secondId, {
     command_id: secondId,
     type: "balance",
@@ -210,24 +220,38 @@ test("parallel balance commands stay correlated beyond seven seconds", async ({
     data: { USDT: 2 },
     at,
   })
-  await page.clock.runFor(9000)
-  const first = page.getByTestId("command").filter({ hasText: firstId })
-  const second = page.getByTestId("command").filter({ hasText: secondId })
-  await expect(first).toContainText("pending")
-  await expect(first).not.toContainText("wrong")
-  await expect(second).toContainText("succeeded")
-  await expect(second).toContainText("Requested balance network: TESTNET")
+  await page.clock.runFor(2000)
+  await expect(section).toContainText("succeeded")
+  await expect(section).toContainText('"USDT": 2')
+  // The superseded request is still polled; the swap dropped nothing.
+  expect(api.reads).toContain(firstId)
+  expect(api.reads).toContain(secondId)
+  expect(api.reads).not.toContain("MISSING")
+})
+
+test("balances never appear on the Strategy page", async ({ page }) => {
+  const api = await mock(page)
+  await page.goto("/balance")
+  await page.clock.install()
+  await page.getByRole("button", { name: "TESTNET", exact: true }).click()
+  await page.getByRole("button", { name: "Check balance", exact: true }).click()
   api.results.set(firstId, {
     command_id: firstId,
     type: "balance",
     ok: true,
-    data: { USDT: 1 },
+    data: { USDT: 777.5 },
     at,
   })
   await page.clock.runFor(2000)
-  await expect(first).toContainText("succeeded")
-  await expect(first).toContainText("Requested balance network: LIVE")
-  expect(api.reads).not.toContain("MISSING")
+  await expect(page.getByText(/777.5/)).toBeVisible()
+
+  await page.getByRole("link", { name: "Strategy", exact: true }).click()
+  await expect(page).toHaveURL(/\/strategy$/)
+  // Neither the tracked balance command nor the heartbeat balances belong here.
+  await expect(page.getByTestId("command")).toHaveCount(0)
+  await expect(page.getByText("balance — succeeded")).toHaveCount(0)
+  await expect(page.getByText(/777.5/)).toHaveCount(0)
+  await expect(page.getByText(/Heartbeat balances/)).toHaveCount(0)
 })
 
 test("offline stop remains pending then times out without success", async ({
@@ -299,16 +323,19 @@ test("a command started on /strategy keeps polling and resolves after navigating
   await expect(page.getByText("stop — accepted")).toBeVisible()
   await page.clock.runFor(2000)
   await expect(page.getByText("stop — pending")).toBeVisible()
+  const pollsBefore = api.reads.filter((id) => id === firstId).length
 
   await page.getByRole("link", { name: "Balance", exact: true }).click()
   await expect(page).toHaveURL(/\/balance$/)
-  // Still tracked after the route change; no duplicate poll for the same id.
-  await expect(page.getByText("stop — pending")).toBeVisible()
-
+  // The stop belongs to the Strategy page, and is still tracked and polled
+  // while we are away from it. Poll rather than sampling once: whether a tick
+  // has already landed depends on the app's timers versus the fake clock.
+  await expect(page.getByText("stop — pending")).toHaveCount(0)
   api.results.set(firstId, { command_id: firstId, type: "stop", ok: true, at })
   await page.clock.runFor(2000)
-  await expect(page.getByText("stop — succeeded")).toBeVisible()
-  expect(api.reads.filter((id) => id === firstId).length).toBeGreaterThan(0)
+  await expect
+    .poll(() => api.reads.filter((id) => id === firstId).length)
+    .toBeGreaterThan(pollsBefore)
 
   await page.getByRole("link", { name: "Strategy", exact: true }).click()
   await expect(page).toHaveURL(/\/strategy$/)
@@ -403,6 +430,47 @@ test("desired/actual confirmed-running and stopped states render distinct contro
   await expect(
     page.getByRole("button", { name: "Stop", exact: true }),
   ).toBeDisabled()
+})
+
+test("a rejected session asks for a fresh login instead of half a menu", async ({
+  page,
+}) => {
+  // Every way `GET /users/me` can refuse a stored session: 403/401 for a token
+  // it cannot validate, 404 when the token names a user that no longer exists
+  // (a recreated database — the case that showed "Oops!" on every page), 400
+  // for a deactivated user.
+  for (const status of [400, 401, 403, 404]) {
+    await test.step(`GET /users/me answers ${status}`, async () => {
+      await mock(page)
+      await page.route("**/api/v1/users/me", (route) =>
+        route.fulfill({ status, json: { detail: "rejected" } }),
+      )
+      await page.goto("/strategy")
+      // Previously this rendered an error page with only Dashboard/Items in
+      // the menu, because a present token was treated as a valid session.
+      await expect(page).toHaveURL(/\/login$/)
+      await expect(page.getByTestId("email-input")).toBeVisible()
+      expect(
+        await page.evaluate(() => localStorage.getItem("access_token")),
+      ).toBeNull()
+    })
+  }
+})
+
+test("a server failure is not misreported as a signed-out session", async ({
+  page,
+}) => {
+  for (const status of [500, 503]) {
+    await mock(page)
+    await page.route("**/api/v1/users/me", (route) =>
+      route.fulfill({ status, json: { detail: "boom" } }),
+    )
+    await page.goto("/strategy")
+    await expect(page).not.toHaveURL(/\/login$/)
+    expect(
+      await page.evaluate(() => localStorage.getItem("access_token")),
+    ).toBe("mock-token")
+  }
 })
 
 test("unpublished catalog shows a message and blocks Start instead of an empty form", async ({

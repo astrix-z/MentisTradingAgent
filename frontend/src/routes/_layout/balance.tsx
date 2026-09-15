@@ -6,7 +6,10 @@ import { type NetworkRequest, TradingService, UsersService } from "@/client"
 import { CommandTrackingView } from "@/components/CommandTrackingView"
 import { TradingStatusView } from "@/components/TradingStatusView"
 import { Button } from "@/components/ui/button"
-import { useCommandTracking } from "@/hooks/useCommandTracking"
+import {
+  latestTrackedCommand,
+  useCommandTracking,
+} from "@/hooks/useCommandTracking"
 import useCustomToast from "@/hooks/useCustomToast"
 import { handleError } from "@/utils"
 
@@ -28,6 +31,12 @@ function Balance() {
   const [network, setNetwork] = useState<NetworkRequest["network"]>()
   const { commands, track } = useCommandTracking()
   const { showErrorToast } = useCustomToast()
+  // Only the newest request: a refresh replaces the previous section rather
+  // than adding another one.
+  const latestBalanceCommand = latestTrackedCommand(
+    commands,
+    (command) => command.envelope.type === "balance",
+  )
   const balanceMutation = useMutation({
     mutationFn: (network: NonNullable<NetworkRequest["network"]>) =>
       TradingService.fetchBalance({ body: { network } }),
@@ -44,7 +53,7 @@ function Balance() {
           the strategy configuration and does not start or stop trading.
         </p>
       </div>
-      <TradingStatusView status={status} error={isError} />
+      <TradingStatusView status={status} error={isError} balances />
       <section className="space-y-3" aria-label="Balance request">
         <h2 className="font-semibold">Check balance</h2>
         <p>
@@ -71,7 +80,9 @@ function Balance() {
             Check balance
           </Button>
         </div>
-        <CommandTrackingView commands={commands} />
+        <CommandTrackingView
+          commands={latestBalanceCommand ? [latestBalanceCommand] : []}
+        />
       </section>
     </div>
   )

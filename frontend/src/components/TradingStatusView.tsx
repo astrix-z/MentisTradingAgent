@@ -3,9 +3,15 @@ import type { TradingStatus } from "@/client"
 export function TradingStatusView({
   status,
   error,
+  balances = false,
 }: {
   status?: TradingStatus
   error?: boolean
+  /**
+   * Heartbeat balances belong to the Balance page. Off by default so account
+   * amounts cannot leak onto a page that is about configuration and control.
+   */
+  balances?: boolean
 }) {
   if (!status) return <p>{error ? "Status unavailable" : "Loading status…"}</p>
   const { desired, actual, online } = status
@@ -46,7 +52,7 @@ export function TradingStatusView({
           heartbeat.
         </p>
       )}
-      {actual?.balances && (
+      {balances && actual?.balances && (
         <div>
           <h2 className="font-semibold">
             Heartbeat balances —{" "}

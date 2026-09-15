@@ -31,7 +31,11 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { useCommandTracking } from "@/hooks/useCommandTracking"
+import {
+  latestTrackedCommand,
+  type TrackedCommand,
+  useCommandTracking,
+} from "@/hooks/useCommandTracking"
 import useCustomToast from "@/hooks/useCustomToast"
 import { cn } from "@/lib/utils"
 import { handleError } from "@/utils"
@@ -54,6 +58,11 @@ const strategyCatalogQueryOptions = () => ({
   queryFn: async () => (await TradingService.listStrategies()).data,
   queryKey: ["strategy-catalog"],
 })
+
+// This page owns start/stop only: a balance request belongs to /balance, and
+// showing its result here would put account amounts on the settings page.
+const isLifecycleCommand = (command: TrackedCommand) =>
+  command.envelope.type === "start" || command.envelope.type === "stop"
 
 export const Route = createFileRoute("/_layout/strategy")({
   component: Strategy,
@@ -158,12 +167,10 @@ function Strategy() {
 
   // The latest tracked start/stop command drives the "awaiting confirmation"
   // and "timeout" control states; a 202 Accepted is never treated as success.
-  const latestLifecycleCommand = useMemo(() => {
-    const lifecycle = commands.filter(
-      (c) => c.envelope.type === "start" || c.envelope.type === "stop",
-    )
-    return lifecycle.length > 0 ? lifecycle[lifecycle.length - 1] : undefined
-  }, [commands])
+  const latestLifecycleCommand = useMemo(
+    () => latestTrackedCommand(commands, isLifecycleCommand),
+    [commands],
+  )
 
   const mismatch =
     !!status &&
@@ -283,7 +290,9 @@ function Strategy() {
         </p>
       </div>
 
-      <CommandTrackingView commands={commands} />
+      <CommandTrackingView
+        commands={latestLifecycleCommand ? [latestLifecycleCommand] : []}
+      />
       <p role="status">{CONTROL_STATE_COPY[controlState]}</p>
       <p>
         {dirty
