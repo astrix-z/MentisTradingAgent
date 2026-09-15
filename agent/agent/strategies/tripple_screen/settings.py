@@ -1,4 +1,10 @@
-"""Validated, immutable startup configuration (Triple Screen spec §10)."""
+"""Validated, immutable startup configuration (Triple Screen spec §10).
+
+Field ``title``s are the UI labels and ``json_schema_extra`` carries the widget
+hints the frontend needs; both travel to the backend/UI through the published
+catalog (see :mod:`agent.protocol`), so this module stays the only place that
+knows the parameter set — including how it should be presented.
+"""
 
 from __future__ import annotations
 
@@ -25,27 +31,51 @@ def interval_ms(interval: str) -> int:
 class TripleScreenSettings(BaseModel):
     model_config = ConfigDict(frozen=True, allow_inf_nan=False)
 
-    quote_asset: Literal["USDT", "USDC"] = "USDT"
-    tide_interval: str = "4h"
-    wave_interval: str = "1h"
-    ripple_interval: str = "15m"
-    ema_tide_periods: tuple[PositiveInt, PositiveInt, PositiveInt] = (5, 13, 34)
-    stochastic_k_period: PositiveInt = 5
-    stochastic_d_period: PositiveInt = 3
-    stochastic_slow_period: PositiveInt = 3
-    fi_ema_period: PositiveInt = 2
-    oversold_threshold: Decimal = Field(default=Decimal(20), gt=0, lt=100)
-    swing_low_h1_n: PositiveInt = 2
-    trail_m15_n: PositiveInt = 2
-    stop_buffer_pct: Decimal = Field(default=Decimal("0.1"), ge=0, lt=100)
-    min_stop_distance_pct: Decimal = Field(default=Decimal(1), gt=0, lt=100)
-    tp_pct: Decimal = Field(default=Decimal(10), gt=0)
-    cooldown_minutes: int = Field(default=60, ge=0)
-    signal_validity_minutes: PositiveInt = 15
-    rest_concurrency: int = Field(default=3, ge=3, le=5)
-    ws_top_n: PositiveInt = 50
-    volume_window: Literal["24h"] = "24h"
-    kline_window: PositiveInt = 1000
+    quote_asset: Literal["USDT", "USDC"] = Field(default="USDT", title="Quote asset")
+    tide_interval: str = Field(
+        default="4h",
+        title="Tide interval",
+        json_schema_extra={"ui": {"widget": "interval"}},
+    )
+    wave_interval: str = Field(
+        default="1h",
+        title="Wave interval",
+        json_schema_extra={"ui": {"widget": "interval"}},
+    )
+    ripple_interval: str = Field(
+        default="15m",
+        title="Ripple interval",
+        json_schema_extra={"ui": {"widget": "interval"}},
+    )
+    ema_tide_periods: tuple[PositiveInt, PositiveInt, PositiveInt] = Field(
+        default=(5, 13, 34), title="EMA tide periods"
+    )
+    stochastic_k_period: PositiveInt = Field(default=5, title="Stochastic %K period")
+    stochastic_d_period: PositiveInt = Field(default=3, title="Stochastic %D period")
+    stochastic_slow_period: PositiveInt = Field(
+        default=3, title="Stochastic slow period"
+    )
+    fi_ema_period: PositiveInt = Field(default=2, title="Force index EMA period")
+    oversold_threshold: Decimal = Field(
+        default=Decimal(20), gt=0, lt=100, title="Oversold threshold"
+    )
+    swing_low_h1_n: PositiveInt = Field(default=2, title="Swing low H1 N")
+    trail_m15_n: PositiveInt = Field(default=2, title="Trail M15 N")
+    stop_buffer_pct: Decimal = Field(
+        default=Decimal("0.1"), ge=0, lt=100, title="Stop buffer %"
+    )
+    min_stop_distance_pct: Decimal = Field(
+        default=Decimal(1), gt=0, lt=100, title="Min stop distance %"
+    )
+    tp_pct: Decimal = Field(default=Decimal(10), gt=0, title="Take profit %")
+    cooldown_minutes: int = Field(default=60, ge=0, title="Cooldown (minutes)")
+    signal_validity_minutes: PositiveInt = Field(
+        default=15, title="Signal validity (minutes)"
+    )
+    rest_concurrency: int = Field(default=3, ge=3, le=5, title="REST concurrency")
+    ws_top_n: PositiveInt = Field(default=50, title="WS top N symbols")
+    volume_window: Literal["24h"] = Field(default="24h", title="Volume window")
+    kline_window: PositiveInt = Field(default=1000, title="Kline window")
 
     @model_validator(mode="after")
     def coherent(self) -> Self:

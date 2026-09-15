@@ -21,6 +21,7 @@ from agent.strategies.tripple_screen.indicators import (
     sma_of_optional,
     stochastic_k_series,
 )
+from agent.strategies.tripple_screen.schema import CONSTRAINTS, LOOKUPS
 from agent.strategies.tripple_screen.settings import TripleScreenSettings, interval_ms
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 @strategy("tripple_screen")
 class TripleScreenStrategy(Strategy):
+    label = "Triple Screen"
+    settings_model = TripleScreenSettings
+    settings_constraints = CONSTRAINTS
+    settings_lookups = LOOKUPS
+
     def __init__(self, params: dict[str, Any]) -> None:
         super().__init__(params)
         self._settings = TripleScreenSettings.from_params(params)

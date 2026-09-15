@@ -20,6 +20,8 @@ from decimal import Decimal
 from typing import Any, ClassVar, Literal
 from uuid import uuid4
 
+from pydantic import BaseModel
+
 from agent.exchange.rest import ExchangeRest
 from agent.exchange.streams import MarketDataStreams
 
@@ -101,10 +103,38 @@ class StrategyServices:
 
 
 class Strategy(abc.ABC):
-    """Base class for trading strategies."""
+    """Base class for trading strategies.
+
+    A strategy also *owns its configuration contract*: the pydantic model of
+    its ``params``, the cross-field rules that model cannot express in JSON
+    Schema, and the value tables those rules index. The agent publishes all of
+    it to the backend (see :mod:`agent.protocol`) so that the API and the UI
+    validate and render against the strategy's own declaration rather than a
+    copy of it.
+    """
 
     #: Registry key; must be unique across the ``strategies`` package.
     name: ClassVar[str] = ""
+
+    #: Human-readable name for the UI; falls back to the registry key.
+    label: ClassVar[str] = ""
+
+    #: Pydantic model validating this strategy's ``params``. ``None`` means the
+    #: strategy takes no settings; its JSON Schema is published as-is.
+    settings_model: ClassVar[type[BaseModel] | None] = None
+
+    #: Cross-field rules the settings schema cannot express, in the constraint
+    #: grammar documented in :mod:`agent.protocol`. Evaluated against ``params``
+    #: by every consumer (backend before accepting a Start, UI before sending
+    #: one), so the rule text is never mirrored by hand.
+    settings_constraints: ClassVar[list[dict[str, Any]]] = []
+
+    #: Named value tables referenced by :attr:`settings_constraints` via
+    #: ``{"lookup": "<name>", "field": "<field>"}``. Declared by the strategy
+    #: because only it knows which exchange/SDK values back its fields. A field
+    #: marked ``{"ui": {"widget": "interval"}}`` takes its allowed values from
+    #: the ``intervals_ms`` table.
+    settings_lookups: ClassVar[dict[str, dict[str, int]]] = {}
 
     def __init__(self, params: dict[str, Any]) -> None:
         self._params = deepcopy(params)

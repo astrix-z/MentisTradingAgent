@@ -55,7 +55,9 @@
    Стратегией. Существующий resume сохранён: намерение `running=true` восстанавливается
    после рестарта, включая LIVE; Stop сохраняет `running=false`.
 2. Отдельная страница UI `/strategy` — единственное место настройки и пуск/стоп.
-   Поля страницы жёстко привязаны к параметрам Стратегии (spec §10).
+   Страница рендерится из **каталога стратегий**, который публикует агент
+   (`agent:strategies`): схема параметров, лейблы полей и междоменные правила
+   приходят от агента, а не дублируются в UI.
 3. Кнопка **Start** → backend публикует команду `start` → Redis → агент.
 4. Агент валидирует `params`, создаёт Стратегию и запускает её с этими настройками.
 5. **Stop** ведёт к `engine.stop()` (стратегия/потоки гасятся).
@@ -78,8 +80,20 @@
 - Живость: heartbeat `trading:heartbeat` (TTL 30 c). `GET /trading/status` =
   `{desired, actual, online}` только для superuser. `desired` включает params/revision;
   сеть/стратегия/balances факта берутся исключительно из `actual` heartbeat.
+- **Каталог стратегий** — `agent:strategies` (без TTL), публикуется агентом при
+  старте и периодически. Содержит JSON Schema `settings_schema` для `params`,
+  междоменные `constraints` (декларативный AST) и таблицы `lookups`. Схема —
+  единственный источник правды: `TripleScreenSettings` принадлежит **только**
+  агенту, backend его не импортирует. Backend компилирует каталог и авторитетно
+  проверяет `params` до записи в Redis (невалидное → 422); каталога нет или он не
+  интерпретируем → 503, а не «считаем валидным». Спецификация формата —
+  `agent/agent/protocol.py`.
+- `GET /trading/strategies/` (superuser) отдаёт каталог UI целиком;
+  `available: false` означает «агент ещё не публиковал», это не ошибка.
 - Redis-ключи/канал держать в синхроне между
-  `backend/app/api/routes/trading.py` и `agent/agent/engine.py`.
+  `backend/app/api/routes/trading.py`, `agent/agent/engine.py` и
+  `backend/app/core/strategy_catalog.py`; расхождение каталога ловит
+  `backend/tests/test_strategy_catalog_fidelity.py`.
 
 ## 4. ОБЯЗАТЕЛЬНО: работа с биржей только через `binance_sdk_spot`
 
@@ -139,6 +153,40 @@
 ---
 
 ## ЖУРНАЛ (последняя задача сверху)
+
+### [2026-09-15] Каталог стратегий: схема настроек принадлежит только агенту
+- `TripleScreenSettings` больше не импортируется backend'ом (это же чинило падение
+  backend-контейнера `ModuleNotFoundError: No module named 'agent'`). Агент публикует
+  `agent:strategies`: JSON Schema `params` + междоменные `constraints` (декларативный
+  AST) + `lookups`; публикация валидируется на своей же схеме и падает fast при
+  невычисляемом правиле.
+- Backend **остаётся авторитетным валидатором**: `app/core/strategy_catalog.py`
+  компилирует каталог в pydantic-модель (+ свои границы элементов массива, enum
+  через membership-валидатор) и вычисляет constraints. Невалидное → 422 до Redis;
+  каталога нет/он неинтерпретируем → 503. `KNOWN_STRATEGIES`/`STRATEGY_SETTINGS`
+  удалены, `GET /trading/strategies/` отдаёт каталог целиком с `available`.
+- UI: `strategy.tsx` больше не содержит копии схемы (`DEFAULT_PARAMS`, `FIELDS`,
+  `VALID_INTERVALS`, `crossValidate` удалены); форма, лейблы (`title`), значения
+  (`default`) и правила строятся из каталога (`components/strategy-form/strategySchema.ts`).
+  Десятичные поля отправляются строками. `available:false` → сообщение и блокировка Start.
+- Файлы: `agent/agent/protocol.py`, `agent/agent/engine.py`, `agent/agent/main.py`,
+  `agent/agent/strategies/base.py`, `agent/agent/strategies/tripple_screen/{settings.py,schema.py,strategy.py}`,
+  `agent/tests/test_strategy_catalog.py`,
+  `backend/app/core/strategy_catalog.py`, `backend/app/api/routes/trading.py`,
+  `backend/tests/{test_trading_contract.py,test_strategy_catalog_fidelity.py}`,
+  `frontend/src/routes/_layout/strategy.tsx`, `frontend/src/components/strategy-form/strategySchema.ts`,
+  `frontend/tests/{trading-contract.spec.ts,fixtures/strategy-catalog.json}`,
+  `scripts/write_strategy_catalog_fixture.py`.
+- Проверено: agent 110 passed/6 skipped (30 новых), backend trading 48 + fidelity 28
+  (fidelity компилирует реальный опубликованный документ и сверяет вердикты с моделью
+  агента, плюс round-trip через реальные байты и общее имя ключа); Playwright mock 13 passed;
+  vite build; ruff check, strict mypy (backend/app, agent/agent).
+- **Ограничения:** живые Redis/Binance и e2e против реального backend не проверены;
+  полный DB-suite не запускался. `ty check` даёт 1 давнюю диагностику в
+  `trading.py` (`await redis.hgetall`, чужой незакоммиченный код) — не трогал.
+- Осознанные ограничения контракта: позиционные массивы с разнотипными элементами
+  backend не компилирует (отказ, а не приближение); пattern для Decimal-строк
+  не проверяется ни одной из сторон (только `Decimal` + `allow_inf_nan=false`).
 
 ### [2026-09-12] Исправления R01–R14 из REVIEW.md (без новых торговых слоёв)
 - Стратегия: сервисы/эмиссия, snapshot по времени M15, дедуп и backfill полных окон,

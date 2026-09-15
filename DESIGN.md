@@ -172,10 +172,14 @@ class Strategy(abc.ABC):
 
 ## 7. Влияние на backend/frontend
 
-- `backend/app/api/routes/trading.py`: команды/снапшот/статус/результат;
-  `KNOWN_STRATEGIES` синхронизирован с реестром агента. `protector` удалён.
-- `frontend/src/routes/_layout/strategy.tsx`: настройки Стратегии (жёстко под
-  параметры Triple Screen) + Start/Stop; шлёт `start {network, strategy, symbols, params}`.
+- `backend/app/api/routes/trading.py`: команды/снапшот/статус/результат. Список
+  стратегий и правила их параметров здесь **не** перечисляются: агент публикует их
+  в `agent:strategies`, а `backend/app/core/strategy_catalog.py` компилирует
+  опубликованное и проверяет `params` до записи в Redis. `protector` удалён.
+- `frontend/src/routes/_layout/strategy.tsx`: форма настроек строится из каталога
+  агента (лейблы — `title` полей, значения — `default`, междоменные правила —
+  `constraints`); локальных копий схемы Triple Screen нет. Шлёт
+  `start {network, strategy, symbols, params}`.
 - `/trading` — только наблюдение и отдельный запрос баланса; никаких неявных Start.
 - `GET /trading/status/` (superuser) возвращает `{desired, actual, online}`.
   `desired` содержит params и revision, `actual` — последний heartbeat со своей

@@ -22,18 +22,39 @@ from typing import Any, Literal
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from agent.exchange import ExchangeError, ExchangeRest, MarketDataStreams, balance_map
+from agent.exchange import (
+    ExchangeError,
+    ExchangeRest,
+    MarketDataStreams,
+    balance_map,
+    balance_snapshot,
+)
 from agent.strategies import Signal, Strategy, StrategyServices, build_strategy
 
 logger = logging.getLogger(__name__)
 
-# Redis keys/channels shared with the backend (keep in sync with
+# Redis keys/streams shared with the backend (keep in sync with
 # backend/app/api/routes/trading.py).
-REDIS_COMMAND_CHANNEL = "agent:commands"
+REDIS_COMMAND_STREAM = "agent:commands:stream"
+REDIS_COMMAND_GROUP = "agent-workers"
+# Fixed consumer name: the engine owns exactly one running strategy, so a
+# single named consumer is enough, and it lets a restart reclaim its own
+# pending (unacked) entries by reading id "0" instead of needing XCLAIM.
+REDIS_COMMAND_CONSUMER = "primary"
 REDIS_RUNTIME_KEY = "agent:runtime"
 REDIS_HEARTBEAT_KEY = "trading:heartbeat"
 REDIS_RESULT_KEY = "agent:result"
+REDIS_COMMAND_STATE_PREFIX = "agent:command:"
 REDIS_EVENTS_CHANNEL = "agent:events"
+# Published strategy catalog (settings schema + cross-field constraints) that
+# the backend validates Start params against; see agent/protocol.py.
+REDIS_STRATEGIES_KEY = "agent:strategies"
+
+# Command state TTLs (keep in sync with backend/app/api/routes/trading.py):
+# short while in flight, long once terminal.
+COMMAND_STATE_TTL_ACTIVE = 3600
+COMMAND_STATE_TTL_TERMINAL = 86400
+TERMINAL_STATUSES = ("succeeded", "failed", "timed_out")
 
 # How often the heartbeat is published; keep below the backend staleness window.
 HEARTBEAT_INTERVAL = 5.0
@@ -106,6 +127,12 @@ class Engine:
         if target == self._network:
             self._balances = balances
         return balances
+
+    async def fetch_account_balance_snapshot(self, network: str) -> list[dict[str, str]]:
+        """Return non-zero ``{asset, free, locked}`` rows (Decimal strings) for
+        ``network`` — the typed shape returned by the ``balance`` command."""
+        rest = self._ensure_rest(network)
+        return balance_snapshot(await rest.balances())
 
     async def _refresh_balance_quiet(self) -> None:
         try:

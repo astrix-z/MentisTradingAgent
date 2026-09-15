@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # Control/status plane between backend and agent (commands + liveness).
     REDIS_URL: str = "redis://localhost:6379/0"
 
+    # Server-side deadline for a command's network I/O (e.g. exchange calls
+    # during start/balance), so a stuck call reports a clear timeout instead
+    # of hanging indefinitely.
+    COMMAND_IO_TIMEOUT_SECONDS: float = 20.0
+
     # Own settings DB: a dedicated database on the project's Postgres.
     # Optional at boot so the daemon can start and report a warning if missing.
     AGENT_DB_URL: PostgresDsn | None = None

@@ -1,10 +1,17 @@
 import { useMutation, useQuery } from "@tanstack/react-query"
 import { createFileRoute, redirect } from "@tanstack/react-router"
 import { Play, Square } from "lucide-react"
-import { useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 
 import { type StartPayload, TradingService, UsersService } from "@/client"
 import { CommandTrackingView } from "@/components/CommandTrackingView"
+import {
+  type FieldValues,
+  formatParamValue,
+  parseSettingsSchema,
+  seedFormValues,
+  validateSettings,
+} from "@/components/strategy-form/strategySchema"
 import { TradingStatusView } from "@/components/TradingStatusView"
 import { Button } from "@/components/ui/button"
 import {
@@ -14,6 +21,14 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useCommandTracking } from "@/hooks/useCommandTracking"
@@ -22,92 +37,22 @@ import { cn } from "@/lib/utils"
 import { handleError } from "@/utils"
 
 type Network = NonNullable<StartPayload["network"]>
-
-const STRATEGY = "tripple_screen"
-
-// Triple Screen defaults (must match agent/agent/strategies/tripple_screen/settings.py).
-const DEFAULT_PARAMS = {
-  quote_asset: "USDT",
-  tide_interval: "4h",
-  wave_interval: "1h",
-  ripple_interval: "15m",
-  ema_tide_periods: [5, 13, 34],
-  stochastic_k_period: 5,
-  stochastic_d_period: 3,
-  stochastic_slow_period: 3,
-  fi_ema_period: 2,
-  oversold_threshold: 20,
-  swing_low_h1_n: 2,
-  trail_m15_n: 2,
-  stop_buffer_pct: 0.1,
-  min_stop_distance_pct: 1,
-  tp_pct: 10,
-  cooldown_minutes: 60,
-  signal_validity_minutes: 15,
-  rest_concurrency: 3,
-  ws_top_n: 50,
-  volume_window: "24h",
-  kline_window: 1000,
-} satisfies Record<string, string | number | number[]>
-
-type ParamKey = keyof typeof DEFAULT_PARAMS
-type FieldType = "string" | "number" | "numberArray"
-
-type FieldDef = {
-  key: ParamKey
-  label: string
-  type: FieldType
-}
-
-const FIELDS: FieldDef[] = [
-  { key: "quote_asset", label: "Quote asset", type: "string" },
-  { key: "tide_interval", label: "Tide interval", type: "string" },
-  { key: "wave_interval", label: "Wave interval", type: "string" },
-  { key: "ripple_interval", label: "Ripple interval", type: "string" },
-  { key: "ema_tide_periods", label: "EMA tide periods", type: "numberArray" },
-  { key: "stochastic_k_period", label: "Stochastic %K period", type: "number" },
-  { key: "stochastic_d_period", label: "Stochastic %D period", type: "number" },
-  {
-    key: "stochastic_slow_period",
-    label: "Stochastic slow period",
-    type: "number",
-  },
-  { key: "fi_ema_period", label: "Force index EMA period", type: "number" },
-  { key: "oversold_threshold", label: "Oversold threshold", type: "number" },
-  { key: "swing_low_h1_n", label: "Swing low H1 N", type: "number" },
-  { key: "trail_m15_n", label: "Trail M15 N", type: "number" },
-  { key: "stop_buffer_pct", label: "Stop buffer %", type: "number" },
-  {
-    key: "min_stop_distance_pct",
-    label: "Min stop distance %",
-    type: "number",
-  },
-  { key: "tp_pct", label: "Take profit %", type: "number" },
-  { key: "cooldown_minutes", label: "Cooldown (minutes)", type: "number" },
-  {
-    key: "signal_validity_minutes",
-    label: "Signal validity (minutes)",
-    type: "number",
-  },
-  { key: "rest_concurrency", label: "REST concurrency", type: "number" },
-  { key: "ws_top_n", label: "WS top N symbols", type: "number" },
-  { key: "volume_window", label: "Volume window", type: "string" },
-  { key: "kline_window", label: "Kline window", type: "number" },
-]
-
-const initialValues = (): Record<ParamKey, string> => {
-  const values = {} as Record<ParamKey, string>
-  for (const field of FIELDS) {
-    const value = DEFAULT_PARAMS[field.key]
-    values[field.key] = Array.isArray(value) ? value.join(", ") : String(value)
-  }
-  return values
+type ValidatedStart = {
+  network: Network
+  strategy: string
+  symbols: string[]
+  params: Record<string, unknown>
 }
 
 const tradingStatusQueryOptions = () => ({
   queryFn: async () => (await TradingService.getStatus()).data,
   queryKey: ["trading-status"],
   refetchInterval: 5000,
+})
+
+const strategyCatalogQueryOptions = () => ({
+  queryFn: async () => (await TradingService.listStrategies()).data,
+  queryKey: ["strategy-catalog"],
 })
 
 export const Route = createFileRoute("/_layout/strategy")({
@@ -129,35 +74,65 @@ export const Route = createFileRoute("/_layout/strategy")({
   }),
 })
 
+type ControlState =
+  | "loading"
+  | "timeout"
+  | "awaiting-start"
+  | "awaiting-stop"
+  | "error"
+  | "offline"
+  | "running-confirmed"
+  | "stopped-confirmed"
+  | "unconfirmed"
+
 function Strategy() {
   const { showErrorToast } = useCustomToast()
   const { commands, track } = useCommandTracking()
   const { data: status, isError } = useQuery(tradingStatusQueryOptions())
+  const { data: catalog, isError: isCatalogError } = useQuery(
+    strategyCatalogQueryOptions(),
+  )
 
   const [network, setNetwork] = useState<Network>("testnet")
   const [symbolsInput, setSymbolsInput] = useState("")
-  const [values, setValues] = useState<Record<ParamKey, string>>(initialValues)
+  const [values, setValues] = useState<FieldValues>({})
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
+  const [formErrors, setFormErrors] = useState<string[]>([])
+  const [symbolsError, setSymbolsError] = useState<string | null>(null)
+  const [pendingLiveStart, setPendingLiveStart] =
+    useState<ValidatedStart | null>(null)
 
   const [dirty, setDirty] = useState(false)
-  const [strategy, setStrategy] = useState(STRATEGY)
+  const [strategy, setStrategy] = useState("")
   const [savedParams, setSavedParams] = useState<Record<string, unknown>>({})
+
+  const strategies = catalog?.strategies
+  const activeStrategy = useMemo(() => {
+    const list = strategies ?? []
+    if (list.length === 0) return undefined
+    return list.find((item) => item.name === strategy) ?? list[0]
+  }, [strategies, strategy])
+  const fields = useMemo(
+    () => parseSettingsSchema(activeStrategy?.settings_schema),
+    [activeStrategy],
+  )
+  const offeredNames = useMemo(
+    () => new Set((strategies ?? []).map((item) => item.name)),
+    [strategies],
+  )
+  const activeLabel = activeStrategy?.label ?? "strategy"
+  const catalogReady = !!catalog && catalog.available !== false
+  const strategyOffered = strategy !== "" && offeredNames.has(strategy)
+
   useEffect(() => {
-    if (dirty || !status) return
+    if (dirty || !status || fields.length === 0) return
     const snapshot = status.desired
-    const next = initialValues()
-    for (const field of FIELDS) {
-      const value = snapshot.params?.[field.key]
-      if (value !== undefined)
-        next[field.key] = Array.isArray(value)
-          ? value.join(", ")
-          : String(value)
-    }
-    setValues(next)
+    setValues(seedFormValues(fields, snapshot.params))
     setNetwork(snapshot.network ?? "testnet")
-    setStrategy(snapshot.strategy ?? STRATEGY)
+    setStrategy(snapshot.strategy ?? "")
     setSymbolsInput((snapshot.symbols ?? []).join(", "))
     setSavedParams(snapshot.params ?? {})
-  }, [status, dirty])
+  }, [status, fields, dirty])
 
   const parsedSymbols = Array.from(
     new Set(
@@ -181,68 +156,135 @@ function Strategy() {
 
   const pending = startMutation.isPending || stopMutation.isPending
 
-  const setValue = (key: ParamKey, value: string) => {
+  // The latest tracked start/stop command drives the "awaiting confirmation"
+  // and "timeout" control states; a 202 Accepted is never treated as success.
+  const latestLifecycleCommand = useMemo(() => {
+    const lifecycle = commands.filter(
+      (c) => c.envelope.type === "start" || c.envelope.type === "stop",
+    )
+    return lifecycle.length > 0 ? lifecycle[lifecycle.length - 1] : undefined
+  }, [commands])
+
+  const mismatch =
+    !!status &&
+    (!status.actual ||
+      status.desired.running !== (status.actual.state === "running") ||
+      (status.desired.running &&
+        (status.desired.network !== status.actual.network ||
+          status.desired.strategy !== status.actual.strategy)))
+
+  const controlState: ControlState = useMemo(() => {
+    if (!status) return "loading"
+    if (latestLifecycleCommand?.phase === "timeout") return "timeout"
+    if (
+      latestLifecycleCommand &&
+      (latestLifecycleCommand.phase === "accepted" ||
+        latestLifecycleCommand.phase === "pending")
+    ) {
+      return latestLifecycleCommand.envelope.type === "start"
+        ? "awaiting-start"
+        : "awaiting-stop"
+    }
+    if (status.actual?.state === "error") return "error"
+    if (!status.online) return "offline"
+    if (
+      status.desired.running &&
+      status.actual?.state === "running" &&
+      !mismatch
+    )
+      return "running-confirmed"
+    if (!status.desired.running && status.actual?.state !== "running")
+      return "stopped-confirmed"
+    return "unconfirmed"
+  }, [status, latestLifecycleCommand, mismatch])
+
+  const CONTROL_STATE_COPY: Record<ControlState, string> = {
+    loading: "Loading agent status…",
+    timeout:
+      "No confirmation for the last command within 120 seconds; outcome unknown.",
+    "awaiting-start": "Start sent; awaiting agent confirmation.",
+    "awaiting-stop": "Stop sent; awaiting agent confirmation.",
+    error: "Agent reported an error state.",
+    offline:
+      "Agent offline / stale heartbeat; last known state may be outdated.",
+    "running-confirmed": "Confirmed running with the desired configuration.",
+    "stopped-confirmed": "Confirmed stopped.",
+    unconfirmed: "Desired and actual state are not confirmed to match.",
+  }
+
+  // Once the draft is touched (dirty), Start is a deliberate reconfiguration,
+  // not an unconscious repeat of the already-confirmed run. Start also needs a
+  // published catalog and a strategy the agent actually offers.
+  const startDisabled =
+    pending ||
+    !status ||
+    !catalogReady ||
+    !activeStrategy ||
+    (strategy !== "" && !strategyOffered) ||
+    controlState === "loading" ||
+    (!dirty && controlState === "running-confirmed")
+  const stopDisabled =
+    pending ||
+    controlState === "loading" ||
+    controlState === "stopped-confirmed"
+
+  const setValue = (key: string, value: string) => {
     setDirty(true)
     setValues((current) => ({ ...current, [key]: value }))
   }
 
-  const buildParams = (): Record<string, unknown> | null => {
-    const params: Record<string, unknown> = { ...savedParams }
-    for (const field of FIELDS) {
-      const raw = values[field.key].trim()
-      if (field.type === "number") {
-        const parsed = Number(raw)
-        if (raw === "" || Number.isNaN(parsed)) {
-          showErrorToast(`${field.label} must be a number`)
-          return null
-        }
-        params[field.key] = parsed
-      } else if (field.type === "numberArray") {
-        const parsed = raw
-          .split(",")
-          .map((part) => Number(part.trim()))
-          .filter((part) => !Number.isNaN(part))
-        if (parsed.length === 0) {
-          showErrorToast(`${field.label} must be a list of numbers`)
-          return null
-        }
-        params[field.key] = parsed
-      } else {
-        if (raw === "") {
-          showErrorToast(`${field.label} is required`)
-          return null
-        }
-        params[field.key] = raw
-      }
-    }
-    return params
-  }
+  const runStart = (payload: ValidatedStart) => startMutation.mutate(payload)
 
   const onStart = () => {
+    setSymbolsError(null)
+    setFieldErrors({})
+    setFormErrors([])
+    if (!activeStrategy) return
     if (parsedSymbols.length === 0) {
-      showErrorToast("Enter at least one symbol to trade (e.g. BTCUSDT)")
+      setSymbolsError("Enter at least one symbol to trade (e.g. BTCUSDT)")
       return
     }
-    const params = buildParams()
-    if (params === null) return
-    startMutation.mutate({
-      network,
-      strategy,
-      symbols: parsedSymbols,
-      params,
+    const result = validateSettings({
+      fields,
+      values,
+      lookups: catalog?.lookups ?? {},
+      constraints: activeStrategy.constraints ?? [],
+      savedParams,
     })
+    if (!result.ok) {
+      setFieldErrors(result.fieldErrors)
+      setFormErrors(result.formErrors)
+      return
+    }
+    const payload: ValidatedStart = {
+      network,
+      strategy: strategy || activeStrategy.name,
+      symbols: parsedSymbols,
+      params: result.params,
+    }
+    if (network === "live") {
+      setPendingLiveStart(payload)
+      return
+    }
+    runStart(payload)
   }
+
+  const hasErrors =
+    Object.keys(fieldErrors).length > 0 ||
+    formErrors.length > 0 ||
+    !!symbolsError
 
   return (
     <div className="flex flex-col gap-6">
       <div>
         <h1 className="text-2xl font-bold tracking-tight">Strategy</h1>
         <p className="text-muted-foreground">
-          Configure the Triple Screen strategy and start or stop the agent
+          Configure the {activeLabel} strategy and start or stop the agent
         </p>
       </div>
 
       <CommandTrackingView commands={commands} />
+      <p role="status">{CONTROL_STATE_COPY[controlState]}</p>
       <p>
         {dirty
           ? "Unsaved local draft — background updates will not overwrite it"
@@ -253,11 +295,22 @@ function Strategy() {
           Reload desired configuration
         </Button>
       )}
-      {strategy !== STRATEGY && (
+      {strategy !== "" && !strategyOffered && (
         <p role="alert">
-          Saved strategy {strategy} is not supported by this form. Start
-          disabled.
+          Saved strategy {strategy} is not offered by the agent. Start disabled.
         </p>
+      )}
+      {hasErrors && (
+        <div role="alert" className="space-y-1 rounded-md border p-3 text-sm">
+          <p className="font-semibold">Fix the following before starting:</p>
+          {symbolsError && <p>{symbolsError}</p>}
+          {formErrors.map((message) => (
+            <p key={message}>{message}</p>
+          ))}
+          {Object.entries(fieldErrors).map(([key, message]) => (
+            <p key={key}>{message}</p>
+          ))}
+        </div>
       )}
       <div className="grid gap-6 md:grid-cols-2">
         <Card>
@@ -314,6 +367,7 @@ function Strategy() {
                 placeholder="e.g. BTCUSDT, ETHUSDT"
                 value={symbolsInput}
                 disabled={pending}
+                aria-invalid={!!symbolsError}
                 onChange={(event) => {
                   setDirty(true)
                   setSymbolsInput(event.target.value)
@@ -322,12 +376,13 @@ function Strategy() {
               <span className="text-muted-foreground text-xs">
                 Comma-separated, uppercased and de-duplicated automatically
               </span>
+              {symbolsError && <p role="alert">{symbolsError}</p>}
             </div>
 
             <div className="flex gap-2">
               <Button
                 type="button"
-                disabled={pending || !status || strategy !== STRATEGY}
+                disabled={startDisabled}
                 onClick={onStart}
                 className="flex-1"
               >
@@ -337,7 +392,7 @@ function Strategy() {
               <Button
                 type="button"
                 variant="outline"
-                disabled={pending}
+                disabled={stopDisabled}
                 onClick={() => stopMutation.mutate()}
                 className="flex-1"
               >
@@ -351,28 +406,125 @@ function Strategy() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Triple Screen settings</CardTitle>
+          <CardTitle>{activeLabel} settings</CardTitle>
           <CardDescription>
             Fixed at start; the agent validates them before the strategy runs
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {FIELDS.map((field) => (
-              <div key={field.key} className="flex flex-col gap-2">
-                <Label htmlFor={field.key}>{field.label}</Label>
-                <Input
-                  id={field.key}
-                  value={values[field.key]}
-                  disabled={pending}
-                  inputMode={field.type === "string" ? undefined : "decimal"}
-                  onChange={(event) => setValue(field.key, event.target.value)}
-                />
-              </div>
-            ))}
-          </div>
+          {!catalog ? (
+            <p role="status">
+              {isCatalogError
+                ? "Strategy settings are unavailable."
+                : "Loading strategy settings…"}
+            </p>
+          ) : catalog.available === false ? (
+            <p role="status">
+              The agent has not published a strategy catalog yet, so Start is
+              disabled. It will appear once the agent runs and publishes one.
+            </p>
+          ) : fields.length === 0 ? (
+            <p role="status">
+              The agent publishes no configurable settings for this strategy.
+            </p>
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              {fields.map((field) => (
+                <div key={field.key} className="flex flex-col gap-2">
+                  <Label htmlFor={field.key}>{field.title}</Label>
+                  {field.kind === "const" ? (
+                    <Input
+                      id={field.key}
+                      value={field.defaultText}
+                      readOnly
+                      disabled
+                    />
+                  ) : field.kind === "enum" ? (
+                    <>
+                      <Input
+                        id={field.key}
+                        list={`${field.key}-options`}
+                        value={values[field.key] ?? ""}
+                        disabled={pending}
+                        aria-invalid={!!fieldErrors[field.key]}
+                        onChange={(event) =>
+                          setValue(field.key, event.target.value)
+                        }
+                      />
+                      <datalist id={`${field.key}-options`}>
+                        {(field.options ?? []).map((option) => (
+                          <option key={option} value={option} />
+                        ))}
+                      </datalist>
+                    </>
+                  ) : (
+                    <Input
+                      id={field.key}
+                      value={values[field.key] ?? ""}
+                      disabled={pending}
+                      aria-invalid={!!fieldErrors[field.key]}
+                      inputMode={field.kind === "text" ? undefined : "decimal"}
+                      onChange={(event) =>
+                        setValue(field.key, event.target.value)
+                      }
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </CardContent>
       </Card>
+
+      <Dialog
+        open={pendingLiveStart !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingLiveStart(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm live Start</DialogTitle>
+            <DialogDescription>
+              This sends a Start command on the LIVE network. Review before
+              confirming.
+            </DialogDescription>
+          </DialogHeader>
+          {pendingLiveStart && (
+            <div className="space-y-2 text-sm">
+              <p>Network: {pendingLiveStart.network.toUpperCase()}</p>
+              <p>
+                Strategy: {activeStrategy?.label ?? pendingLiveStart.strategy}
+              </p>
+              <p>Symbols: {pendingLiveStart.symbols.join(", ")}</p>
+              <div className="space-y-1">
+                <p className="font-medium">Key params</p>
+                <ul className="grid max-h-64 grid-cols-2 gap-x-4 gap-y-1 overflow-y-auto text-xs">
+                  {fields.map((field) => (
+                    <li key={field.key}>
+                      {field.title}:{" "}
+                      {formatParamValue(pendingLiveStart.params[field.key])}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setPendingLiveStart(null)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                if (pendingLiveStart) runStart(pendingLiveStart)
+                setPendingLiveStart(null)
+              }}
+            >
+              Confirm live Start
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

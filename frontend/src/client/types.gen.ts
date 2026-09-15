@@ -147,6 +147,44 @@ export type CommandResult = {
 };
 
 /**
+ * CommandState
+ *
+ * Full command lifecycle (see the Prompt 5 design note above), for
+ * diagnostics/audit — additive; existing UI polling keeps using
+ * ``/result/`` for the terminal outcome.
+ */
+export type CommandState = {
+    /**
+     * Command Id
+     */
+    command_id: string;
+    /**
+     * Type
+     */
+    type: string;
+    /**
+     * Status
+     */
+    status: 'accepted' | 'dispatched' | 'running' | 'succeeded' | 'failed' | 'timed_out';
+    /**
+     * Network
+     */
+    network?: 'testnet' | 'live' | null;
+    /**
+     * Created At
+     */
+    created_at?: string | null;
+    /**
+     * Updated At
+     */
+    updated_at?: string | null;
+    /**
+     * Error
+     */
+    error?: string | null;
+};
+
+/**
  * HTTPValidationError
  */
 export type HTTPValidationError = {
@@ -237,13 +275,13 @@ export type Message = {
 /**
  * NetworkRequest
  *
- * Optional body carrying the target network (e.g. for ``balance``).
+ * Body carrying the target network (e.g. for ``balance``).
  */
 export type NetworkRequest = {
     /**
      * Network
      */
-    network?: 'testnet' | 'live';
+    network: 'testnet' | 'live';
 };
 
 /**
@@ -328,6 +366,12 @@ export type RuntimeSnapshot = {
  * StartPayload
  *
  * Payload of the ``start`` command (strategy/symbols/params).
+ *
+ * Only what the backend itself knows is validated here: symbols are
+ * normalized and malformed/empty/duplicate ones are rejected with ``422``, so
+ * an invalid Start never reaches Redis. ``strategy`` and ``params`` are
+ * enforced against the agent's published catalog further down the request, in
+ * :func:`_enforce_strategy_params` — the agent owns those rules.
  */
 export type StartPayload = {
     /**
@@ -348,6 +392,80 @@ export type StartPayload = {
     params?: {
         [key: string]: unknown;
     };
+};
+
+/**
+ * StrategyCatalog
+ *
+ * What the UI needs to render and validate strategy settings.
+ *
+ * ``available=False`` means the agent has never published a catalog (it has
+ * not started yet), which is distinct from a strategy list that is empty by
+ * accident — the UI must say so instead of showing a blank form.
+ */
+export type StrategyCatalog = {
+    /**
+     * Available
+     */
+    available: boolean;
+    /**
+     * Schema Hash
+     */
+    schema_hash?: string | null;
+    /**
+     * Published At
+     */
+    published_at?: string | null;
+    /**
+     * Lookups
+     */
+    lookups?: {
+        [key: string]: {
+            [key: string]: number;
+        };
+    };
+    /**
+     * Strategies
+     */
+    strategies?: Array<StrategyDescription>;
+};
+
+/**
+ * StrategyDescription
+ *
+ * One strategy exactly as the agent declares it.
+ *
+ * ``settings_schema`` is a JSON Schema for ``params`` and ``constraints`` are
+ * the cross-field rules it cannot express (see ``agent/agent/protocol.py``
+ * for the grammar). Both are served verbatim: the backend compiles them to
+ * validate a Start, the UI renders a form from them, and neither restates
+ * them.
+ */
+export type StrategyDescription = {
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Label
+     */
+    label: string;
+    /**
+     * Description
+     */
+    description?: string;
+    /**
+     * Settings Schema
+     */
+    settings_schema?: {
+        [key: string]: unknown;
+    } | null;
+    /**
+     * Constraints
+     */
+    constraints?: Array<{
+        [key: string]: unknown;
+    }>;
 };
 
 /**
@@ -1136,11 +1254,9 @@ export type tradingListStrategiesData = {
 
 export type tradingListStrategiesResponses = {
     /**
-     * Response Trading-List Strategies
-     *
      * Successful Response
      */
-    200: Array<string>;
+    200: StrategyCatalog;
 };
 
 export type tradingListStrategiesResponse = tradingListStrategiesResponses[keyof tradingListStrategiesResponses];
@@ -1212,10 +1328,7 @@ export type tradingStopTradingResponses = {
 export type tradingStopTradingResponse = tradingStopTradingResponses[keyof tradingStopTradingResponses];
 
 export type tradingFetchBalanceData = {
-    /**
-     * Request
-     */
-    body?: NetworkRequest | null;
+    body: NetworkRequest;
     path?: never;
     query?: never;
     url: '/api/v1/trading/balance/';
@@ -1272,6 +1385,38 @@ export type tradingGetCommandResultResponses = {
 };
 
 export type tradingGetCommandResultResponse = tradingGetCommandResultResponses[keyof tradingGetCommandResultResponses];
+
+export type tradingGetCommandStateData = {
+    body?: never;
+    path: {
+        /**
+         * Command Id
+         */
+        command_id: string;
+    };
+    query?: never;
+    url: '/api/v1/trading/commands/{command_id}/state/';
+};
+
+export type tradingGetCommandStateErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type tradingGetCommandStateError = tradingGetCommandStateErrors[keyof tradingGetCommandStateErrors];
+
+export type tradingGetCommandStateResponses = {
+    /**
+     * Response Trading-Get Command State
+     *
+     * Successful Response
+     */
+    200: CommandState | null;
+};
+
+export type tradingGetCommandStateResponse = tradingGetCommandStateResponses[keyof tradingGetCommandStateResponses];
 
 export type tradingGetStatusData = {
     body?: never;

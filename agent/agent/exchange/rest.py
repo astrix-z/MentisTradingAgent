@@ -13,6 +13,7 @@ through :func:`asyncio.to_thread` to keep the agent's event loop free.
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from binance_common.configuration import ConfigurationRestAPI
@@ -82,8 +83,34 @@ def _to_float(value: Any) -> float:
     """Best-effort conversion of the SDK's string numerics to ``float``."""
     try:
         return float(value) if value not in (None, "") else 0.0
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return 0.0
+
+
+def _to_decimal(value: Any) -> Decimal:
+    """Best-effort conversion of the SDK's string numerics to ``Decimal``."""
+    try:
+        return Decimal(str(value)) if value not in (None, "") else Decimal(0)
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal(0)
+
+
+def balance_snapshot(
+    balances: list[GetAccountResponseBalancesInner],
+) -> list[dict[str, str]]:
+    """Non-zero balance rows as ``{asset, free, locked}`` with Decimal-precise
+    string amounts (never binary float), preserving ``locked`` that
+    :func:`balance_map` collapses away. An asset is included whenever
+    ``free`` or ``locked`` is non-zero."""
+    result: list[dict[str, str]] = []
+    for row in balances:
+        if row.asset is None:
+            continue
+        free = _to_decimal(row.free)
+        locked = _to_decimal(row.locked)
+        if free > 0 or locked > 0:
+            result.append({"asset": row.asset, "free": str(free), "locked": str(locked)})
+    return result
 
 
 class ExchangeRest:

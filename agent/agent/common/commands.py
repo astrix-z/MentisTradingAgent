@@ -1,17 +1,22 @@
 """Agent command envelope, registry and built-in handlers.
 
-Backend -> agent traffic is *commands*. Each command is a JSON envelope on the
-``agent:commands`` channel::
+Backend -> agent traffic is *commands*. Each command is a JSON envelope read
+off the ``agent:commands:stream`` Redis Stream (a consumer group, not
+Pub/Sub — see :mod:`agent.main` for the durable read/dedup loop)::
 
     {"id": "...", "type": "start", "payload": {...}, "issued_at": "..."}
 
 Handlers are registered by command type via the :func:`command` decorator, so
-adding a command is just adding a decorated handler here — the subscription loop
+adding a command is just adding a decorated handler here — the read loop
 in :mod:`agent.main` never changes.
 
 Every command may report a *result* (``CommandContext.report``), which the agent
 writes atomically to ``agent:result`` (last result) and
-``agent:result:<command_id>`` (TTL 3600 seconds) for correlated polling.
+``agent:result:<command_id>`` (TTL 3600 seconds) for correlated polling, and
+also advances a per-command lifecycle state hash (``agent:command:<id>``:
+accepted -> dispatched -> running -> succeeded|failed|timed_out) that
+:func:`dispatch` uses to skip re-running a command whose stream entry was
+redelivered after it already reached a terminal state.
 
 The runtime snapshot (``agent:runtime``) lets the agent restore its intent after
 a restart: on boot we read it and, if it says ``running``, start the strategy
@@ -20,8 +25,10 @@ with the stored settings.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,7 +37,16 @@ from typing import Any
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from agent.engine import REDIS_RESULT_KEY, REDIS_RUNTIME_KEY, Engine
+from agent.core.config import settings
+from agent.engine import (
+    COMMAND_STATE_TTL_ACTIVE,
+    COMMAND_STATE_TTL_TERMINAL,
+    REDIS_COMMAND_STATE_PREFIX,
+    REDIS_RESULT_KEY,
+    REDIS_RUNTIME_KEY,
+    TERMINAL_STATUSES,
+    Engine,
+)
 from agent.exchange import ExchangeError
 from agent.strategies import STRATEGIES
 
@@ -80,6 +96,27 @@ class AgentCommand:
         )
 
 
+def _state_key(command_id: str) -> str:
+    return f"{REDIS_COMMAND_STATE_PREFIX}{command_id}"
+
+
+async def already_terminal(redis: Redis, command_id: str) -> bool:
+    """True if this command_id already reached a terminal state.
+
+    Used to skip re-invoking a handler for a redelivered stream entry (a
+    crash-recovered restart, or an at-least-once redelivery) without
+    re-running an already-succeeded/failed Start. Fails open (returns False)
+    on a Redis error: dropping a command silently is worse than a rare
+    duplicate run, and handlers are themselves safe to retry (Stop is
+    idempotent; Start rolls back cleanly on failure).
+    """
+    try:
+        status = await redis.hget(_state_key(command_id), "status")  # type: ignore[misc]
+    except RedisError:
+        return False
+    return status in TERMINAL_STATUSES
+
+
 @dataclass
 class CommandContext:
     """Everything a handler needs: the engine, Redis and the command itself."""
@@ -88,14 +125,46 @@ class CommandContext:
     redis: Redis
     command: AgentCommand
 
+    async def _set_state(self, status: str, *, error: str | None = None) -> None:
+        fields = {
+            "status": status,
+            "type": self.command.type,
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        if error is not None:
+            fields["error"] = error
+        ttl = (
+            COMMAND_STATE_TTL_TERMINAL
+            if status in TERMINAL_STATUSES
+            else COMMAND_STATE_TTL_ACTIVE
+        )
+        key = _state_key(self.command.id)
+        try:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                pipe.hset(key, mapping=fields)
+                pipe.expire(key, ttl)
+                await pipe.execute()
+        except RedisError:
+            logger.warning("cannot update command state (Redis unavailable)")
+
+    async def mark_dispatched(self) -> None:
+        """The stream entry was claimed; a handler is about to run."""
+        await self._set_state("dispatched")
+
+    async def mark_running(self) -> None:
+        """The handler is now actually executing."""
+        await self._set_state("running")
+
     async def report(
         self,
         *,
         ok: bool,
         data: dict[str, Any] | list[Any] | None = None,
         message: str | None = None,
+        timed_out: bool = False,
     ) -> None:
-        """Publish the command result so the backend can surface it to the UI."""
+        """Publish the command result so the backend can surface it to the UI,
+        and advance the lifecycle state hash to its terminal status."""
         payload = json.dumps(
             {
                 "command_id": self.command.id,
@@ -113,6 +182,8 @@ class CommandContext:
                 await pipe.execute()
         except RedisError:
             logger.warning("cannot publish command result (Redis unavailable)")
+        status = "timed_out" if timed_out else ("succeeded" if ok else "failed")
+        await self._set_state(status, error=None if ok else message)
 
 
 CommandHandler = Callable[[CommandContext, dict[str, Any]], Awaitable[None]]
@@ -132,7 +203,13 @@ def command(type_: str) -> Callable[[CommandHandler], CommandHandler]:
 
 
 async def dispatch(engine: Engine, redis: Redis, raw: str) -> None:
-    """Parse a command envelope and run its handler, if registered."""
+    """Parse a command envelope and run its handler, if registered.
+
+    Skips (without erroring) a handler already run to a terminal state for
+    this ``command_id`` — the redelivery-safety half of durable delivery; see
+    :func:`already_terminal`. Logs ``command_id``, ``type``, ``network`` (when
+    present) and elapsed time for every dispatch, without params/secrets.
+    """
     try:
         envelope = AgentCommand.from_json(raw)
     except (ValueError, KeyError, TypeError) as exc:
@@ -143,12 +220,44 @@ async def dispatch(engine: Engine, redis: Redis, raw: str) -> None:
     if handler is None:
         logger.warning("unknown command type=%r (ignored)", envelope.type)
         return
+
+    network = envelope.payload.get("network", "-")
+    if await already_terminal(redis, envelope.id):
+        logger.info(
+            "command_id=%s type=%s network=%s already terminal; skipping redelivery",
+            envelope.id,
+            envelope.type,
+            network,
+        )
+        return
+
     ctx = CommandContext(engine=engine, redis=redis, command=envelope)
+    await ctx.mark_dispatched()
+    await ctx.mark_running()
+    started = time.monotonic()
+    # "completed" means the handler returned without an unhandled exception —
+    # a domain-level rejection the handler itself catches (e.g. invalid start
+    # settings) still logs as "completed"; its outcome is in the result/state.
+    outcome = "completed"
+    reason: str | None = None
     try:
         await handler(ctx, envelope.payload)
     except Exception as exc:
+        outcome = "unhandled_exception"
+        reason = str(exc)
         logger.exception("command type=%r failed", envelope.type)
         await ctx.report(ok=False, message=str(exc))
+    finally:
+        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+        logger.info(
+            "command_id=%s type=%s network=%s elapsed_ms=%s outcome=%s%s",
+            envelope.id,
+            envelope.type,
+            network,
+            elapsed_ms,
+            outcome,
+            f" reason={reason}" if reason else "",
+        )
 
 
 # --- Built-in commands ------------------------------------------------------
@@ -168,15 +277,23 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
         sorted(params),
     )
     try:
-        await ctx.engine.start_run(
-            network=network,
-            strategy=strategy,
-            symbols=symbols,
-            params=params,
+        await asyncio.wait_for(
+            ctx.engine.start_run(
+                network=network,
+                strategy=strategy,
+                symbols=symbols,
+                params=params,
+            ),
+            timeout=settings.COMMAND_IO_TIMEOUT_SECONDS,
         )
     except ValueError as exc:
         logger.warning("start rejected: %s", exc)
         await ctx.report(ok=False, message=str(exc))
+        return
+    except TimeoutError:
+        message = f"start timed out after {settings.COMMAND_IO_TIMEOUT_SECONDS}s"
+        logger.warning(message)
+        await ctx.report(ok=False, message=message, timed_out=True)
         return
     await ctx.report(
         ok=True,
@@ -198,15 +315,34 @@ async def _stop(ctx: CommandContext, _payload: dict[str, Any]) -> None:
 
 @command("balance")
 async def _balance(ctx: CommandContext, payload: dict[str, Any]) -> None:
-    network = str(payload.get("network") or ctx.engine.network)
+    network = payload.get("network")
+    if not network:
+        await ctx.report(ok=False, message="network is required")
+        return
+    network = str(network)
     logger.info("command balance: network=%s", network)
     try:
-        balances = await ctx.engine.fetch_account_balance(network=network)
+        assets = await asyncio.wait_for(
+            ctx.engine.fetch_account_balance_snapshot(network=network),
+            timeout=settings.COMMAND_IO_TIMEOUT_SECONDS,
+        )
     except ExchangeError as exc:
         logger.warning("balance command failed: %s", exc)
         await ctx.report(ok=False, message=str(exc))
         return
-    await ctx.report(ok=True, data=balances)
+    except TimeoutError:
+        message = f"balance timed out after {settings.COMMAND_IO_TIMEOUT_SECONDS}s"
+        logger.warning(message)
+        await ctx.report(ok=False, message=message, timed_out=True)
+        return
+    await ctx.report(
+        ok=True,
+        data={
+            "network": network,
+            "fetched_at": datetime.now(UTC).isoformat(),
+            "assets": assets,
+        },
+    )
 
 
 # --- Boot-time resume -------------------------------------------------------

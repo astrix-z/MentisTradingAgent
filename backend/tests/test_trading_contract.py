@@ -20,6 +20,7 @@ from redis.exceptions import RedisError
 from app.api import deps
 from app.api.routes import trading
 from app.core.security import create_access_token
+from app.core.strategy_catalog import REDIS_STRATEGIES_KEY
 from app.models import User
 
 NOW = datetime(2026, 9, 12, tzinfo=UTC)
@@ -27,8 +28,145 @@ START = {
     "network": "live",
     "strategy": "tripple_screen",
     "symbols": ["btcusdt"],
-    "params": {"ema_period": 37, "nested": {"enabled": True}, "empty": []},
+    "params": {"tp_pct": 12},
 }
+
+
+def catalog_payload() -> dict[str, Any]:
+    """A strategy catalog in exactly the format the agent publishes.
+
+    Deliberately written out here rather than imported from the agent: the
+    backend consumes this wire format, and ``test_strategy_catalog_fidelity``
+    separately checks the compiler against the *real* published document. This
+    fixture is small but covers every grammar construct the backend enforces
+    (enum, anyOf-Decimal, fixed-length array, indexed field, lookup, operators,
+    ``{rhs}`` substitution, and extra-property rejection).
+    """
+    return {
+        "version": 1,
+        "schema_hash": "fixture-hash",
+        "published_at": "2026-09-12T00:00:00+00:00",
+        "lookups": {
+            "intervals_ms": {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
+        },
+        "strategies": [
+            {
+                "name": "tripple_screen",
+                "label": "Triple Screen",
+                "description": "Test strategy.",
+                "settings_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "title": "TripleScreenSettings",
+                    "properties": {
+                        "wave_interval": {
+                            "type": "string",
+                            "title": "Wave interval",
+                            "default": "1h",
+                            "enum": ["15m", "1h", "4h"],
+                            "ui": {"widget": "interval"},
+                        },
+                        "ema_tide_periods": {
+                            "type": "array",
+                            "title": "EMA tide periods",
+                            "default": [5, 13, 34],
+                            "minItems": 3,
+                            "maxItems": 3,
+                            "prefixItems": [
+                                {"type": "integer", "exclusiveMinimum": 0},
+                                {"type": "integer", "exclusiveMinimum": 0},
+                                {"type": "integer", "exclusiveMinimum": 0},
+                            ],
+                        },
+                        "kline_window": {
+                            "type": "integer",
+                            "title": "Kline window",
+                            "default": 1000,
+                            "exclusiveMinimum": 0,
+                        },
+                        "tp_pct": {
+                            "anyOf": [
+                                {"type": "number", "exclusiveMinimum": 0.0},
+                                {
+                                    "type": "string",
+                                    "pattern": "[+-]?0*\\d*\\.?\\d*",
+                                },
+                            ],
+                            "title": "Take profit %",
+                            "default": "10",
+                        },
+                    },
+                },
+                "constraints": [
+                    {
+                        "cmp": "lt",
+                        "lhs": {"field": ["ema_tide_periods", 0]},
+                        "rhs": {"field": ["ema_tide_periods", 1]},
+                        "message": "EMA tide periods must be strictly increasing",
+                    },
+                    {
+                        "cmp": "gte",
+                        "lhs": {"field": "kline_window"},
+                        "rhs": {
+                            "op": "max",
+                            "args": [
+                                {
+                                    "op": "add",
+                                    "args": [
+                                        {"field": ["ema_tide_periods", 2]},
+                                        {"const": 1},
+                                    ],
+                                },
+                                {"const": 2},
+                            ],
+                        },
+                        "message": "kline_window must be at least {rhs}",
+                    },
+                    {
+                        "cmp": "eq",
+                        "lhs": {"lookup": "intervals_ms", "field": "wave_interval"},
+                        "rhs": {"const": 3_600_000},
+                        "message": "wave interval must be 1h in this fixture",
+                    },
+                ],
+            }
+        ],
+    }
+
+
+class _FakePipe:
+    """Mimics ``redis.pipeline(transaction=True)`` for hash writes only."""
+
+    def __init__(self, store: MemoryRedis) -> None:
+        self.store = store
+        self.ops: list[tuple[str, tuple[Any, ...]]] = []
+
+    def hset(self, key: str, mapping: dict[str, str]) -> _FakePipe:
+        self.ops.append(("hset", (key, mapping)))
+        return self
+
+    def expire(self, key: str, ttl: int) -> _FakePipe:
+        self.ops.append(("expire", (key, ttl)))
+        return self
+
+    async def __aenter__(self) -> _FakePipe:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def execute(self) -> list[Any]:
+        if self.store.fail == "pipeline":
+            raise RedisError("pipeline failed")
+        results: list[Any] = []
+        for name, args in self.ops:
+            if name == "hset":
+                key, mapping = args
+                self.store.hashes.setdefault(key, {}).update(mapping)
+                results.append(len(mapping))
+            else:
+                results.append(1)
+        return results
 
 
 class MemoryRedis:
@@ -36,6 +174,7 @@ class MemoryRedis:
 
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
         self.publications: list[tuple[str, dict[str, Any], str | None]] = []
         self.conflicts = 0
         self.fail: str | None = None
@@ -47,13 +186,31 @@ class MemoryRedis:
         await asyncio.sleep(0)
         return raw
 
-    async def publish(self, channel: str, raw: str) -> int:
+    async def hgetall(self, key: str) -> dict[str, str]:
+        if self.fail == "get":
+            raise RedisError("read failed")
+        return dict(self.hashes.get(key, {}))
+
+    def pipeline(self, transaction: bool = True) -> _FakePipe:
+        return _FakePipe(self)
+
+    async def xadd(
+        self,
+        key: str,
+        fields: dict[str, str],
+        maxlen: int | None = None,
+        approximate: bool | None = None,
+    ) -> str:
         if self.fail == "publish":
             raise RedisError("publish failed")
         self.publications.append(
-            (channel, json.loads(raw), self.values.get(trading.REDIS_RUNTIME_KEY))
+            (
+                key,
+                json.loads(fields["data"]),
+                self.values.get(trading.REDIS_RUNTIME_KEY),
+            )
         )
-        return 0  # No subscribers: acceptance still must not claim execution.
+        return "0-1"  # No consumers yet: acceptance still must not claim execution.
 
     async def execute_command(
         self,
@@ -63,8 +220,9 @@ class MemoryRedis:
         key: str,
         expected: str,
         snapshot: str,
-        channel: str,
+        stream: str,
         envelope: str,
+        maxlen: str,
     ) -> int:
         assert command == "EVAL"
         assert script == trading.COMMIT_RUNTIME_LUA
@@ -76,14 +234,18 @@ class MemoryRedis:
             self.conflicts += 1
             return 0
         self.values[key] = snapshot
-        # No await between comparison, SET and PUBLISH, just like a Redis script.
-        self.publications.append((channel, json.loads(envelope), snapshot))
+        # No await between comparison, SET and XADD, just like a Redis script.
+        self.publications.append((stream, json.loads(envelope), snapshot))
         return 1
 
 
 @pytest.fixture
 def redis(monkeypatch: pytest.MonkeyPatch) -> MemoryRedis:
     store = MemoryRedis()
+    # A published catalog is the normal state of the system: the backend
+    # rejects an invalid Start before Redis, but only using rules the agent
+    # declared. Tests that need "the agent has not run yet" delete this key.
+    store.values[REDIS_STRATEGIES_KEY] = json.dumps(catalog_payload())
     monkeypatch.setattr(trading, "get_redis", lambda: store)
     monkeypatch.setattr(trading, "_now", lambda: NOW)
     return store
@@ -225,7 +387,7 @@ def test_concurrent_commands_retry_without_reordering(
             if command == "start":
                 payload = trading._start_command_payload(
                     trading.StartPayload.model_validate(
-                        {**START, "params": {"index": index}}
+                        {**START, "params": {"tp_pct": 10 + index}}
                     )
                 )
                 tasks.append(trading._apply_command("start", payload))
@@ -239,7 +401,7 @@ def test_concurrent_commands_retry_without_reordering(
     assert len(redis.publications) == len(commands)
     assert [entry[1]["type"] for entry in redis.publications] == list(commands)
     for revision, (channel, envelope, raw) in enumerate(redis.publications, start=1):
-        assert channel == trading.REDIS_COMMAND_CHANNEL
+        assert channel == trading.REDIS_COMMAND_STREAM
         assert raw is not None
         snapshot = json.loads(raw)
         assert snapshot["revision"] == revision
@@ -256,7 +418,11 @@ def test_old_snapshot_and_balance_do_not_lose_configuration(
 ) -> None:
     old = {**START, "running": True, "updated_at": NOW.isoformat()}
     redis.values[trading.REDIS_RUNTIME_KEY] = json.dumps(old)
-    response = client.post("/api/v1/trading/balance/", headers=headers(client))
+    response = client.post(
+        "/api/v1/trading/balance/",
+        json={"network": "testnet"},
+        headers=headers(client),
+    )
     assert response.status_code == 202
     assert redis.values[trading.REDIS_RUNTIME_KEY] == json.dumps(old)
     client.post("/api/v1/trading/stop/", headers=headers(client))
@@ -336,15 +502,20 @@ def test_command_redis_failure_is_not_accepted(
     fail: str,
 ) -> None:
     redis.fail = fail
+    body: dict[str, Any] | None = None
+    if path == "start":
+        body = START
+    elif path == "balance":
+        body = {"network": "testnet"}
     response = client.post(
         f"/api/v1/trading/{path}/",
-        json=START if path == "start" else None,
+        json=body,
         headers=headers(client),
     )
     assert response.status_code == 503
     assert response.json() == {"detail": "Redis is unavailable"}
     assert not redis.publications
-    assert not redis.values
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
 
 
 @pytest.mark.parametrize("path", ["status", "result"])
@@ -378,6 +549,178 @@ def test_generic_commands_share_the_same_commit_path(
         assert snapshot["revision"] == 1
         assert snapshot["params"] == (START["params"] if command == "start" else {})
         assert snapshot["symbols"] == (["BTCUSDT"] if command == "start" else [])
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {**START, "strategy": "unknown_strategy"},
+        {**START, "params": {"unknown_param": 1}},
+        {**START, "params": {"tp_pct": -1}},  # Decimal branch: tp_pct > 0
+        {**START, "params": {"tp_pct": "not-a-number"}},
+        {**START, "symbols": []},
+        {**START, "symbols": ["not a symbol!"]},
+        {**START, "symbols": ["BTCUSDT", "btcusdt"]},  # duplicate after normalizing
+        # Cross-field: declared by the agent, enforced by the backend.
+        {**START, "params": {"ema_tide_periods": [34, 13, 5]}},
+        {**START, "params": {"ema_tide_periods": [5, 13]}},  # fixed length is 3
+        {**START, "params": {"kline_window": 10}},
+        {**START, "params": {"wave_interval": "15m"}},  # lookup rule
+    ],
+)
+def test_invalid_start_rejected_before_redis(
+    client: TestClient,
+    redis: MemoryRedis,
+    payload: dict[str, Any],
+) -> None:
+    response = client.post(
+        "/api/v1/trading/start/", json=payload, headers=headers(client)
+    )
+    assert response.status_code == 422
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+def test_cross_field_rejection_carries_the_published_message(
+    client: TestClient,
+    redis: MemoryRedis,
+) -> None:
+    """The UI shows the agent's rule text, so its shape is part of the contract."""
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "params": {"kline_window": 10}},
+        headers=headers(client),
+    )
+    assert response.status_code == 422
+    assert [error["msg"] for error in response.json()["detail"]] == [
+        "kline_window must be at least 35"
+    ]
+    assert not redis.publications
+
+
+def test_start_is_refused_when_no_catalog_is_published(
+    client: TestClient,
+    redis: MemoryRedis,
+) -> None:
+    """Without the agent's declaration the backend cannot certify anything."""
+    del redis.values[REDIS_STRATEGIES_KEY]
+    response = client.post(
+        "/api/v1/trading/start/", json=START, headers=headers(client)
+    )
+    assert response.status_code == 503
+    assert "strategy catalog" in response.json()["detail"]
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "not json at all",
+        json.dumps({"version": 99, "schema_hash": "h", "strategies": [{}]}),
+        json.dumps({"version": 1, "strategies": []}),  # no schema_hash
+    ],
+)
+def test_start_is_refused_when_the_catalog_is_unusable(
+    client: TestClient,
+    redis: MemoryRedis,
+    broken: str,
+) -> None:
+    """A catalog that cannot be evaluated must not read as "valid"."""
+    redis.values[REDIS_STRATEGIES_KEY] = broken
+    response = client.post(
+        "/api/v1/trading/start/", json=START, headers=headers(client)
+    )
+    assert response.status_code == 503
+    assert not redis.publications
+
+
+def test_strategies_endpoint_serves_the_published_catalog(
+    client: TestClient,
+) -> None:
+    response = client.get("/api/v1/trading/strategies/", headers=headers(client))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["available"] is True
+    assert body["schema_hash"] == "fixture-hash"
+    assert body["lookups"]["intervals_ms"]["1h"] == 3_600_000
+    entry = body["strategies"][0]
+    assert entry["name"] == "tripple_screen"
+    assert entry["label"] == "Triple Screen"
+    # The UI renders from these, so they must survive verbatim.
+    assert entry["settings_schema"]["additionalProperties"] is False
+    assert entry["settings_schema"]["properties"]["tp_pct"]["title"] == (
+        "Take profit %"
+    )
+    assert len(entry["constraints"]) == 3
+
+
+def test_strategies_endpoint_reports_a_missing_agent_without_erroring(
+    client: TestClient,
+    redis: MemoryRedis,
+) -> None:
+    """An unpublished catalog is a state, not a failure the UI must toast."""
+    del redis.values[REDIS_STRATEGIES_KEY]
+    response = client.get("/api/v1/trading/strategies/", headers=headers(client))
+    assert response.status_code == 200
+    assert response.json() == {
+        "available": False,
+        "schema_hash": None,
+        "published_at": None,
+        "lookups": {},
+        "strategies": [],
+    }
+
+
+def test_balance_requires_network(client: TestClient, redis: MemoryRedis) -> None:
+    response = client.post("/api/v1/trading/balance/", headers=headers(client))
+    assert response.status_code == 422
+    assert not redis.publications
+
+
+def test_commands_are_durably_enqueued_on_a_stream(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    """Prompt 5: the command lane is a Redis Stream (XADD), not Pub/Sub."""
+    response = client.post(
+        "/api/v1/trading/balance/", json={"network": "testnet"}, headers=headers(client)
+    )
+    assert response.status_code == 202
+    assert len(redis.publications) == 1
+    assert redis.publications[0][0] == trading.REDIS_COMMAND_STREAM
+
+
+def test_command_state_tracks_accepted_then_agent_transitions(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    response = client.post(
+        "/api/v1/trading/start/", json=START, headers=headers(client)
+    )
+    command_id = response.json()["id"]
+    state = client.get(
+        f"/api/v1/trading/commands/{command_id}/state/", headers=headers(client)
+    ).json()
+    assert state["status"] == "accepted"
+    assert state["type"] == "start"
+    assert state["network"] == "live"
+
+    # The agent side owns later transitions; simulate it writing the hash.
+    redis.hashes[f"{trading.REDIS_COMMAND_STATE_PREFIX}{command_id}"].update(
+        {"status": "succeeded", "updated_at": NOW.isoformat()}
+    )
+    state = client.get(
+        f"/api/v1/trading/commands/{command_id}/state/", headers=headers(client)
+    ).json()
+    assert state["status"] == "succeeded"
+
+
+def test_command_state_unknown_id_is_null(client: TestClient) -> None:
+    unknown = uuid.uuid4()
+    response = client.get(
+        f"/api/v1/trading/commands/{unknown}/state/", headers=headers(client)
+    )
+    assert response.status_code == 200
+    assert response.json() is None
 
 
 def test_openapi_exposes_typed_status_and_optional_id(client: TestClient) -> None:

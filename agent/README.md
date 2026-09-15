@@ -12,9 +12,14 @@ backend lifecycle.
 - UI ↔ agent communication goes **only** through the backend (never direct).
 - Commands and liveness between the backend and the agent travel **only** over
   Redis (the "live plane"). The backend publishes *command envelopes* to a
-  channel and keeps a *runtime snapshot* key (what should be running); the agent
-  dispatches each command to its registered handler and publishes a heartbeat
-  (plus signal events) in return.
+  durable Redis Stream and keeps a *runtime snapshot* key (what should be
+  running); the agent dispatches each command to its registered handler and
+  publishes a heartbeat (plus signal events) in return.
+- The agent also **owns strategy settings** and publishes them to
+  `agent:strategies` (see `agent/protocol.py`). That document is a JSON Schema
+  per strategy plus the cross-field rules the schema cannot express, so the
+  backend can enforce and the UI can render the parameters without either of
+  them owning (or importing) `TripleScreenSettings`.
 - **All exchange access is built on `binance_sdk_spot`.** Own/duplicate models
   (`Quote`, `MarketData`, `NewOrder`, ...) are forbidden; the SDK already provides
   them. Docs and examples live in `../binance-spot/`.
@@ -50,6 +55,11 @@ HTTP 202 only acknowledges acceptance. Results are correlated through
 `agent:result:<command_id>` (3600-second TTL), with `agent:result` retained for
 legacy readers. Financial status/results require a superuser.
 
+The backend validates a Start against the published catalog before it reaches
+Redis; the agent remains the final authority and re-validates on `start`. A
+catalog that is missing or cannot be evaluated makes the backend refuse (503)
+rather than accept.
+
 Signals carry exact Decimal strings, provenance and `signal_id`. Failed emission
 is retried in memory with the same ID while still fresh/valid; consumers must
 deduplicate. Redis Pub/Sub is not a durable queue. Execution, sizing, position
@@ -63,11 +73,16 @@ protection and universe scanning remain unimplemented.
   strategy, publishes the heartbeat and signal events. Boots in `idle`.
 - `agent/common/commands.py` — command envelope + handler registry (`@command`),
   built-in `start`/`stop`/`balance`, and boot-time resume from the snapshot.
+- `agent/protocol.py` — builds and publishes the strategy catalog
+  (`agent:strategies`), and validates at publish time that every declared
+  constraint is evaluable against its own schema.
 - `agent/exchange/` — thin adapters over `binance_sdk_spot`:
   - `rest.py` — `ExchangeRest` (async `Spot.rest_api`);
   - `streams.py` — `MarketDataStreams` (async `Spot.websocket_streams`).
 - `agent/strategies/` — the decision core:
-  - `base.py` — `Strategy` contract, `StrategyServices`, `Signal`;
+  - `base.py` — `Strategy` contract, `StrategyServices`, `Signal`; a strategy
+    also declares its settings contract (`settings_model`,
+    `settings_constraints`, `settings_lookups`, `label`);
   - `registry.py` — `@strategy(name)` + `build_strategy`;
   - `tripple_screen/` — the current strategy (`settings.py`, `indicators.py`,
     `strategy.py`), see `../docs/STRATEGY_TRIPPLE_SCREEN.md`.

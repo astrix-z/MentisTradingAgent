@@ -1,0 +1,420 @@
+{
+  "version": 1,
+  "schema_hash": "89757569c12b2485fed8615ccfced0a21ec1980c7281844ade98294449137580",
+  "published_at": "2026-09-15T13:42:56.416509+00:00",
+  "lookups": {
+    "intervals_ms": {
+      "1s": 1000,
+      "1m": 60000,
+      "3m": 180000,
+      "5m": 300000,
+      "15m": 900000,
+      "30m": 1800000,
+      "1h": 3600000,
+      "2h": 7200000,
+      "4h": 14400000,
+      "6h": 21600000,
+      "8h": 28800000,
+      "12h": 43200000
+    }
+  },
+  "strategies": [
+    {
+      "name": "tripple_screen",
+      "label": "Triple Screen",
+      "description": "Closed-candle Triple Screen core; execution/universe/protection live elsewhere.",
+      "settings_schema": {
+        "properties": {
+          "quote_asset": {
+            "default": "USDT",
+            "enum": [
+              "USDT",
+              "USDC"
+            ],
+            "title": "Quote asset",
+            "type": "string"
+          },
+          "tide_interval": {
+            "default": "4h",
+            "title": "Tide interval",
+            "type": "string",
+            "ui": {
+              "widget": "interval"
+            },
+            "enum": [
+              "1s",
+              "1m",
+              "3m",
+              "5m",
+              "15m",
+              "30m",
+              "1h",
+              "2h",
+              "4h",
+              "6h",
+              "8h",
+              "12h"
+            ]
+          },
+          "wave_interval": {
+            "default": "1h",
+            "title": "Wave interval",
+            "type": "string",
+            "ui": {
+              "widget": "interval"
+            },
+            "enum": [
+              "1s",
+              "1m",
+              "3m",
+              "5m",
+              "15m",
+              "30m",
+              "1h",
+              "2h",
+              "4h",
+              "6h",
+              "8h",
+              "12h"
+            ]
+          },
+          "ripple_interval": {
+            "default": "15m",
+            "title": "Ripple interval",
+            "type": "string",
+            "ui": {
+              "widget": "interval"
+            },
+            "enum": [
+              "1s",
+              "1m",
+              "3m",
+              "5m",
+              "15m",
+              "30m",
+              "1h",
+              "2h",
+              "4h",
+              "6h",
+              "8h",
+              "12h"
+            ]
+          },
+          "ema_tide_periods": {
+            "default": [
+              5,
+              13,
+              34
+            ],
+            "maxItems": 3,
+            "minItems": 3,
+            "prefixItems": [
+              {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              },
+              {
+                "exclusiveMinimum": 0,
+                "type": "integer"
+              }
+            ],
+            "title": "EMA tide periods",
+            "type": "array"
+          },
+          "stochastic_k_period": {
+            "default": 5,
+            "exclusiveMinimum": 0,
+            "title": "Stochastic %K period",
+            "type": "integer"
+          },
+          "stochastic_d_period": {
+            "default": 3,
+            "exclusiveMinimum": 0,
+            "title": "Stochastic %D period",
+            "type": "integer"
+          },
+          "stochastic_slow_period": {
+            "default": 3,
+            "exclusiveMinimum": 0,
+            "title": "Stochastic slow period",
+            "type": "integer"
+          },
+          "fi_ema_period": {
+            "default": 2,
+            "exclusiveMinimum": 0,
+            "title": "Force index EMA period",
+            "type": "integer"
+          },
+          "oversold_threshold": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 100.0,
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "20",
+            "title": "Oversold threshold"
+          },
+          "swing_low_h1_n": {
+            "default": 2,
+            "exclusiveMinimum": 0,
+            "title": "Swing low H1 N",
+            "type": "integer"
+          },
+          "trail_m15_n": {
+            "default": 2,
+            "exclusiveMinimum": 0,
+            "title": "Trail M15 N",
+            "type": "integer"
+          },
+          "stop_buffer_pct": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 100.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "0.1",
+            "title": "Stop buffer %"
+          },
+          "min_stop_distance_pct": {
+            "anyOf": [
+              {
+                "exclusiveMaximum": 100.0,
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "1",
+            "title": "Min stop distance %"
+          },
+          "tp_pct": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "10",
+            "title": "Take profit %"
+          },
+          "cooldown_minutes": {
+            "default": 60,
+            "minimum": 0,
+            "title": "Cooldown (minutes)",
+            "type": "integer"
+          },
+          "signal_validity_minutes": {
+            "default": 15,
+            "exclusiveMinimum": 0,
+            "title": "Signal validity (minutes)",
+            "type": "integer"
+          },
+          "rest_concurrency": {
+            "default": 3,
+            "maximum": 5,
+            "minimum": 3,
+            "title": "REST concurrency",
+            "type": "integer"
+          },
+          "ws_top_n": {
+            "default": 50,
+            "exclusiveMinimum": 0,
+            "title": "WS top N symbols",
+            "type": "integer"
+          },
+          "volume_window": {
+            "const": "24h",
+            "default": "24h",
+            "title": "Volume window",
+            "type": "string"
+          },
+          "kline_window": {
+            "default": 1000,
+            "exclusiveMinimum": 0,
+            "title": "Kline window",
+            "type": "integer"
+          }
+        },
+        "title": "TripleScreenSettings",
+        "type": "object",
+        "additionalProperties": false
+      },
+      "constraints": [
+        {
+          "cmp": "lt",
+          "lhs": {
+            "field": [
+              "ema_tide_periods",
+              0
+            ]
+          },
+          "rhs": {
+            "field": [
+              "ema_tide_periods",
+              1
+            ]
+          },
+          "message": "EMA tide periods must be three strictly increasing positive periods"
+        },
+        {
+          "cmp": "lt",
+          "lhs": {
+            "field": [
+              "ema_tide_periods",
+              1
+            ]
+          },
+          "rhs": {
+            "field": [
+              "ema_tide_periods",
+              2
+            ]
+          },
+          "message": "EMA tide periods must be three strictly increasing positive periods"
+        },
+        {
+          "cmp": "eq",
+          "lhs": {
+            "lookup": "intervals_ms",
+            "field": "tide_interval"
+          },
+          "rhs": {
+            "op": "mul",
+            "args": [
+              {
+                "const": 4
+              },
+              {
+                "lookup": "intervals_ms",
+                "field": "wave_interval"
+              }
+            ]
+          },
+          "message": "timeframes must have tide:wave:ripple ratio 16:4:1"
+        },
+        {
+          "cmp": "eq",
+          "lhs": {
+            "lookup": "intervals_ms",
+            "field": "wave_interval"
+          },
+          "rhs": {
+            "op": "mul",
+            "args": [
+              {
+                "const": 4
+              },
+              {
+                "lookup": "intervals_ms",
+                "field": "ripple_interval"
+              }
+            ]
+          },
+          "message": "timeframes must have tide:wave:ripple ratio 16:4:1"
+        },
+        {
+          "cmp": "gte",
+          "lhs": {
+            "field": "kline_window"
+          },
+          "rhs": {
+            "op": "max",
+            "args": [
+              {
+                "op": "add",
+                "args": [
+                  {
+                    "field": [
+                      "ema_tide_periods",
+                      2
+                    ]
+                  },
+                  {
+                    "const": 1
+                  }
+                ]
+              },
+              {
+                "op": "add",
+                "args": [
+                  {
+                    "field": "stochastic_k_period"
+                  },
+                  {
+                    "field": "stochastic_d_period"
+                  }
+                ]
+              },
+              {
+                "op": "sub",
+                "args": [
+                  {
+                    "op": "add",
+                    "args": [
+                      {
+                        "field": "stochastic_k_period"
+                      },
+                      {
+                        "field": "stochastic_d_period"
+                      },
+                      {
+                        "field": "stochastic_slow_period"
+                      }
+                    ]
+                  },
+                  {
+                    "const": 2
+                  }
+                ]
+              },
+              {
+                "op": "add",
+                "args": [
+                  {
+                    "field": "fi_ema_period"
+                  },
+                  {
+                    "const": 2
+                  }
+                ]
+              },
+              {
+                "field": "swing_low_h1_n"
+              },
+              {
+                "field": "trail_m15_n"
+              },
+              {
+                "const": 2
+              }
+            ]
+          },
+          "message": "kline_window must be at least {rhs}"
+        }
+      ]
+    }
+  ]
+}

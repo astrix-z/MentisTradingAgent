@@ -1,5 +1,13 @@
 import { useQueryClient } from "@tanstack/react-query"
-import { useCallback, useEffect, useRef, useState } from "react"
+import {
+  createContext,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useRef,
+  useState,
+} from "react"
 
 import {
   type CommandEnvelope,
@@ -24,7 +32,20 @@ export type TrackedCommand = {
 // Lack of confirmation is not proof that execution failed.
 export const COMMAND_TIMEOUT_MS = 120_000
 
-export function useCommandTracking() {
+type CommandTrackingContextValue = {
+  commands: TrackedCommand[]
+  track: (envelope: CommandEnvelope) => void
+}
+
+const CommandTrackingContext =
+  createContext<CommandTrackingContextValue | null>(null)
+
+/**
+ * Owns the active-command polling loop above the route level so navigating
+ * between /strategy and /balance never drops an in-flight command_id or
+ * starts a second poller for the same one.
+ */
+export function CommandTrackingProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient()
   const [commands, setCommands] = useState<TrackedCommand[]>([])
   const active = useRef(new Map<string, TrackedCommand>())
@@ -108,5 +129,18 @@ export function useCommandTracking() {
     }
   }, [queryClient])
 
-  return { commands, track }
+  return (
+    <CommandTrackingContext.Provider value={{ commands, track }}>
+      {children}
+    </CommandTrackingContext.Provider>
+  )
+}
+
+export function useCommandTracking(): CommandTrackingContextValue {
+  const context = useContext(CommandTrackingContext)
+  if (!context)
+    throw new Error(
+      "useCommandTracking must be used within a CommandTrackingProvider",
+    )
+  return context
 }

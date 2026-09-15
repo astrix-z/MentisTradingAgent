@@ -2,7 +2,7 @@
 
 import { type Client, type Options as Options2, type TDataShape, urlSearchParamsBodySerializer } from './client';
 import { client } from './client.gen';
-import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
+import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetCommandStateData, tradingGetCommandStateErrors, tradingGetCommandStateResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -368,7 +368,10 @@ export class TradingService {
     /**
      * List Strategies
      *
-     * Names of selectable trading strategies (see ``KNOWN_STRATEGIES``).
+     * Strategies and their settings, as published by the agent.
+     *
+     * Served with ``available=False`` (not an error) when the agent has not run
+     * yet, so the UI can distinguish "no agent" from "no strategies".
      */
     public static listStrategies<ThrowOnError extends boolean = true>(options?: Options<tradingListStrategiesData, ThrowOnError>) {
         return (options?.client ?? client).get<tradingListStrategiesResponses, unknown, ThrowOnError>({
@@ -433,16 +436,19 @@ export class TradingService {
      * Fetch Balance
      *
      * Ask the agent for the account balance on the given network.
+     *
+     * ``network`` is required: the caller must state it explicitly rather than
+     * implicitly reusing whatever network the agent currently happens to run.
      */
-    public static fetchBalance<ThrowOnError extends boolean = true>(options?: Options<tradingFetchBalanceData, ThrowOnError>) {
-        return (options?.client ?? client).post<tradingFetchBalanceResponses, tradingFetchBalanceErrors, ThrowOnError>({
+    public static fetchBalance<ThrowOnError extends boolean = true>(options: Options<tradingFetchBalanceData, ThrowOnError>) {
+        return (options.client ?? client).post<tradingFetchBalanceResponses, tradingFetchBalanceErrors, ThrowOnError>({
             responseType: 'json',
             security: [{ scheme: 'bearer', type: 'http' }],
             url: '/api/v1/trading/balance/',
             ...options,
             headers: {
                 'Content-Type': 'application/json',
-                ...options?.headers
+                ...options.headers
             }
         });
     }
@@ -460,6 +466,24 @@ export class TradingService {
             responseType: 'json',
             security: [{ scheme: 'bearer', type: 'http' }],
             url: '/api/v1/trading/result/',
+            ...options
+        });
+    }
+    
+    /**
+     * Get Command State
+     *
+     * Full lifecycle state for one command (diagnostics/audit).
+     *
+     * Distinct from ``/result/``: this reflects accepted/dispatched/running too,
+     * not only a terminal outcome. Null means no state is retained (unknown or
+     * expired past its TTL), not any particular status.
+     */
+    public static getCommandState<ThrowOnError extends boolean = true>(options: Options<tradingGetCommandStateData, ThrowOnError>) {
+        return (options.client ?? client).get<tradingGetCommandStateResponses, tradingGetCommandStateErrors, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/commands/{command_id}/state/',
             ...options
         });
     }

@@ -74,6 +74,7 @@ class MemoryRedis:
         self.trading = trading
         self.values: dict[str, str] = {}
         self.ttls: dict[str, int | None] = {}
+        self.hashes: dict[str, dict[str, str]] = {}
         self.publications: list[tuple[str, str, str | None]] = []
         self.signal_ready = asyncio.Event()
 
@@ -84,6 +85,20 @@ class MemoryRedis:
         self.values[key] = raw
         self.ttls[key] = ex
 
+    async def hget(self, key: str, field: str) -> str | None:
+        return self.hashes.get(key, {}).get(field)
+
+    async def hgetall(self, key: str) -> dict[str, str]:
+        return dict(self.hashes.get(key, {}))
+
+    async def xack(self, *_args: Any, **_kwargs: Any) -> int:
+        return 1
+
+    async def publish(self, channel: str, raw: str) -> int:
+        # Unrelated to command delivery: agent:events (signals) stays Pub/Sub.
+        self.record(channel, raw)
+        return 1
+
     def record(self, channel: str, raw: str) -> None:
         self.publications.append(
             (channel, raw, self.values.get(self.trading.REDIS_RUNTIME_KEY))
@@ -91,9 +106,15 @@ class MemoryRedis:
         if channel == "agent:events":
             self.signal_ready.set()
 
-    async def publish(self, channel: str, raw: str) -> int:
-        self.record(channel, raw)
-        return 1
+    async def xadd(
+        self,
+        key: str,
+        fields: dict[str, str],
+        maxlen: int | None = None,
+        approximate: bool | None = None,
+    ) -> str:
+        self.record(key, fields["data"])
+        return "0-1"
 
     async def execute_command(
         self,
@@ -103,37 +124,55 @@ class MemoryRedis:
         key: str,
         expected: str,
         snapshot: str,
-        channel: str,
+        stream: str,
         envelope: str,
+        maxlen: str,
     ) -> int:
-        assert (command, script, numkeys, key, channel) == (
+        assert (command, script, numkeys, key, stream) == (
             "EVAL",
             self.trading.COMMIT_RUNTIME_LUA,
             1,
             self.trading.REDIS_RUNTIME_KEY,
-            self.trading.REDIS_COMMAND_CHANNEL,
+            self.trading.REDIS_COMMAND_STREAM,
         )
         if self.values.get(key, "") != expected:
             return 0
-        # No await between compare, write and publication.
+        # No await between compare, write and enqueue.
         self.values[key] = snapshot
-        self.record(channel, envelope)
+        self.record(stream, envelope)
         return 1
 
     def pipeline(self, *, transaction: bool) -> Any:
         assert transaction is True
-        pending: list[tuple[str, str, int | None]] = []
+        pending: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
 
         def set_value(key: str, raw: str, *, ex: int | None = None) -> None:
-            pending.append((key, raw, ex))
+            pending.append(("set", (key, raw), {"ex": ex}))
+
+        def hset_value(key: str, mapping: dict[str, str]) -> None:
+            pending.append(("hset", (key,), {"mapping": mapping}))
+
+        def expire_value(key: str, ttl: int) -> None:
+            pending.append(("expire", (key, ttl), {}))
 
         async def execute() -> None:
-            for key, raw, ex in pending:
-                self.values[key] = raw
-                self.ttls[key] = ex
+            for name, args, kwargs in pending:
+                if name == "set":
+                    key, raw = args
+                    self.values[key] = raw
+                    self.ttls[key] = kwargs["ex"]
+                elif name == "hset":
+                    (key,) = args
+                    self.hashes.setdefault(key, {}).update(kwargs["mapping"])
+                elif name == "expire":
+                    key, ttl = args
+                    self.ttls[key] = ttl
 
         pipe = Mock(
-            set=Mock(side_effect=set_value), execute=AsyncMock(side_effect=execute)
+            set=Mock(side_effect=set_value),
+            hset=Mock(side_effect=hset_value),
+            expire=Mock(side_effect=expire_value),
+            execute=AsyncMock(side_effect=execute),
         )
         return Mock(
             __aenter__=AsyncMock(return_value=pipe),
@@ -181,7 +220,7 @@ def test_start_signal_stop_and_failed_start(
                 kind, payload if kind == "start" else {}
             )
             channel, raw, snapshot_raw = store.publications[-1]
-            assert channel == "agent:commands"
+            assert channel == trading.REDIS_COMMAND_STREAM
             assert json.loads(raw) == envelope.model_dump(mode="json")
             assert snapshot_raw == store.values["agent:runtime"]
             snapshot = json.loads(snapshot_raw)

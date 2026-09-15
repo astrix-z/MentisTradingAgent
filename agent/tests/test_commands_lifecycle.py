@@ -9,8 +9,9 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from agent.common import commands
+from agent.core.config import settings
 from agent.engine import Engine
-from agent.main import _CommandQueue, _heartbeat_loop, _listen
+from agent.main import _CommandQueue, _handle_balance, _heartbeat_loop, _listen
 from agent.strategies import STRATEGIES
 
 
@@ -26,7 +27,7 @@ def envelope(kind: str, id_: str, **payload: Any) -> str:
 
 
 def redis_mock() -> Any:
-    pipe = Mock(set=Mock(), execute=AsyncMock())
+    pipe = Mock(set=Mock(), hset=Mock(), expire=Mock(), execute=AsyncMock())
     context = Mock(
         __aenter__=AsyncMock(return_value=pipe), __aexit__=AsyncMock(return_value=False)
     )
@@ -34,6 +35,8 @@ def redis_mock() -> Any:
         pipeline=Mock(return_value=context),
         set=AsyncMock(),
         get=AsyncMock(return_value=None),
+        hget=AsyncMock(return_value=None),  # dedup check: nothing terminal yet
+        xack=AsyncMock(return_value=1),
     )
 
 
@@ -58,7 +61,13 @@ def test_correlated_results() -> None:
         pipe = redis.pipeline.return_value.__aenter__.return_value
         assert pipe.set.call_args_list[1].kwargs == {"ex": 3600}
         assert pipe.set.call_args_list[3].kwargs == {"ex": 3600}
-        assert pipe.execute.await_count == 2
+        # Each report() does two pipelined blocks: the result write (2 SETs)
+        # and the state-hash transition to "succeeded" (HSET + EXPIRE).
+        assert pipe.execute.await_count == 4
+        assert [call.kwargs["mapping"]["status"] for call in pipe.hset.call_args_list] == [
+            "succeeded",
+            "succeeded",
+        ]
         redis.pipeline.assert_called_with(transaction=True)
 
     asyncio.run(scenario())
@@ -128,11 +137,11 @@ def test_stop_barrier_and_new_start(monkeypatch: pytest.MonkeyPatch) -> None:
         worker = asyncio.create_task(control.run())
         options = {"network": "testnet", "strategy": "test", "symbols": ["BTCUSDT"]}
         try:
-            control.submit(envelope("start", "active", **options))
+            control.submit(envelope("start", "active", **options), "ack-active")
             await entered.wait()
-            control.submit(envelope("start", "queued", **options))
-            control.submit(envelope("stop", "stop"))
-            control.submit(envelope("start", "after-stop", **options))
+            control.submit(envelope("start", "queued", **options), "ack-queued")
+            control.submit(envelope("stop", "stop"), "ack-stop")
+            control.submit(envelope("start", "after-stop", **options), "ack-after-stop")
             await asyncio.wait_for(control.queue.join(), 1)
             stored = results(redis)
             assert not stored["agent:result:active"]["ok"]
@@ -141,6 +150,12 @@ def test_stop_barrier_and_new_start(monkeypatch: pytest.MonkeyPatch) -> None:
             assert stored["agent:result:after-stop"]["ok"]
             assert engine.running
             assert count == 2
+            assert sorted(call.args[-1] for call in redis.xack.call_args_list) == [
+                "ack-active",
+                "ack-after-stop",
+                "ack-queued",
+                "ack-stop",
+            ]
         finally:
             worker.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -163,26 +178,27 @@ def test_listener_and_heartbeat_during_resume(
             asyncio.Event(),
             asyncio.Event(),
         )
-        incoming: asyncio.Queue[dict[str, str]] = asyncio.Queue()
-        pubsub = Mock()
+        incoming: asyncio.Queue[tuple[str, dict[str, str]]] = asyncio.Queue()
 
-        async def subscribe(*_: Any) -> None:
+        async def ensure_group(*_a: Any, **_kw: Any) -> None:
             subscribed.set()
 
-        async def get_message(**_: Any) -> Any:
+        async def xreadgroup(
+            _group: str, _consumer: str, streams: dict[str, str], *, block: int, **_kw: Any
+        ) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
+            (stream_name,) = streams
             try:
-                return incoming.get_nowait()
+                entry_id, fields = incoming.get_nowait()
             except asyncio.QueueEmpty:
-                return None
+                # Mirror real Redis's server-side BLOCK: without this, an
+                # empty queue would spin the read loop as fast as physically
+                # possible instead of waiting.
+                await asyncio.sleep(block / 1000)
+                return []
+            return [(stream_name, [(entry_id, fields)])]
 
-        pubsub.subscribe = AsyncMock(side_effect=subscribe)
-        pubsub.get_message = AsyncMock(side_effect=get_message)
-        redis.pubsub = Mock(
-            return_value=Mock(
-                __aenter__=AsyncMock(return_value=pubsub),
-                __aexit__=AsyncMock(return_value=False),
-            )
-        )
+        redis.xgroup_create = AsyncMock(side_effect=ensure_group)
+        redis.xreadgroup = AsyncMock(side_effect=xreadgroup)
         redis.get.return_value = json.dumps(
             {"running": True, "strategy": "test", "symbols": ["BTCUSDT"]}
         )
@@ -224,10 +240,8 @@ def test_listener_and_heartbeat_during_resume(
             assert not listener.done() and not heartbeat.done()
             if fail_resume:
                 assert engine.state == "error"
-            incoming.put_nowait({"type": "message", "data": envelope("stop", "stop")})
-            incoming.put_nowait(
-                {"type": "message", "data": envelope("observed", "new")}
-            )
+            incoming.put_nowait(("1-1", {"data": envelope("stop", "stop")}))
+            incoming.put_nowait(("1-2", {"data": envelope("observed", "new")}))
             await asyncio.wait_for(received.wait(), 1)
             assert engine.state == "idle"
             assert results(redis)["agent:result:stop"]["ok"]
@@ -235,6 +249,47 @@ def test_listener_and_heartbeat_during_resume(
             stop.set()
             await asyncio.wait_for(asyncio.gather(listener, heartbeat), 1)
             await engine.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_balance_missing_network_reports_failure() -> None:
+    async def scenario() -> None:
+        redis = redis_mock()
+        engine = Mock(fetch_account_balance_snapshot=AsyncMock())
+        await commands.dispatch(engine, redis, envelope("balance", "no-network"))
+        result = results(redis)["agent:result:no-network"]
+        assert result["ok"] is False
+        assert "network" in result["message"]
+        engine.fetch_account_balance_snapshot.assert_not_awaited()
+
+    asyncio.run(scenario())
+
+
+def test_balance_command_returns_typed_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        redis = redis_mock()
+        engine = Engine(redis)
+        rows = [
+            Mock(asset="USDT", free="12.34", locked="0.00"),
+            Mock(asset="BTC", free="0", locked="0.50"),  # locked-only, still non-zero
+            Mock(asset="ETH", free="0", locked="0"),  # zero balance, omitted
+        ]
+        rest = Mock(balances=AsyncMock(return_value=rows))
+        monkeypatch.setattr(
+            "agent.engine.ExchangeRest.connect", Mock(return_value=rest)
+        )
+        await commands.dispatch(
+            engine, redis, envelope("balance", "bal-1", network="testnet")
+        )
+        result = results(redis)["agent:result:bal-1"]
+        assert result["ok"] is True
+        assert result["data"]["network"] == "testnet"
+        assert "fetched_at" in result["data"]
+        assert result["data"]["assets"] == [
+            {"asset": "USDT", "free": "12.34", "locked": "0.00"},
+            {"asset": "BTC", "free": "0", "locked": "0.50"},
+        ]
 
     asyncio.run(scenario())
 
@@ -264,5 +319,116 @@ def test_start_failure_result(monkeypatch: pytest.MonkeyPatch) -> None:
         assert result["ok"] is False
         assert result["message"] == "subscription failed"
         assert engine.state == "error" and not engine.running
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_skips_redelivery_of_an_already_terminal_command() -> None:
+    """Prompt 5 dedup: redelivery of a completed command_id never re-runs it."""
+
+    async def scenario() -> None:
+        redis = redis_mock()
+        redis.hget = AsyncMock(return_value="succeeded")
+        engine = Mock(stop=AsyncMock())
+        await commands.dispatch(engine, redis, envelope("stop", "dup-1"))
+        engine.stop.assert_not_awaited()
+        pipe = redis.pipeline.return_value.__aenter__.return_value
+        pipe.set.assert_not_called()  # no new result written for a skipped redelivery
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_reruns_a_command_stuck_dispatched_or_running() -> None:
+    """A crash mid-handling (status stuck at dispatched/running, never
+    terminal) must still be re-run on redelivery — only a terminal status
+    is treated as already-handled."""
+
+    async def scenario() -> None:
+        redis = redis_mock()
+        redis.hget = AsyncMock(return_value="running")
+        engine = Mock(stop=AsyncMock())
+        await commands.dispatch(engine, redis, envelope("stop", "resumed-1"))
+        engine.stop.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_balance_timeout_reports_timed_out_not_a_hang(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        redis = redis_mock()
+        engine = Engine(redis)
+
+        async def hang(*_a: Any, **_kw: Any) -> list[Any]:
+            await asyncio.sleep(10)
+            return []
+
+        monkeypatch.setattr(
+            "agent.engine.ExchangeRest.connect",
+            Mock(return_value=Mock(balances=AsyncMock(side_effect=hang))),
+        )
+        monkeypatch.setattr(settings, "COMMAND_IO_TIMEOUT_SECONDS", 0.01)
+        await asyncio.wait_for(
+            commands.dispatch(
+                engine, redis, envelope("balance", "slow-1", network="testnet")
+            ),
+            1,
+        )
+        result = results(redis)["agent:result:slow-1"]
+        assert result["ok"] is False
+        assert "timed out" in result["message"]
+        pipe = redis.pipeline.return_value.__aenter__.return_value
+        statuses = [call.kwargs["mapping"]["status"] for call in pipe.hset.call_args_list]
+        assert statuses[-1] == "timed_out"
+
+    asyncio.run(scenario())
+
+
+def test_stop_completes_without_waiting_for_a_slow_balance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prompt 5: Balance never shares the serialized start/stop queue, so a
+    slow balance fetch cannot make Stop wait behind it."""
+
+    async def scenario() -> None:
+        redis = redis_mock()
+        engine = Engine(redis)
+        balance_started = asyncio.Event()
+        balance_release = asyncio.Event()
+
+        async def slow_balances() -> list[Any]:
+            balance_started.set()
+            await balance_release.wait()
+            return []
+
+        monkeypatch.setattr(
+            "agent.engine.ExchangeRest.connect",
+            Mock(return_value=Mock(balances=AsyncMock(side_effect=slow_balances))),
+        )
+        control = _CommandQueue(redis, engine)
+        worker = asyncio.create_task(control.run())
+        balance_task = asyncio.create_task(
+            _handle_balance(
+                redis,
+                engine,
+                envelope("balance", "slow-bal", network="testnet"),
+                "ack-bal",
+            )
+        )
+        try:
+            await asyncio.wait_for(balance_started.wait(), 1)
+            control.submit(envelope("stop", "stop-1"), "ack-stop")
+            await asyncio.wait_for(control.queue.join(), 1)
+            stored = results(redis)
+            assert stored["agent:result:stop-1"]["ok"] is True
+            assert not balance_task.done()  # still stuck; Stop did not wait on it
+        finally:
+            balance_release.set()
+            await asyncio.wait_for(balance_task, 1)
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+            await engine.shutdown()
 
     asyncio.run(scenario())

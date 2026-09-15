@@ -3,49 +3,103 @@
 The backend talks to the agent through *commands*, not through a shared
 "desired state" document:
 
-* command endpoints publish a command envelope to the ``agent:commands``
-  channel (start / stop, and more to come);
+* command endpoints durably enqueue a command envelope onto the
+  ``agent:commands:stream`` Redis Stream (start / stop, and more to come),
+  read by the agent through a consumer group — not at-most-once Pub/Sub, so a
+  command survives an agent restart/reconnect (see the Prompt 5 design note
+  below);
 * a *runtime snapshot* key (``agent:runtime``) is kept alongside so the agent
   can resume its intent after a restart and the UI can report what *should* be
   running;
+* a per-command state hash (``agent:command:<id>``) tracks the lifecycle
+  (accepted -> dispatched -> running -> succeeded|failed|timed_out) for
+  diagnostics/audit, separate from the terminal-only ``/result/`` polling
+  contract the UI already uses;
 * the agent reports liveness through a heartbeat key.
 
 To add a new command, define a payload schema, a handler on the agent side,
 and (optionally) a thin endpoint here — the generic ``POST /trading/commands``
 and the snapshot logic already route by ``type``.
+
+Design note (Prompt 5 — durable delivery):
+* Delivery mechanism: a Redis Stream + one consumer group, not Postgres/
+  Alembic-backed outbox. There is no existing trading-command persistence
+  path in this project to extend, and Redis is already the sole control-plane
+  transport between backend and agent (see module docstring above and
+  ``agent/agent/engine.py``); introducing a second datastore purely for this
+  would be a much larger, separately-reviewable change. Durability here comes
+  from the stream (entries survive until trimmed/acked) plus the consumer
+  group's per-consumer pending-entries list (survives an agent restart).
+* Retention: the stream is capped with an approximate ``MAXLEN`` trim
+  (``COMMAND_STREAM_MAXLEN``); per-command state hashes get a short TTL while
+  in flight and a longer one once terminal (``COMMAND_STATE_TTL_ACTIVE`` /
+  ``COMMAND_STATE_TTL_TERMINAL``), refreshed by the agent on each transition.
+* Idempotency/dedup: the agent (``agent/agent/common/commands.py``) checks the
+  state hash before invoking a handler and skips (ack-only) redelivery of a
+  command that already reached a terminal state, so a strategy Start is never
+  re-run just because its stream entry was redelivered.
+* Stop-vs-Balance: Start/Stop stay on the existing serialized queue with the
+  generation-based cancel-on-Stop barrier (``agent/agent/main.py``); Balance
+  commands run as independent concurrent tasks so a slow balance fetch can
+  never make Stop wait behind it.
 """
 
 from __future__ import annotations
 
+import logging
+import re
 import uuid
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from redis.exceptions import RedisError
 
 from app.api.deps import CurrentUser, get_current_active_superuser
 from app.core.redis_client import get_redis
+from app.core.strategy_catalog import (
+    CatalogError,
+    CompiledCatalog,
+    CompiledStrategy,
+    json_safe_errors,
+    read_catalog,
+)
 from app.models import User
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/trading", tags=["trading"])
 
-# Redis keys/channel shared with the agent (keep in sync with agent/agent/engine.py).
-REDIS_COMMAND_CHANNEL = "agent:commands"
+# Redis keys/stream shared with the agent (keep in sync with agent/agent/engine.py
+# and agent/agent/common/commands.py).
+REDIS_COMMAND_STREAM = "agent:commands:stream"
+REDIS_COMMAND_GROUP = "agent-workers"
 REDIS_RUNTIME_KEY = "agent:runtime"
 REDIS_HEARTBEAT_KEY = "trading:heartbeat"
 REDIS_RESULT_KEY = "agent:result"
+REDIS_COMMAND_STATE_PREFIX = "agent:command:"
 
-# Compare the exact document read by this worker, then commit and publish without
-# interleaving with another worker. JSON stays in Python to preserve empty arrays.
+# Approximate trim keeps the durable command stream bounded without an exact
+# (expensive) length check on every write.
+COMMAND_STREAM_MAXLEN = 10_000
+# Command state TTLs: short while in flight (refreshed on every transition by
+# whichever side moves the command forward), long once terminal so a recent
+# history is inspectable without this hash becoming unbounded audit storage.
+COMMAND_STATE_TTL_ACTIVE = 3600
+COMMAND_STATE_TTL_TERMINAL = 86400
+_TERMINAL_STATUSES = ("succeeded", "failed", "timed_out")
+
+# Compare the exact document read by this worker, then commit and durably
+# enqueue without interleaving with another worker. JSON stays in Python to
+# preserve empty arrays.
 COMMIT_RUNTIME_LUA = """
 local current = redis.call('GET', KEYS[1])
 if (current or '') ~= ARGV[1] then
     return 0
 end
 redis.call('SET', KEYS[1], ARGV[2])
-redis.call('PUBLISH', ARGV[3], ARGV[4])
+redis.call('XADD', ARGV[3], 'MAXLEN', '~', ARGV[5], '*', 'data', ARGV[4])
 return 1
 """
 
@@ -59,11 +113,12 @@ SuperUserDep = Annotated[User, Depends(get_current_active_superuser)]
 Network = Literal["testnet", "live"]
 CommandType = Literal["start", "stop", "balance"]
 
-# Strategy names the UI can pick from. Keep in sync with the agent registry
-# ``agent/agent/strategies`` (@strategy). The agent validates unknown names.
-# Position protection is part of the strategy, so there is no separate
-# protector concept.
-KNOWN_STRATEGIES = ("tripple_screen",)
+# Strategy names and per-strategy parameter rules are *not* listed here: the
+# agent owns them and publishes them (see ``app.core.strategy_catalog``), so a
+# new strategy or a changed domain rule needs no backend change and cannot
+# drift from the agent. ``GET /strategies/`` serves that declaration to the UI.
+
+_SYMBOL_RE = re.compile(r"[A-Z0-9]+")
 
 
 def _now() -> datetime:
@@ -74,18 +129,42 @@ def _now() -> datetime:
 
 
 class StartPayload(BaseModel):
-    """Payload of the ``start`` command (strategy/symbols/params)."""
+    """Payload of the ``start`` command (strategy/symbols/params).
+
+    Only what the backend itself knows is validated here: symbols are
+    normalized and malformed/empty/duplicate ones are rejected with ``422``, so
+    an invalid Start never reaches Redis. ``strategy`` and ``params`` are
+    enforced against the agent's published catalog further down the request, in
+    :func:`_enforce_strategy_params` — the agent owns those rules.
+    """
 
     network: Network = "testnet"
     strategy: str
     symbols: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def _validate_symbols(self) -> Self:
+        if not self.symbols:
+            raise ValueError("symbols must be a non-empty list")
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in self.symbols:
+            symbol = str(raw).strip().upper()
+            if _SYMBOL_RE.fullmatch(symbol) is None:
+                raise ValueError(f"invalid symbol format: {raw!r}")
+            if symbol in seen:
+                raise ValueError(f"duplicate symbol: {symbol!r}")
+            seen.add(symbol)
+            normalized.append(symbol)
+        self.symbols = normalized
+        return self
+
 
 class NetworkRequest(BaseModel):
-    """Optional body carrying the target network (e.g. for ``balance``)."""
+    """Body carrying the target network (e.g. for ``balance``)."""
 
-    network: Network = "testnet"
+    network: Network
 
 
 class CommandRequest(BaseModel):
@@ -139,6 +218,64 @@ class TradingStatus(BaseModel):
     online: bool
 
 
+class StrategyDescription(BaseModel):
+    """One strategy exactly as the agent declares it.
+
+    ``settings_schema`` is a JSON Schema for ``params`` and ``constraints`` are
+    the cross-field rules it cannot express (see ``agent/agent/protocol.py``
+    for the grammar). Both are served verbatim: the backend compiles them to
+    validate a Start, the UI renders a form from them, and neither restates
+    them.
+    """
+
+    name: str
+    label: str
+    description: str = ""
+    settings_schema: dict[str, Any] | None = None
+    constraints: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class StrategyCatalog(BaseModel):
+    """What the UI needs to render and validate strategy settings.
+
+    ``available=False`` means the agent has never published a catalog (it has
+    not started yet), which is distinct from a strategy list that is empty by
+    accident — the UI must say so instead of showing a blank form.
+    """
+
+    available: bool
+    schema_hash: str | None = None
+    published_at: str | None = None
+    lookups: dict[str, dict[str, int]] = Field(default_factory=dict)
+    strategies: list[StrategyDescription] = Field(default_factory=list)
+
+
+class BalanceAsset(BaseModel):
+    """One non-zero asset row. Amounts are Decimal-precise strings, never
+    binary floats, so financial values round-trip exactly through JSON."""
+
+    asset: str
+    free: str
+    locked: str
+
+
+class BalanceSnapshot(BaseModel):
+    """Documented shape of ``CommandResult.data`` for a succeeded ``balance``
+    command (``CommandResult.data`` itself stays polymorphic across command
+    types, so this is not wired as its response_model — it is the contract
+    ``agent/agent/common/commands.py``'s ``_balance`` handler must produce,
+    and what the backend/agent tests validate against).
+
+    Zero-balance policy: assets with both ``free`` and ``locked`` equal to
+    zero are omitted (matching the exchange call's ``omit_zero_balances``),
+    so an asset present in ``assets`` is always non-zero.
+    """
+
+    network: Network
+    fetched_at: datetime
+    assets: list[BalanceAsset]
+
+
 class CommandResult(BaseModel):
     """Execution outcome produced by the agent, not an acceptance receipt."""
 
@@ -150,6 +287,25 @@ class CommandResult(BaseModel):
     at: datetime
 
 
+CommandStatus = Literal[
+    "accepted", "dispatched", "running", "succeeded", "failed", "timed_out"
+]
+
+
+class CommandState(BaseModel):
+    """Full command lifecycle (see the Prompt 5 design note above), for
+    diagnostics/audit — additive; existing UI polling keeps using
+    ``/result/`` for the terminal outcome."""
+
+    command_id: uuid.UUID
+    type: str
+    status: CommandStatus
+    network: Network | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    error: str | None = None
+
+
 # --- Redis helpers ---------------------------------------------------------
 
 
@@ -157,12 +313,43 @@ def _redis_unavailable(_exc: RedisError) -> HTTPException:
     return HTTPException(status_code=503, detail="Redis is unavailable")
 
 
-async def _publish(envelope: CommandEnvelope) -> None:
+async def _enqueue(envelope: CommandEnvelope) -> None:
+    """Durably append to the command stream (at-least-once; see module docstring)."""
     redis = get_redis()
     try:
-        await redis.publish(REDIS_COMMAND_CHANNEL, envelope.model_dump_json())
+        await redis.xadd(
+            REDIS_COMMAND_STREAM,
+            {"data": envelope.model_dump_json()},
+            maxlen=COMMAND_STREAM_MAXLEN,
+            approximate=True,
+        )
     except RedisError as exc:
         raise _redis_unavailable(exc) from exc
+
+
+async def _record_command_accepted(
+    envelope: CommandEnvelope, *, network: Any | None
+) -> None:
+    """Best-effort observability write. The durable stream entry (already
+    committed by the time this runs) is what guarantees delivery — this hash
+    is diagnostics, so its own failure must not fail command acceptance."""
+    redis = get_redis()
+    key = f"{REDIS_COMMAND_STATE_PREFIX}{envelope.id}"
+    fields: dict[str, str] = {
+        "status": "accepted",
+        "type": envelope.type,
+        "created_at": envelope.issued_at.isoformat(),
+        "updated_at": envelope.issued_at.isoformat(),
+    }
+    if network:
+        fields["network"] = str(network)
+    try:
+        async with redis.pipeline(transaction=True) as pipe:
+            pipe.hset(key, mapping=fields)
+            pipe.expire(key, COMMAND_STATE_TTL_ACTIVE)
+            await pipe.execute()
+    except RedisError:
+        logger.warning("cannot record command state (Redis unavailable)")
 
 
 async def _get_snapshot() -> RuntimeSnapshot | None:
@@ -177,49 +364,51 @@ async def _get_snapshot() -> RuntimeSnapshot | None:
 async def _apply_command(
     type_: CommandType, payload: dict[str, Any]
 ) -> CommandEnvelope:
-    """Accept intent; publication does not confirm agent execution."""
+    """Accept intent; durable enqueue does not confirm agent execution."""
     envelope = CommandEnvelope(
         id=uuid.uuid4(), type=type_, payload=payload, issued_at=_now()
     )
     if type_ == "balance":
-        await _publish(envelope)
-        return envelope
-
-    redis = get_redis()
-    try:
-        while True:
-            raw = await redis.get(REDIS_RUNTIME_KEY)
-            snapshot = (
-                RuntimeSnapshot.model_validate_json(raw)
-                if raw is not None
-                else RuntimeSnapshot(updated_at=_now())
-            )
-            if type_ == "start":
-                snapshot.running = True
-                snapshot.network = payload["network"]
-                snapshot.strategy = payload["strategy"]
-                snapshot.symbols = list(payload["symbols"])
-                snapshot.params = dict(payload["params"])
-            else:
-                # Stopping changes intent, not the saved configuration for the UI.
-                snapshot.running = False
-            snapshot.last_command = type_
-            snapshot.updated_at = _now()
-            snapshot.revision += 1
-            committed = await redis.execute_command(  # type: ignore[no-untyped-call]
-                "EVAL",
-                COMMIT_RUNTIME_LUA,
-                1,
-                REDIS_RUNTIME_KEY,
-                raw if raw is not None else "",
-                snapshot.model_dump_json(),
-                REDIS_COMMAND_CHANNEL,
-                envelope.model_dump_json(),
-            )
-            if committed:
-                return envelope
-    except RedisError as exc:
-        raise _redis_unavailable(exc) from exc
+        await _enqueue(envelope)
+    else:
+        redis = get_redis()
+        try:
+            while True:
+                raw = await redis.get(REDIS_RUNTIME_KEY)
+                snapshot = (
+                    RuntimeSnapshot.model_validate_json(raw)
+                    if raw is not None
+                    else RuntimeSnapshot(updated_at=_now())
+                )
+                if type_ == "start":
+                    snapshot.running = True
+                    snapshot.network = payload["network"]
+                    snapshot.strategy = payload["strategy"]
+                    snapshot.symbols = list(payload["symbols"])
+                    snapshot.params = dict(payload["params"])
+                else:
+                    # Stopping changes intent, not the saved configuration for the UI.
+                    snapshot.running = False
+                snapshot.last_command = type_
+                snapshot.updated_at = _now()
+                snapshot.revision += 1
+                committed = await redis.execute_command(  # type: ignore[no-untyped-call]
+                    "EVAL",
+                    COMMIT_RUNTIME_LUA,
+                    1,
+                    REDIS_RUNTIME_KEY,
+                    raw if raw is not None else "",
+                    snapshot.model_dump_json(),
+                    REDIS_COMMAND_STREAM,
+                    envelope.model_dump_json(),
+                    str(COMMAND_STREAM_MAXLEN),
+                )
+                if committed:
+                    break
+        except RedisError as exc:
+            raise _redis_unavailable(exc) from exc
+    await _record_command_accepted(envelope, network=payload.get("network"))
+    return envelope
 
 
 def _start_command_payload(parsed: StartPayload) -> dict[str, Any]:
@@ -232,28 +421,120 @@ def _start_command_payload(parsed: StartPayload) -> dict[str, Any]:
     }
 
 
-def _start_payload(request: CommandRequest) -> dict[str, Any]:
+async def _compiled_strategy(name: str) -> CompiledStrategy:
+    """The agent's compiled description of ``name``, or a clear HTTP error.
+
+    A missing or unevaluable catalog is ``503``, not ``422``: the backend
+    cannot tell whether the request is valid, and must not imply that it is.
+    """
+    redis = get_redis()
     try:
-        parsed = StartPayload(**request.payload)
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=exc.errors()) from exc
-    return _start_command_payload(parsed)
+        catalog = await read_catalog(redis)
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    except CatalogError as exc:
+        logger.error("strategy catalog unusable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="the agent's strategy catalog cannot be used; refusing to "
+            "validate strategy parameters",
+        ) from exc
+    if catalog is None:
+        raise HTTPException(
+            status_code=503,
+            detail="the agent has not published a strategy catalog",
+        )
+    compiled = catalog.strategy(name)
+    if compiled is None:
+        known = ", ".join(sorted(catalog.strategies)) or "<none>"
+        raise HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "loc": ["body", "strategy"],
+                    "msg": f"unknown strategy {name!r}; known: {known}",
+                    "type": "value_error",
+                }
+            ],
+        )
+    return compiled
+
+
+async def _enforce_strategy_params(
+    strategy: str, params: dict[str, Any]
+) -> None:
+    """Reject an invalid Start here, so nothing invalid reaches Redis.
+
+    The rules enforced are the agent's own published ones (schema + cross-field
+    constraints); the backend contributes no domain knowledge.
+    """
+    compiled = await _compiled_strategy(strategy)
+    try:
+        errors = compiled.validate(params)
+    except CatalogError as exc:
+        logger.error("strategy catalog not evaluable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="the agent's strategy catalog cannot be evaluated",
+        ) from exc
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+
+
+def _catalog_response(catalog: CompiledCatalog | None) -> StrategyCatalog:
+    if catalog is None:
+        return StrategyCatalog(available=False)
+    return StrategyCatalog(
+        available=True,
+        schema_hash=catalog.schema_hash,
+        published_at=catalog.published_at or None,
+        lookups=catalog.lookups,
+        strategies=[
+            StrategyDescription(
+                name=s.name,
+                label=s.label,
+                description=s.description,
+                settings_schema=s.settings_schema,
+                constraints=s.constraints,
+            )
+            for s in catalog.strategies.values()
+        ],
+    )
 
 
 # --- Endpoints -------------------------------------------------------------
 
 
-@router.get("/strategies/", response_model=list[str])
-async def list_strategies(_: CurrentUser) -> list[str]:
-    """Names of selectable trading strategies (see ``KNOWN_STRATEGIES``)."""
-    return list(KNOWN_STRATEGIES)
+@router.get("/strategies/", response_model=StrategyCatalog)
+async def list_strategies(_: CurrentUser) -> StrategyCatalog:
+    """Strategies and their settings, as published by the agent.
+
+    Served with ``available=False`` (not an error) when the agent has not run
+    yet, so the UI can distinguish "no agent" from "no strategies".
+    """
+    redis = get_redis()
+    try:
+        catalog = await read_catalog(redis)
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    except CatalogError as exc:
+        logger.error("strategy catalog unusable: %s", exc)
+        return StrategyCatalog(available=False)
+    return _catalog_response(catalog)
 
 
 @router.post("/commands/", status_code=202, response_model=CommandEnvelope)
 async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnvelope:
     """Publish an arbitrary known command to the agent."""
     if request.type == "start":
-        return await _apply_command("start", _start_payload(request))
+        try:
+            parsed = StartPayload(**request.payload)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422, detail=json_safe_errors(exc)
+            ) from exc
+        await _enforce_strategy_params(parsed.strategy, parsed.params)
+        return await _apply_command("start", _start_command_payload(parsed))
     if request.type == "balance":
         return await _apply_command("balance", request.payload)
     return await _apply_command("stop", {})
@@ -262,6 +543,7 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
 @router.post("/start/", status_code=202, response_model=CommandEnvelope)
 async def start_trading(payload: StartPayload, _: SuperUserDep) -> CommandEnvelope:
     """Convenience alias: start trading on a network with a strategy."""
+    await _enforce_strategy_params(payload.strategy, payload.params)
     return await _apply_command("start", _start_command_payload(payload))
 
 
@@ -272,15 +554,13 @@ async def stop_trading(_: SuperUserDep) -> CommandEnvelope:
 
 
 @router.post("/balance/", status_code=202, response_model=CommandEnvelope)
-async def fetch_balance(
-    _: SuperUserDep, request: NetworkRequest | None = None
-) -> CommandEnvelope:
-    """Ask the agent for the account balance on the given network."""
-    if request is None:
-        payload: dict[str, Any] = {}
-    else:
-        payload = {"network": request.network}
-    return await _apply_command("balance", payload)
+async def fetch_balance(request: NetworkRequest, _: SuperUserDep) -> CommandEnvelope:
+    """Ask the agent for the account balance on the given network.
+
+    ``network`` is required: the caller must state it explicitly rather than
+    implicitly reusing whatever network the agent currently happens to run.
+    """
+    return await _apply_command("balance", {"network": request.network})
 
 
 @router.get("/result/", response_model=CommandResult | None)
@@ -314,6 +594,35 @@ async def get_command_result(
     if command_id is not None and result.command_id != command_id:
         return None
     return result
+
+
+@router.get("/commands/{command_id}/state/", response_model=CommandState | None)
+async def get_command_state(
+    _: SuperUserDep, command_id: uuid.UUID
+) -> CommandState | None:
+    """Full lifecycle state for one command (diagnostics/audit).
+
+    Distinct from ``/result/``: this reflects accepted/dispatched/running too,
+    not only a terminal outcome. Null means no state is retained (unknown or
+    expired past its TTL), not any particular status.
+    """
+    redis = get_redis()
+    key = f"{REDIS_COMMAND_STATE_PREFIX}{command_id}"
+    try:
+        raw = await redis.hgetall(key)  # type: ignore[misc]
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    if not raw:
+        return None
+    return CommandState(
+        command_id=command_id,
+        type=raw.get("type", ""),
+        status=raw.get("status", "accepted"),
+        network=raw.get("network"),
+        created_at=raw.get("created_at"),
+        updated_at=raw.get("updated_at"),
+        error=raw.get("error"),
+    )
 
 
 @router.get("/status/", response_model=TradingStatus)

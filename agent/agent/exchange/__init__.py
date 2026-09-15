@@ -10,7 +10,13 @@ Neither defines its own order/quote/balance models: they return the SDK's models
 so the agent never duplicates what the library already provides.
 """
 
-from agent.exchange.rest import ExchangeError, ExchangeRest, Network, balance_map
+from agent.exchange.rest import (
+    ExchangeError,
+    ExchangeRest,
+    Network,
+    balance_map,
+    balance_snapshot,
+)
 from agent.exchange.streams import MarketDataStreams
 
 __all__ = [
@@ -19,4 +25,5 @@ __all__ = [
     "MarketDataStreams",
     "Network",
     "balance_map",
+    "balance_snapshot",
 ]
