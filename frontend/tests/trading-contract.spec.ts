@@ -3,7 +3,9 @@ import type {
   CommandEnvelope,
   CommandResult,
   StrategyCatalog,
+  SymbolEntry,
   TradingStatus,
+  WorkingSymbols,
 } from "../src/client"
 import strategyCatalog from "./fixtures/strategy-catalog.json"
 
@@ -37,10 +39,56 @@ function snapshot(): TradingStatus {
     online: true,
   }
 }
+// The agent publishes the tradeable universe with the marks merged in; the
+// backend serves it verbatim. ETHUSDT is marked so a Start still carries it.
+function workingSymbols(
+  overrides: Partial<WorkingSymbols> = {},
+): WorkingSymbols {
+  const entry = (
+    symbol: string,
+    baseAsset: string,
+    extra: Partial<SymbolEntry> = {},
+  ): SymbolEntry => ({
+    symbol,
+    base_asset: baseAsset,
+    quote_asset: "USDT",
+    status: "TRADING",
+    spot_allowed: true,
+    quote_volume_24h: "1000",
+    classification: "crypto",
+    classification_label: null,
+    excluded_reason: null,
+    selected: false,
+    ...extra,
+  })
+  return {
+    available: true,
+    quote_asset: "USDT",
+    generated_at: at,
+    total: 3,
+    usable: 2,
+    selected: 1,
+    selected_unusable: 0,
+    symbols: [
+      entry("AAPLBUSDT", "AAPLB", {
+        classification: "tokenized_equity",
+        classification_label: "tokenized equity",
+        excluded_reason: "tokenized equity",
+      }),
+      // Deliberately huge: 2500000000 must sort after 900, which only happens
+      // if the Decimal strings are compared as numbers.
+      entry("BTCUSDT", "BTC", { quote_volume_24h: "2500000000" }),
+      entry("ETHUSDT", "ETH", { quote_volume_24h: "900", selected: true }),
+    ],
+    ...overrides,
+  }
+}
+
 async function mock(
   page: Page,
   status = snapshot(),
   published: StrategyCatalog = catalog(),
+  universe: WorkingSymbols = workingSymbols(),
 ) {
   const posts: { path: string; body: Record<string, unknown> | null }[] = []
   const results = new Map<string, CommandResult | null>()
@@ -68,6 +116,11 @@ async function mock(
       body = results.get(id) ?? null
     } else if (url.pathname.endsWith("/trading/strategies/")) {
       body = published
+    } else if (
+      request.method() === "GET" &&
+      url.pathname.endsWith("/trading/symbols/")
+    ) {
+      body = universe
     } else if (request.method() === "POST") {
       const payload = request.postDataJSON()
       posts.push({ path: url.pathname, body: payload })
@@ -84,7 +137,7 @@ async function mock(
     }
     await route.fulfill({ status: code, json: body })
   })
-  return { posts, results, reads, status }
+  return { posts, results, reads, status, universe }
 }
 
 test("legacy /trading route redirects to /balance", async ({ page }) => {
@@ -100,6 +153,14 @@ test("sidebar links to /balance, not /trading", async ({ page }) => {
     page.getByRole("link", { name: "Balance", exact: true }),
   ).toHaveAttribute("href", "/balance")
   await expect(page.getByRole("link", { name: "Trading" })).toHaveCount(0)
+})
+
+test("sidebar links to /working-symbols from Strategy", async ({ page }) => {
+  await mock(page)
+  await page.goto("/")
+  await expect(
+    page.getByRole("link", { name: "Working Symbols", exact: true }),
+  ).toHaveAttribute("href", "/working-symbols")
 })
 
 test("balance page is observation-only and separates desired, actual and balance networks", async ({
@@ -142,9 +203,15 @@ test("strategy seeds desired config, preserves dirty draft and reports rejected 
 }) => {
   const api = await mock(page)
   await page.goto("/strategy")
-  await expect(page.getByLabel("Symbols", { exact: true })).toHaveValue(
-    "ETHUSDT",
-  )
+  // Symbols are not typed here any more: they come from the working list,
+  // which the page links to instead of offering its own input.
+  await expect(
+    page.getByRole("link", { name: "Working Symbols", exact: true }).first(),
+  ).toHaveAttribute("href", "/working-symbols")
+  await expect(
+    page.getByText(/1 symbol\(s\) from the working list/),
+  ).toBeVisible()
+  await expect(page.getByLabel("Symbols", { exact: true })).toHaveCount(0)
   await expect(page.getByLabel("Take profit %")).toHaveValue("17")
   await expect(page.getByLabel("EMA tide periods")).toHaveValue("6, 14, 35")
   await expect(
@@ -182,6 +249,71 @@ test("strategy seeds desired config, preserves dirty draft and reports rejected 
   await expect(page.getByText("Invalid start settings")).toBeVisible()
   await page.reload()
   await expect(page.getByLabel("Take profit %")).toHaveValue("25")
+})
+
+test("working symbols: filter, sort on every column and save the whole set", async ({
+  page,
+}) => {
+  const api = await mock(page)
+  await page.goto("/working-symbols")
+
+  // Only usable symbols are listed until the toggle asks for the rest.
+  await expect(page.getByText("AAPLBUSDT")).toHaveCount(0)
+  await expect(page.getByText("BTCUSDT")).toBeVisible()
+  await expect(page.getByText("ETHUSDT")).toBeVisible()
+  await expect(
+    page.getByRole("checkbox", { name: "Use ETHUSDT in the strategy" }),
+  ).toBeChecked()
+
+  // Every column sorts; the volume column compares numerically, so 900 comes
+  // before 2500000000, which text comparison would get backwards.
+  await page.getByRole("button", { name: "24h volume (USDT)" }).click()
+  await expect(page.locator("tbody tr td:nth-child(2)")).toHaveText([
+    "ETHUSDT",
+    "BTCUSDT",
+  ])
+  // Clicking the same header again reverses the order.
+  await page.getByRole("button", { name: "24h volume (USDT)" }).click()
+  await expect(page.locator("tbody tr td:nth-child(2)")).toHaveText([
+    "BTCUSDT",
+    "ETHUSDT",
+  ])
+
+  // An excluded symbol can be inspected but not marked.
+  await page.getByRole("switch", { name: "Show unusable symbols" }).click()
+  await expect(page.getByText("AAPLBUSDT")).toBeVisible()
+  await expect(
+    page.getByRole("checkbox", { name: "Use AAPLBUSDT in the strategy" }),
+  ).toBeDisabled()
+
+  // Marking is a local draft until saved, and a save sends the whole set.
+  await page.clock.install()
+  await page
+    .getByRole("checkbox", { name: "Use BTCUSDT in the strategy" })
+    .click()
+  await expect(page.getByText("Unsaved changes")).toBeVisible()
+  expect(api.posts).toEqual([])
+  await page.getByRole("button", { name: "Save", exact: true }).click()
+  await expect(page.getByText("symbols — accepted")).toBeVisible()
+  expect(api.posts[0].path).toContain("/trading/symbols/")
+  expect(api.posts[0].body).toEqual({ symbols: ["BTCUSDT", "ETHUSDT"] })
+
+  // The agent is the source of truth: once the save is confirmed the draft is
+  // gone, and what the table shows is the document the agent republished.
+  for (const entry of api.universe.symbols ?? []) {
+    entry.selected = entry.symbol !== "AAPLBUSDT"
+  }
+  api.universe.selected = 2
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "symbols",
+    ok: true,
+    data: { symbols: ["BTCUSDT", "ETHUSDT"], count: 2 },
+    at,
+  })
+  await page.clock.runFor(2000)
+  await expect(page.getByText("symbols — succeeded")).toBeVisible()
+  await expect(page.getByText("Unsaved changes")).toHaveCount(0)
 })
 
 test("only the latest balance request is shown, and results stay correlated", async ({

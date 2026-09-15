@@ -20,6 +20,9 @@
    намерение `running=true` автоматически восстанавливается, в том числе для LIVE.
 4. **Один канал backend↔agent — Redis** (команды + снапшот + heartbeat + события).
    У каждого сервиса своя БД; чужую схему никто не читает и не пишет.
+5. **Рабочие символы — тоже агента.** Агент сам читает вселенную у биржи, сам
+   проверяет отметки и хранит их в своей БД; backend лишь отдаёт опубликованный
+   документ и передаёт выбор командой (см. §8).
 
 ## Роли
 
@@ -27,10 +30,11 @@
 |---|---|
 | Strategy | ядро: анализ данных, эмиссия `Signal(ENTRY/EXIT/HOLD)` + provenance |
 | Engine | жизненный цикл Стратегии, сборка сервисов, heartbeat, события |
-| Commands | конверт команды + реестр обработчиков (`start`/`stop`/`balance`) |
+| Commands | конверт команды + реестр обработчиков (`start`/`stop`/`balance`/`symbols`) |
+| Universe / Selection | вселенная биржи, классификация символов и отметки пользователя |
 | Exchange (adapters) | тонкие async-обёртки над `binance_sdk_spot` (REST + WS) |
 | Backend | публикует команды, хранит снапшот намерения, отдаёт статус/результат |
-| Frontend | страница `/strategy`: настройки Стратегии + Start/Stop |
+| Frontend | `/strategy` (настройки + Start/Stop) и `/working-symbols` (отметки) |
 
 Стратегия **не обращается к бирже напрямую** и **не определяет** размер позиции,
 тип ордера, цену исполнения или защиту (`D-SIGNAL-ONLY`). Эти слои — следующие
@@ -42,8 +46,11 @@
 agent/agent/
 ├── main.py                    # демон: подписка на Redis + heartbeat
 ├── engine.py                  # Engine: lifecycle, сборка сервисов, heartbeat, events
+├── models.py                  # таблицы агента (WorkingSymbol) — схема через create_all
+├── selection.py               # чтение/запись/валидация отметок рабочих символов
+├── symbols.py                 # вселенная биржи: классификация + публикация agent:symbols
 ├── common/
-│   └── commands.py            # конверт/реестр @command + start/stop/balance + resume
+│   └── commands.py            # конверт/реестр @command + start/stop/balance/symbols + resume
 ├── exchange/
 │   ├── rest.py                # ExchangeRest — async-обёртка Spot.rest_api
 │   └── streams.py             # MarketDataStreams — обёртка Spot.websocket_streams
@@ -57,7 +64,7 @@ agent/agent/
 │       └── strategy.py        # @strategy("tripple_screen")
 └── core/
     ├── config.py              # pydantic-settings (.env)
-    └── db.py                  # движки БД (опционально)
+    └── db.py                  # движки БД + идемпотентное создание своей БД и схемы
 ```
 
 Точка подключения торговой логики — **`strategies/`**. Движок и команды её не
@@ -160,8 +167,9 @@ class Strategy(abc.ABC):
    `ExchangeRest` (округление под фильтры Binance, идемпотентные client-id).
 2. **Position monitoring (spec §7)** — initial stop, trailing, TP по live-цене;
    приоритет ≥ входной оценки; инвариант `stop < fill < tp`.
-3. **Universe scan (spec §1)** — eligible-фильтры, H4 slope, top-N по 24h volume,
-   динамический WS-set.
+3. **Universe scan в самой Стратегии (spec §1)** — H4 slope, top-N по 24h volume,
+   динамический WS-set. Сам список торгуемых символов и его отбор уже есть (§8),
+   но Стратегия пока берёт символы из `start`, а не сканирует их сама.
 4. **Fills/портфель** — user-data stream или REST-реконсиляция; персистентный
    cooldown через рестарт.
 5. **Audit chain (spec §8)** — market state → signal → intent → risk → order →
@@ -192,3 +200,44 @@ class Strategy(abc.ABC):
   эпоха потребляется после успешного emit. Просроченные сигналы не повторяются.
   Pub/Sub не предоставляет durable/exactly-once; потребители дедуплицируют ID.
 - Клиент генерируется из openapi (см. `CONTEXT.md` §5); вручную не правится.
+- Символы: `GET /trading/symbols/` отдаёт `agent:symbols` как есть (`available=false`,
+  если агент ещё не публиковал), `POST /trading/symbols/` шлёт команду `symbols`
+  (202 + конверт). Backend отбрасывает только неверный формат (422); «годится ли
+  символ» решает агент и сообщает причину через `/result/`. Страница
+  `/working-symbols` (superuser) сортирует таблицу по любому столбцу и сохраняет
+  весь набор; `/strategy` ссылается на неё вместо поля ввода и берёт отмеченные
+  пригодные символы в `start`. Подробности — §8.
+
+## 8. Торгуемая вселенная и рабочие символы
+
+Список символов принадлежит агенту: он единственный говорит с биржей и единственный
+может сказать, годится ли символ.
+
+- `agent/symbols.py` читает публичный `exchangeInfo` + 24h tickers, классифицирует
+  каждый USDT-символ и публикует документ в `agent:symbols` (на старте и раз в
+  5 минут; неудачное обновление оставляет прежний документ). Поля каждой записи:
+  `status`, `spot_allowed`, `quote_volume_24h` (Decimal-строка), `classification`,
+  `classification_label`, `excluded_reason`, `selected`.
+- **«Особых отметок» биржи не существует в spot-API**: у `exchangeInfo` нет `tags`,
+  `additional_properties` пуст у всех символов, новостей о делистинге там тоже нет.
+  Поэтому `excluded_reason` — **наша** классификация по `status`,
+  `is_spot_trading_allowed` и базовому активу: trading halted or delisted, spot
+  trading not allowed, stablecoin/fiat, gold (`PAXG`/`XAUT`), wrapped or staked,
+  tokenized equity, non-latin name. Токенизированные акции Binance называет
+  `<TICKER>B`: известный тикер отдаётся как факт, любой другой `*B` — как догадка
+  для проверки (`suspected_tokenized_equity`). Memecoins — только метка, из
+  вселенной не исключаются (пользователь снимает их руками).
+- **Отметки хранятся в БД агента** (`agent/models.py:WorkingSymbol`, PK `symbol`):
+  строка и есть отметка, поэтому «что выбрано» и «что есть» не расходятся.
+  `agent/core/db.py` идемпотентно создаёт свою БД и схему на каждом старте;
+  недоступная БД не мешает торговле. Backend к таблице не обращается — только к
+  опубликованному документу (принцип 4).
+- Команда `symbols` (payload `{symbols: [...]}`) заменяет набор целиком: агент
+  проверяет **весь** набор против вселенной и отклоняет запрос целиком, если хоть
+  один символ непригоден, — частичная запись оставила бы ложное впечатление, что
+  отмечено всё. Отмеченный символ, переставший подходить, не удаляется молча: он
+  остаётся отмеченным, а документ называет причину и считает `selected_unusable`.
+- UI: `/working-symbols` — таблица с сортировкой по каждому столбцу (чекбокс
+  участия, имя, 24h volume, отметки) и тумблером «показать непригодные»;
+  сохранение отправляет весь набор. `/strategy` больше не вводит символы текстом:
+  ссылка на эту страницу, а `start` берёт отмеченные пригодные символы.

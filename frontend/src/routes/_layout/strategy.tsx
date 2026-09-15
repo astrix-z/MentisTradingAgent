@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from "@tanstack/react-query"
-import { createFileRoute, redirect } from "@tanstack/react-router"
+import { createFileRoute, Link, redirect } from "@tanstack/react-router"
 import { Play, Square } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
 
@@ -59,6 +59,14 @@ const strategyCatalogQueryOptions = () => ({
   queryKey: ["strategy-catalog"],
 })
 
+// Which symbols a Start carries is decided on /working-symbols, so this page
+// only reads the published document back to show what will be traded.
+const workingSymbolsQueryOptions = () => ({
+  queryFn: async () => (await TradingService.listWorkingSymbols()).data,
+  queryKey: ["working-symbols"],
+  refetchInterval: 60_000,
+})
+
 // This page owns start/stop only: a balance request belongs to /balance, and
 // showing its result here would put account amounts on the settings page.
 const isLifecycleCommand = (command: TrackedCommand) =>
@@ -101,13 +109,14 @@ function Strategy() {
   const { data: catalog, isError: isCatalogError } = useQuery(
     strategyCatalogQueryOptions(),
   )
+  const { data: workingSymbols, isError: isWorkingSymbolsError } = useQuery(
+    workingSymbolsQueryOptions(),
+  )
 
   const [network, setNetwork] = useState<Network>("testnet")
-  const [symbolsInput, setSymbolsInput] = useState("")
   const [values, setValues] = useState<FieldValues>({})
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
   const [formErrors, setFormErrors] = useState<string[]>([])
-  const [symbolsError, setSymbolsError] = useState<string | null>(null)
   const [pendingLiveStart, setPendingLiveStart] =
     useState<ValidatedStart | null>(null)
 
@@ -139,18 +148,28 @@ function Strategy() {
     setValues(seedFormValues(fields, snapshot.params))
     setNetwork(snapshot.network ?? "testnet")
     setStrategy(snapshot.strategy ?? "")
-    setSymbolsInput((snapshot.symbols ?? []).join(", "))
     setSavedParams(snapshot.params ?? {})
   }, [status, fields, dirty])
 
-  const parsedSymbols = Array.from(
-    new Set(
-      symbolsInput
-        .split(",")
-        .map((symbol) => symbol.trim().toUpperCase())
-        .filter(Boolean),
-    ),
+  // The symbols a Start carries are the ones marked on the Working Symbols
+  // page: the agent owns that list, validates it against the exchange and
+  // stores it. A marked symbol that stopped qualifying is named, not silently
+  // traded.
+  const markedSymbols = (workingSymbols?.symbols ?? []).filter(
+    (entry) => entry.selected === true,
   )
+  const startSymbols = markedSymbols
+    .filter((entry) => (entry.excluded_reason ?? null) === null)
+    .map((entry) => entry.symbol)
+  const unusableMarked = markedSymbols.length - startSymbols.length
+
+  const symbolsProblem = isWorkingSymbolsError
+    ? "Cannot load the working symbols from the agent."
+    : workingSymbols?.available === false
+      ? "The agent has not published a symbol list yet."
+      : startSymbols.length === 0
+        ? "No symbols are marked yet. Choose them on the Working Symbols page."
+        : null
 
   const startMutation = useMutation({
     mutationFn: (body: StartPayload) => TradingService.startTrading({ body }),
@@ -228,6 +247,7 @@ function Strategy() {
     !catalogReady ||
     !activeStrategy ||
     (strategy !== "" && !strategyOffered) ||
+    !!symbolsProblem ||
     controlState === "loading" ||
     (!dirty && controlState === "running-confirmed")
   const stopDisabled =
@@ -243,14 +263,10 @@ function Strategy() {
   const runStart = (payload: ValidatedStart) => startMutation.mutate(payload)
 
   const onStart = () => {
-    setSymbolsError(null)
     setFieldErrors({})
     setFormErrors([])
     if (!activeStrategy) return
-    if (parsedSymbols.length === 0) {
-      setSymbolsError("Enter at least one symbol to trade (e.g. BTCUSDT)")
-      return
-    }
+    if (startSymbols.length === 0) return
     const result = validateSettings({
       fields,
       values,
@@ -266,7 +282,7 @@ function Strategy() {
     const payload: ValidatedStart = {
       network,
       strategy: strategy || activeStrategy.name,
-      symbols: parsedSymbols,
+      symbols: startSymbols,
       params: result.params,
     }
     if (network === "live") {
@@ -276,10 +292,7 @@ function Strategy() {
     runStart(payload)
   }
 
-  const hasErrors =
-    Object.keys(fieldErrors).length > 0 ||
-    formErrors.length > 0 ||
-    !!symbolsError
+  const hasErrors = Object.keys(fieldErrors).length > 0 || formErrors.length > 0
 
   return (
     <div className="flex flex-col gap-6">
@@ -312,7 +325,6 @@ function Strategy() {
       {hasErrors && (
         <div role="alert" className="space-y-1 rounded-md border p-3 text-sm">
           <p className="font-semibold">Fix the following before starting:</p>
-          {symbolsError && <p>{symbolsError}</p>}
           {formErrors.map((message) => (
             <p key={message}>{message}</p>
           ))}
@@ -370,22 +382,29 @@ function Strategy() {
             </div>
 
             <div className="flex flex-col gap-2">
-              <Label htmlFor="symbols">Symbols</Label>
-              <Input
-                id="symbols"
-                placeholder="e.g. BTCUSDT, ETHUSDT"
-                value={symbolsInput}
-                disabled={pending}
-                aria-invalid={!!symbolsError}
-                onChange={(event) => {
-                  setDirty(true)
-                  setSymbolsInput(event.target.value)
-                }}
-              />
-              <span className="text-muted-foreground text-xs">
-                Comma-separated, uppercased and de-duplicated automatically
-              </span>
-              {symbolsError && <p role="alert">{symbolsError}</p>}
+              <Label>Symbols</Label>
+              {symbolsProblem ? (
+                <p role="alert">{symbolsProblem}</p>
+              ) : (
+                <p>
+                  {startSymbols.length} symbol(s) from the working list:{" "}
+                  <span className="font-mono text-xs">
+                    {startSymbols.slice(0, 12).join(", ")}
+                    {startSymbols.length > 12
+                      ? ` +${startSymbols.length - 12} more`
+                      : ""}
+                  </span>
+                </p>
+              )}
+              <Link to="/working-symbols" className="text-sm underline">
+                Working Symbols
+              </Link>
+              {unusableMarked > 0 && (
+                <p className="text-destructive text-sm">
+                  {unusableMarked} marked symbol(s) are unusable and will not be
+                  traded.
+                </p>
+              )}
             </div>
 
             <div className="flex gap-2">

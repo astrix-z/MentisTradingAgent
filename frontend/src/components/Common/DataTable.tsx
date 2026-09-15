@@ -3,14 +3,20 @@ import {
   flexRender,
   getCoreRowModel,
   getPaginationRowModel,
+  getSortedRowModel,
+  type SortingState,
   useReactTable,
 } from "@tanstack/react-table"
 import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   ChevronLeft,
   ChevronRight,
   ChevronsLeft,
   ChevronsRight,
 } from "lucide-react"
+import { useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -32,16 +38,25 @@ import {
 interface DataTableProps<TData, TValue> {
   columns: ColumnDef<TData, TValue>[]
   data: TData[]
+  // Off by default: a table that was never meant to sort keeps plain headers,
+  // and a table that opts in gets a sort toggle on every sortable column.
+  sorting?: boolean
 }
 
 export function DataTable<TData, TValue>({
   columns,
   data,
+  sorting = false,
 }: DataTableProps<TData, TValue>) {
+  const [sortingState, setSortingState] = useState<SortingState>([])
   const table = useReactTable({
     data,
     columns,
+    state: { sorting: sortingState },
+    onSortingChange: setSortingState,
+    enableSorting: sorting,
     getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
   })
 
@@ -52,14 +67,36 @@ export function DataTable<TData, TValue>({
           {table.getHeaderGroups().map((headerGroup) => (
             <TableRow key={headerGroup.id} className="hover:bg-transparent">
               {headerGroup.headers.map((header) => {
+                const sorted = header.column.getIsSorted()
                 return (
                   <TableHead key={header.id}>
-                    {header.isPlaceholder
-                      ? null
-                      : flexRender(
+                    {header.isPlaceholder ? null : header.column.getCanSort() ? (
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1 hover:text-foreground"
+                        onClick={header.column.getToggleSortingHandler()}
+                      >
+                        {flexRender(
                           header.column.columnDef.header,
                           header.getContext(),
                         )}
+                        {sorted === "asc" ? (
+                          <ArrowUp className="size-3.5" aria-hidden="true" />
+                        ) : sorted === "desc" ? (
+                          <ArrowDown className="size-3.5" aria-hidden="true" />
+                        ) : (
+                          <ArrowUpDown
+                            className="size-3.5 opacity-50"
+                            aria-hidden="true"
+                          />
+                        )}
+                      </button>
+                    ) : (
+                      flexRender(
+                        header.column.columnDef.header,
+                        header.getContext(),
+                      )
+                    )}
                   </TableHead>
                 )
               })}

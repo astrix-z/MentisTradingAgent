@@ -2,7 +2,7 @@
 
 import { type Client, type Options as Options2, type TDataShape, urlSearchParamsBodySerializer } from './client';
 import { client } from './client.gen';
-import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetCommandStateData, tradingGetCommandStateErrors, tradingGetCommandStateResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
+import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetCommandStateData, tradingGetCommandStateErrors, tradingGetCommandStateResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingListWorkingSymbolsData, tradingListWorkingSymbolsResponses, tradingSetWorkingSymbolsData, tradingSetWorkingSymbolsErrors, tradingSetWorkingSymbolsResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -379,6 +379,45 @@ export class TradingService {
             security: [{ scheme: 'bearer', type: 'http' }],
             url: '/api/v1/trading/strategies/',
             ...options
+        });
+    }
+    
+    /**
+     * List Working Symbols
+     *
+     * The tradeable universe and the marks, as published by the agent.
+     *
+     * Served with ``available=False`` (not an error) when the agent has not run
+     * yet, so the UI can distinguish "no agent" from "no symbols".
+     */
+    public static listWorkingSymbols<ThrowOnError extends boolean = true>(options?: Options<tradingListWorkingSymbolsData, ThrowOnError>) {
+        return (options?.client ?? client).get<tradingListWorkingSymbolsResponses, unknown, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/symbols/',
+            ...options
+        });
+    }
+    
+    /**
+     * Set Working Symbols
+     *
+     * Replace the marked working symbols.
+     *
+     * 202 only acknowledges the command: the agent checks every symbol against the
+     * exchange before storing anything, and reports the outcome through
+     * ``/result/`` (a rejected symbol leaves the previous selection untouched).
+     */
+    public static setWorkingSymbols<ThrowOnError extends boolean = true>(options: Options<tradingSetWorkingSymbolsData, ThrowOnError>) {
+        return (options.client ?? client).post<tradingSetWorkingSymbolsResponses, tradingSetWorkingSymbolsErrors, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/symbols/',
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                ...options.headers
+            }
         });
     }
     

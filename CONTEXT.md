@@ -154,6 +154,46 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-09-15] Working Symbols: страница и API (закрывает хвост предыдущего пункта)
+- **Backend — только API**: `GET /trading/symbols/` отдаёт опубликованный `agent:symbols`
+  как есть (`available=false`, если агент ещё не публиковал; нечитаемый документ —
+  тоже `available=false`, а не 500), `POST /trading/symbols/` (superuser) шлёт команду
+  `symbols` (202 + конверт). Backend проверяет только формат и дубли (422); «годится ли
+  символ» решает агент и сообщает причину через `/result/`.
+- `_SNAPSHOT_COMMANDS = ("start", "stop")`: команды-наблюдения (`balance`, `symbols`)
+  больше не переписывают снапшот — иначе `symbols` молча выставляла бы `running=false`.
+  `CommandType` расширен, `/commands/` тоже понимает `symbols`.
+- Клиент перегенерирован ( `listWorkingSymbols`/`setWorkingSymbols`).
+- UI: новая страница `/working-symbols` (superuser, как `/balance`): таблица с
+  сортировкой по **каждому** столбцу, чекбокс участия, имя, 24h volume (сортируется
+  численно, не как текст) и отметки (badge причины/метки). В `DataTable` добавлен
+  opt-in проп `sorting` — у остальных таблиц заголовки прежние. Тумблер
+  «Show unusable symbols»; непригодные нельзя отметить, но отмеченный всегда можно
+  снять. Правки — локальный черновик, `Save` отправляет весь набор; после
+  подтверждения команды черновик сбрасывается и документ перечитывается.
+- `/strategy`: вместо поля ввода Symbols — ссылка на `/working-symbols` и сводка
+  (сколько отмечено + имена). `start` несёт отмеченные **пригодные** символы;
+  непригодные отмеченные перечисляются, но не торгуются. Start заблокирован, пока
+  нет ни одного отмеченного символа или агент не опубликовал список.
+- Docs: `DESIGN.md` — принцип 5, §7 (эндпоинты/страница) и новый §8 (вселенная,
+  классификация, БД агента, команда `symbols`).
+- Файлы: `backend/app/api/routes/trading.py`, `backend/tests/test_trading_contract.py`,
+  `frontend/src/routes/_layout/working-symbols.tsx`, `frontend/src/routeTree.gen.ts`,
+  `frontend/src/components/{Common/DataTable.tsx,Sidebar/AppSidebar.tsx}`,
+  `frontend/src/routes/_layout/strategy.tsx`, `frontend/tests/trading-contract.spec.ts`,
+  `frontend/src/client/*` (сгенерировано), `DESIGN.md`.
+- Проверено: backend полный сьют **168 passed / 1 skipped**, coverage **93%** (гейт 90%);
+  `trading-contract` отдельно 66 passed; `ruff check` и `uv run mypy backend/app` чисто. Frontend:
+  `tsc -p tsconfig.build.json` и biome чисто (кроме давнего
+  `frontend/tests/fixtures/strategy-catalog.json`: файл сгенерирован, biome его
+  переформатирует — не трогал), `vite build` ок. Playwright **mock 18 passed** (2 новых).
+  Стек пересобран (`docker compose up -d --build backend`); live e2e **78 passed**, 2
+  падения — только `reset-password.spec.ts` (mailpit не запущен, `ECONNREFUSED`, профиль
+  `extras` + пустой `EMAILS_FROM_EMAIL`), к правке не относятся.
+- **Хвост:** реального e2e-теста для `/working-symbols` нет (поведение покрыто
+  mock-сьютом); derived-предупреждений (низкий объём/широкий спред) нет — биржа их не
+  публикует, поэтому отметки — только классификация и причина.
+
 ### [2026-09-15] Рабочие символы: вселенная биржи и отметки принадлежат агенту (агентская часть)
 - Агент читает публичный `exchangeInfo` + 24h tickers, классифицирует и публикует в
   `agent:symbols` полный список USDT-символов с причиной непригодности. Флаги выбора в

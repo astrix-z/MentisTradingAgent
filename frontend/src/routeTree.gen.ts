@@ -21,6 +21,7 @@ import { Route as LayoutItemsRouteImport } from './routes/_layout/items'
 import { Route as LayoutSettingsRouteImport } from './routes/_layout/settings'
 import { Route as LayoutStrategyRouteImport } from './routes/_layout/strategy'
 import { Route as LayoutTradingRouteImport } from './routes/_layout/trading'
+import { Route as LayoutWorkingSymbolsRouteImport } from './routes/_layout/working-symbols'
 
 const LayoutRoute = LayoutRouteImport.update({
   id: '/_layout',
@@ -81,6 +82,11 @@ const LayoutTradingRoute = LayoutTradingRouteImport.update({
   path: '/trading',
   getParentRoute: () => LayoutRoute,
 } as any)
+const LayoutWorkingSymbolsRoute = LayoutWorkingSymbolsRouteImport.update({
+  id: '/working-symbols',
+  path: '/working-symbols',
+  getParentRoute: () => LayoutRoute,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof LayoutIndexRoute
@@ -94,6 +100,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof LayoutSettingsRoute
   '/strategy': typeof LayoutStrategyRoute
   '/trading': typeof LayoutTradingRoute
+  '/working-symbols': typeof LayoutWorkingSymbolsRoute
 }
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
@@ -106,6 +113,7 @@ export interface FileRoutesByTo {
   '/settings': typeof LayoutSettingsRoute
   '/strategy': typeof LayoutStrategyRoute
   '/trading': typeof LayoutTradingRoute
+  '/working-symbols': typeof LayoutWorkingSymbolsRoute
   '/': typeof LayoutIndexRoute
 }
 export interface FileRoutesById {
@@ -121,6 +129,7 @@ export interface FileRoutesById {
   '/_layout/settings': typeof LayoutSettingsRoute
   '/_layout/strategy': typeof LayoutStrategyRoute
   '/_layout/trading': typeof LayoutTradingRoute
+  '/_layout/working-symbols': typeof LayoutWorkingSymbolsRoute
   '/_layout/': typeof LayoutIndexRoute
 }
 export interface FileRouteTypes {
@@ -137,6 +146,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/strategy'
     | '/trading'
+    | '/working-symbols'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/login'
@@ -149,6 +159,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/strategy'
     | '/trading'
+    | '/working-symbols'
     | '/'
   id:
     | '__root__'
@@ -163,6 +174,7 @@ export interface FileRouteTypes {
     | '/_layout/settings'
     | '/_layout/strategy'
     | '/_layout/trading'
+    | '/_layout/working-symbols'
     | '/_layout/'
   fileRoutesById: FileRoutesById
 }
@@ -260,6 +272,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LayoutTradingRouteImport
       parentRoute: typeof LayoutRoute
     }
+    '/_layout/working-symbols': {
+      id: '/_layout/working-symbols'
+      path: '/working-symbols'
+      fullPath: '/working-symbols'
+      preLoaderRoute: typeof LayoutWorkingSymbolsRouteImport
+      parentRoute: typeof LayoutRoute
+    }
   }
 }
 
@@ -270,6 +289,7 @@ interface LayoutRouteChildren {
   LayoutSettingsRoute: typeof LayoutSettingsRoute
   LayoutStrategyRoute: typeof LayoutStrategyRoute
   LayoutTradingRoute: typeof LayoutTradingRoute
+  LayoutWorkingSymbolsRoute: typeof LayoutWorkingSymbolsRoute
   LayoutIndexRoute: typeof LayoutIndexRoute
 }
 
@@ -280,6 +300,7 @@ const LayoutRouteChildren: LayoutRouteChildren = {
   LayoutSettingsRoute: LayoutSettingsRoute,
   LayoutStrategyRoute: LayoutStrategyRoute,
   LayoutTradingRoute: LayoutTradingRoute,
+  LayoutWorkingSymbolsRoute: LayoutWorkingSymbolsRoute,
   LayoutIndexRoute: LayoutIndexRoute,
 }
 

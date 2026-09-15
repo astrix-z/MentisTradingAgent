@@ -1,4 +1,11 @@
-import { Briefcase, Crosshair, Home, Users, Wallet } from "lucide-react"
+import {
+  Briefcase,
+  Crosshair,
+  Home,
+  ListChecks,
+  Users,
+  Wallet,
+} from "lucide-react"
 
 import { SidebarAppearance } from "@/components/Common/Appearance"
 import { Logo } from "@/components/Common/Logo"
@@ -27,6 +34,11 @@ export function AppSidebar() {
           icon: Crosshair,
           title: "Strategy",
           path: "/strategy",
+        },
+        {
+          icon: ListChecks,
+          title: "Working Symbols",
+          path: "/working-symbols",
         },
         {
           icon: Wallet,

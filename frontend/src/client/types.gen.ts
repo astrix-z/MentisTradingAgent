@@ -103,7 +103,7 @@ export type CommandRequest = {
     /**
      * Type
      */
-    type: 'start' | 'stop' | 'balance';
+    type: 'start' | 'stop' | 'balance' | 'symbols';
     /**
      * Payload
      */
@@ -469,6 +469,74 @@ export type StrategyDescription = {
 };
 
 /**
+ * SymbolEntry
+ *
+ * One symbol in the universe the agent published.
+ *
+ * Everything here is the agent's classification, served verbatim: the backend
+ * contributes no domain knowledge. ``excluded_reason`` is why the symbol cannot
+ * be marked — ``None`` means it can.
+ */
+export type SymbolEntry = {
+    /**
+     * Symbol
+     */
+    symbol: string;
+    /**
+     * Base Asset
+     */
+    base_asset?: string | null;
+    /**
+     * Quote Asset
+     */
+    quote_asset: string;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Spot Allowed
+     */
+    spot_allowed?: boolean;
+    /**
+     * Quote Volume 24H
+     */
+    quote_volume_24h?: string;
+    /**
+     * Classification
+     */
+    classification: string;
+    /**
+     * Classification Label
+     */
+    classification_label?: string | null;
+    /**
+     * Excluded Reason
+     */
+    excluded_reason?: string | null;
+    /**
+     * Selected
+     */
+    selected?: boolean;
+};
+
+/**
+ * SymbolsPayload
+ *
+ * Payload of the ``symbols`` command: the complete marked set.
+ *
+ * ``[]`` is meaningful (nothing is marked) rather than an error. Only payload
+ * hygiene is enforced here — whether a symbol may actually be used is the
+ * agent's call, since it is the only service that reads the exchange.
+ */
+export type SymbolsPayload = {
+    /**
+     * Symbols
+     */
+    symbols?: Array<string>;
+};
+
+/**
  * Token
  */
 export type Token = {
@@ -664,6 +732,50 @@ export type ValidationError = {
     ctx?: {
         [key: string]: unknown;
     };
+};
+
+/**
+ * WorkingSymbols
+ *
+ * The tradeable universe plus which symbols the user marked.
+ *
+ * ``available=False`` means the agent has never published a universe (it has
+ * not started yet), which is distinct from a universe that is legitimately
+ * empty — the UI must say so instead of showing a blank table.
+ */
+export type WorkingSymbols = {
+    /**
+     * Available
+     */
+    available?: boolean;
+    /**
+     * Quote Asset
+     */
+    quote_asset?: string;
+    /**
+     * Generated At
+     */
+    generated_at?: string | null;
+    /**
+     * Total
+     */
+    total?: number;
+    /**
+     * Usable
+     */
+    usable?: number;
+    /**
+     * Selected
+     */
+    selected?: number;
+    /**
+     * Selected Unusable
+     */
+    selected_unusable?: number;
+    /**
+     * Symbols
+     */
+    symbols?: Array<SymbolEntry>;
 };
 
 export type loginLoginAccessTokenData = {
@@ -1260,6 +1372,47 @@ export type tradingListStrategiesResponses = {
 };
 
 export type tradingListStrategiesResponse = tradingListStrategiesResponses[keyof tradingListStrategiesResponses];
+
+export type tradingListWorkingSymbolsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/symbols/';
+};
+
+export type tradingListWorkingSymbolsResponses = {
+    /**
+     * Successful Response
+     */
+    200: WorkingSymbols;
+};
+
+export type tradingListWorkingSymbolsResponse = tradingListWorkingSymbolsResponses[keyof tradingListWorkingSymbolsResponses];
+
+export type tradingSetWorkingSymbolsData = {
+    body: SymbolsPayload;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/symbols/';
+};
+
+export type tradingSetWorkingSymbolsErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type tradingSetWorkingSymbolsError = tradingSetWorkingSymbolsErrors[keyof tradingSetWorkingSymbolsErrors];
+
+export type tradingSetWorkingSymbolsResponses = {
+    /**
+     * Successful Response
+     */
+    202: CommandEnvelope;
+};
+
+export type tradingSetWorkingSymbolsResponse = tradingSetWorkingSymbolsResponses[keyof tradingSetWorkingSymbolsResponses];
 
 export type tradingIssueCommandData = {
     body: CommandRequest;
