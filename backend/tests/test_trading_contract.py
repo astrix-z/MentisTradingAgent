@@ -518,7 +518,7 @@ def test_command_redis_failure_is_not_accepted(
     assert trading.REDIS_RUNTIME_KEY not in redis.values
 
 
-@pytest.mark.parametrize("path", ["status", "result"])
+@pytest.mark.parametrize("path", ["status", "result", "symbols"])
 def test_read_redis_failure(client: TestClient, redis: MemoryRedis, path: str) -> None:
     redis.fail = "get"
     assert (
@@ -527,7 +527,7 @@ def test_read_redis_failure(client: TestClient, redis: MemoryRedis, path: str) -
     )
 
 
-@pytest.mark.parametrize("command", ["start", "stop", "balance"])
+@pytest.mark.parametrize("command", ["start", "stop", "balance", "symbols"])
 def test_generic_commands_share_the_same_commit_path(
     client: TestClient,
     redis: MemoryRedis,
@@ -541,7 +541,7 @@ def test_generic_commands_share_the_same_commit_path(
     assert response.status_code == 202
     assert len(redis.publications) == 1
     assert redis.publications[0][1] == response.json()
-    if command == "balance":
+    if command in ("balance", "symbols"):
         assert trading.REDIS_RUNTIME_KEY not in redis.values
     else:
         snapshot = json.loads(redis.values[trading.REDIS_RUNTIME_KEY])
@@ -736,3 +736,227 @@ def test_openapi_exposes_typed_status_and_optional_id(client: TestClient) -> Non
     assert query["name"] == "command_id"
     assert query["required"] is False
     assert {"type": "string", "format": "uuid"} in query["schema"]["anyOf"]
+
+
+# --- working symbols --------------------------------------------------------
+
+
+def universe_payload() -> dict[str, Any]:
+    """A symbols document in exactly the format the agent publishes.
+
+    Written out here rather than imported from the agent: this is the wire
+    format the backend consumes, and the agent's own tests check that
+    ``agent.symbols.build_universe`` produces it.
+    """
+
+    def entry(
+        symbol: str,
+        base_asset: str,
+        *,
+        volume: str,
+        classification: str = "crypto",
+        label: str | None = None,
+        excluded_reason: str | None = None,
+        selected: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "symbol": symbol,
+            "base_asset": base_asset,
+            "quote_asset": "USDT",
+            "status": "TRADING",
+            "spot_allowed": True,
+            "quote_volume_24h": volume,
+            "classification": classification,
+            "classification_label": label,
+            "excluded_reason": excluded_reason,
+            "selected": selected,
+        }
+
+    return {
+        "version": 1,
+        "generated_at": "2026-09-15T00:00:00+00:00",
+        # Fields the backend does not model must not break the read.
+        "network": "live",
+        "quote_asset": "USDT",
+        "usable": 2,
+        "total": 3,
+        "selected": 1,
+        "selected_unusable": 0,
+        "symbols": [
+            entry(
+                "AAPLBUSDT",
+                "AAPLB",
+                volume="10",
+                classification="tokenized_equity",
+                label="tokenized equity",
+                excluded_reason="tokenized equity",
+            ),
+            entry("BTCUSDT", "BTC", volume="123.45", selected=True),
+            entry("ETHUSDT", "ETH", volume="99.9"),
+        ],
+    }
+
+
+def test_symbols_endpoint_serves_the_published_universe(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    redis.values[trading.REDIS_SYMBOLS_KEY] = json.dumps(universe_payload())
+    response = client.get("/api/v1/trading/symbols/", headers=headers(client))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["available"] is True
+    assert body["quote_asset"] == "USDT"
+    assert body["usable"] == 2
+    assert body["total"] == 3
+    assert body["selected"] == 1
+    # The reason a symbol cannot be marked is served exactly as the agent wrote
+    # it, and None means it can be marked.
+    by_symbol = {entry["symbol"]: entry for entry in body["symbols"]}
+    assert by_symbol["AAPLBUSDT"]["excluded_reason"] == "tokenized equity"
+    assert by_symbol["ETHUSDT"]["excluded_reason"] is None
+    assert by_symbol["BTCUSDT"]["selected"] is True
+    # Volume stays a Decimal string: the UI sorts it numerically, not lexically.
+    assert by_symbol["BTCUSDT"]["quote_volume_24h"] == "123.45"
+
+
+def test_symbols_endpoint_reports_a_missing_agent_without_erroring(
+    client: TestClient,
+) -> None:
+    """An unpublished universe is a state, not a failure the UI must toast."""
+    response = client.get("/api/v1/trading/symbols/", headers=headers(client))
+    assert response.status_code == 200
+    assert response.json() == {
+        "available": False,
+        "quote_asset": "USDT",
+        "generated_at": None,
+        "total": 0,
+        "usable": 0,
+        "selected": 0,
+        "selected_unusable": 0,
+        "symbols": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "not json at all",
+        json.dumps({"symbols": "BTCUSDT"}),
+        json.dumps({"symbols": [{"symbol": "BTCUSDT"}]}),  # entry lacks fields
+    ],
+)
+def test_symbols_endpoint_reports_an_unusable_document(
+    client: TestClient, redis: MemoryRedis, broken: str
+) -> None:
+    """A document the backend cannot read must not render as a full table."""
+    redis.values[trading.REDIS_SYMBOLS_KEY] = broken
+    response = client.get("/api/v1/trading/symbols/", headers=headers(client))
+    assert response.status_code == 200
+    assert response.json()["available"] is False
+    assert response.json()["symbols"] == []
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+@pytest.mark.parametrize("role,expected", [(None, 401), ("user", 403)])
+def test_working_symbols_are_superuser_only(
+    client: TestClient,
+    redis: MemoryRedis,
+    method: str,
+    role: str | None,
+    expected: int,
+) -> None:
+    redis.fail = "get"  # Unauthorized calls must not even reach Redis.
+    kwargs: dict[str, Any] = (
+        {"json": {"symbols": ["BTCUSDT"]}} if method == "post" else {}
+    )
+    response = getattr(client, method)(
+        "/api/v1/trading/symbols/",
+        headers=headers(client, role) if role else {},
+        **kwargs,
+    )
+    assert response.status_code == expected
+
+
+def test_set_symbols_enqueues_a_command(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    response = client.post(
+        "/api/v1/trading/symbols/",
+        json={"symbols": ["btcusdt", " ethusdt "]},
+        headers=headers(client),
+    )
+    assert response.status_code == 202
+    assert len(redis.publications) == 1
+    stream, envelope, _ = redis.publications[0]
+    assert stream == trading.REDIS_COMMAND_STREAM
+    assert envelope["type"] == "symbols"
+    assert envelope["payload"] == {"symbols": ["BTCUSDT", "ETHUSDT"]}
+    # Marking symbols says nothing about whether the strategy is running, so the
+    # snapshot must be left alone (it would otherwise be rewritten as stopped).
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"symbols": "BTCUSDT"},  # not a list
+        {"symbols": ["BTC USDT"]},  # invalid format
+        {"symbols": ["BTCUSDT", "btcusdt"]},  # duplicate after normalizing
+    ],
+)
+def test_invalid_symbols_rejected_before_redis(
+    client: TestClient, redis: MemoryRedis, payload: dict[str, Any]
+) -> None:
+    response = client.post(
+        "/api/v1/trading/symbols/", json=payload, headers=headers(client)
+    )
+    assert response.status_code == 422
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+def test_set_symbols_allows_clearing_the_selection(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    """An empty set is a real choice (nothing is marked), not a bad request."""
+    response = client.post(
+        "/api/v1/trading/symbols/", json={"symbols": []}, headers=headers(client)
+    )
+    assert response.status_code == 202
+    assert redis.publications[0][1]["payload"] == {"symbols": []}
+
+
+def test_generic_symbols_command_shares_the_payload_rules(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    """The generic lane enforces the same contract as the alias above."""
+    response = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": "symbols", "payload": {"symbols": ["BTC USDT"]}},
+        headers=headers(client),
+    )
+    assert response.status_code == 422
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+def test_openapi_exposes_typed_working_symbols(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    models = schema["components"]["schemas"]
+    assert {"excluded_reason", "selected", "quote_volume_24h"} <= set(
+        models["SymbolEntry"]["properties"]
+    )
+    assert {"available", "usable", "selected_unusable", "symbols"} <= set(
+        models["WorkingSymbols"]["properties"]
+    )
+    paths = schema["paths"]["/api/v1/trading/symbols/"]
+    assert (
+        paths["get"]["responses"]["200"]["content"]["application/json"]["schema"][
+            "$ref"
+        ].endswith("/WorkingSymbols")
+    )
+    assert (
+        paths["post"]["responses"]["202"]["content"]["application/json"]["schema"][
+            "$ref"
+        ].endswith("/CommandEnvelope")
+    )

@@ -79,6 +79,7 @@ REDIS_RUNTIME_KEY = "agent:runtime"
 REDIS_HEARTBEAT_KEY = "trading:heartbeat"
 REDIS_RESULT_KEY = "agent:result"
 REDIS_COMMAND_STATE_PREFIX = "agent:command:"
+REDIS_SYMBOLS_KEY = "agent:symbols"
 
 # Approximate trim keeps the durable command stream bounded without an exact
 # (expensive) length check on every write.
@@ -111,7 +112,13 @@ SuperUserDep = Annotated[User, Depends(get_current_active_superuser)]
 
 # Trading network the agent should run against (must match agent key selection).
 Network = Literal["testnet", "live"]
-CommandType = Literal["start", "stop", "balance"]
+CommandType = Literal["start", "stop", "balance", "symbols"]
+
+# Commands that describe the running intent and therefore rewrite the runtime
+# snapshot. Everything else is observation-only (balance, symbols) and goes
+# straight to the stream — an accidental snapshot write there would mean
+# silently stopping the strategy.
+_SNAPSHOT_COMMANDS: tuple[CommandType, ...] = ("start", "stop")
 
 # Strategy names and per-strategy parameter rules are *not* listed here: the
 # agent owns them and publishes them (see ``app.core.strategy_catalog``), so a
@@ -250,6 +257,74 @@ class StrategyCatalog(BaseModel):
     strategies: list[StrategyDescription] = Field(default_factory=list)
 
 
+class SymbolEntry(BaseModel):
+    """One symbol in the universe the agent published.
+
+    Everything here is the agent's classification, served verbatim: the backend
+    contributes no domain knowledge. ``excluded_reason`` is why the symbol cannot
+    be marked — ``None`` means it can.
+    """
+
+    symbol: str
+    base_asset: str | None = None
+    quote_asset: str
+    status: str
+    spot_allowed: bool = False
+    quote_volume_24h: str = "0"
+    classification: str
+    classification_label: str | None = None
+    excluded_reason: str | None = None
+    selected: bool = False
+
+
+class WorkingSymbols(BaseModel):
+    """The tradeable universe plus which symbols the user marked.
+
+    ``available=False`` means the agent has never published a universe (it has
+    not started yet), which is distinct from a universe that is legitimately
+    empty — the UI must say so instead of showing a blank table.
+    """
+
+    #: Defaults to True because a parsed *published* document is available by
+    #: definition: the only unavailable response is the one this backend builds
+    #: itself (:func:`list_working_symbols`), so no published document can be
+    #: mistaken for it.
+    available: bool = True
+    quote_asset: str = "USDT"
+    generated_at: str | None = None
+    total: int = 0
+    usable: int = 0
+    selected: int = 0
+    selected_unusable: int = 0
+    symbols: list[SymbolEntry] = Field(default_factory=list)
+
+
+class SymbolsPayload(BaseModel):
+    """Payload of the ``symbols`` command: the complete marked set.
+
+    ``[]`` is meaningful (nothing is marked) rather than an error. Only payload
+    hygiene is enforced here — whether a symbol may actually be used is the
+    agent's call, since it is the only service that reads the exchange.
+    """
+
+    symbols: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_symbols(self) -> Self:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in self.symbols:
+            symbol = str(raw).strip().upper()
+            if _SYMBOL_RE.fullmatch(symbol) is None:
+                raise ValueError(f"invalid symbol format: {raw!r}")
+            if symbol in seen:
+                raise ValueError(f"duplicate symbol: {symbol!r}")
+            seen.add(symbol)
+            normalized.append(symbol)
+        self.symbols = normalized
+        return self
+
+
 class BalanceAsset(BaseModel):
     """One non-zero asset row. Amounts are Decimal-precise strings, never
     binary floats, so financial values round-trip exactly through JSON."""
@@ -368,7 +443,8 @@ async def _apply_command(
     envelope = CommandEnvelope(
         id=uuid.uuid4(), type=type_, payload=payload, issued_at=_now()
     )
-    if type_ == "balance":
+    if type_ not in _SNAPSHOT_COMMANDS:
+        # Observation-only: no intent to record, so only the stream is written.
         await _enqueue(envelope)
     else:
         redis = get_redis()
@@ -502,6 +578,27 @@ def _catalog_response(catalog: CompiledCatalog | None) -> StrategyCatalog:
     )
 
 
+async def _get_working_symbols() -> WorkingSymbols:
+    """The universe the agent published, or ``available=False``.
+
+    The document is served as the agent wrote it — the backend neither chooses
+    the symbols nor judges them — and an unusable one is reported the same way
+    an unpublished one is, because both mean the UI has nothing to render.
+    """
+    redis = get_redis()
+    try:
+        raw = await redis.get(REDIS_SYMBOLS_KEY)
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    if not raw:
+        return WorkingSymbols(available=False)
+    try:
+        return WorkingSymbols.model_validate_json(raw)
+    except ValidationError as exc:
+        logger.error("published symbol universe is unusable: %s", exc)
+        return WorkingSymbols(available=False)
+
+
 # --- Endpoints -------------------------------------------------------------
 
 
@@ -523,6 +620,29 @@ async def list_strategies(_: CurrentUser) -> StrategyCatalog:
     return _catalog_response(catalog)
 
 
+@router.get("/symbols/", response_model=WorkingSymbols)
+async def list_working_symbols(_: SuperUserDep) -> WorkingSymbols:
+    """The tradeable universe and the marks, as published by the agent.
+
+    Served with ``available=False`` (not an error) when the agent has not run
+    yet, so the UI can distinguish "no agent" from "no symbols".
+    """
+    return await _get_working_symbols()
+
+
+@router.post("/symbols/", status_code=202, response_model=CommandEnvelope)
+async def set_working_symbols(
+    payload: SymbolsPayload, _: SuperUserDep
+) -> CommandEnvelope:
+    """Replace the marked working symbols.
+
+    202 only acknowledges the command: the agent checks every symbol against the
+    exchange before storing anything, and reports the outcome through
+    ``/result/`` (a rejected symbol leaves the previous selection untouched).
+    """
+    return await _apply_command("symbols", {"symbols": payload.symbols})
+
+
 @router.post("/commands/", status_code=202, response_model=CommandEnvelope)
 async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnvelope:
     """Publish an arbitrary known command to the agent."""
@@ -537,6 +657,14 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
         return await _apply_command("start", _start_command_payload(parsed))
     if request.type == "balance":
         return await _apply_command("balance", request.payload)
+    if request.type == "symbols":
+        try:
+            symbols = SymbolsPayload(**request.payload)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422, detail=json_safe_errors(exc)
+            ) from exc
+        return await _apply_command("symbols", symbols.model_dump())
     return await _apply_command("stop", {})
 
 
