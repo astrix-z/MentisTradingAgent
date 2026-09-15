@@ -20,6 +20,14 @@ backend lifecycle.
   per strategy plus the cross-field rules the schema cannot express, so the
   backend can enforce and the UI can render the parameters without either of
   them owning (or importing) `TripleScreenSettings`.
+- **The agent owns the working-symbol selection.** It reads the exchange's
+  tradeable universe, classifies it (stablecoin/fiat, gold, wrapped or staked,
+  tokenized equity, non-Latin names), and publishes it to `agent:symbols`. A
+  symbol the user marks gets a row in the agent's own database (`WorkingSymbol`)
+  and the mark is merged into the published document; the backend only reads that
+  document and asks for changes over the command lane. Validation is the agent's
+  alone: it is the only service that can say whether a marked symbol is still
+  listed, still spot-tradable and still not one of the excluded classes.
 - **All exchange access is built on `binance_sdk_spot`.** Own/duplicate models
   (`Quote`, `MarketData`, `NewOrder`, ...) are forbidden; the SDK already provides
   them. Docs and examples live in `../binance-spot/`.
@@ -62,8 +70,8 @@ rather than accept.
 
 Signals carry exact Decimal strings, provenance and `signal_id`. Failed emission
 is retried in memory with the same ID while still fresh/valid; consumers must
-deduplicate. Redis Pub/Sub is not a durable queue. Execution, sizing, position
-protection and universe scanning remain unimplemented.
+deduplicate. Redis Pub/Sub is not a durable queue. Execution, sizing and position
+protection remain unimplemented.
 
 ## Structure
 
@@ -72,7 +80,16 @@ protection and universe scanning remain unimplemented.
 - `agent/engine.py` — `Engine`: builds the SDK-backed services, starts/stops the
   strategy, publishes the heartbeat and signal events. Boots in `idle`.
 - `agent/common/commands.py` — command envelope + handler registry (`@command`),
-  built-in `start`/`stop`/`balance`, and boot-time resume from the snapshot.
+  built-in `start`/`stop`/`balance`/`symbols`, and boot-time resume from the
+  snapshot.
+- `agent/symbols.py` — reads and classifies the tradeable universe and publishes
+  it to `agent:symbols` (merged with the marks).
+- `agent/selection.py` — reads, writes, validates and merges the marked working
+  symbols.
+- `agent/models.py` — the agent's own tables (starting with `WorkingSymbol`).
+  Created with `create_all` on boot; the backend never queries them.
+- `agent/core/db.py` — async engines (own settings DB + external read-only DB),
+  plus the idempotent database/schema setup for the agent's own DB.
 - `agent/protocol.py` — builds and publishes the strategy catalog
   (`agent:strategies`), and validates at publish time that every declared
   constraint is evaluable against its own schema.

@@ -30,6 +30,7 @@ positive is visible in the published document with its reason.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ from redis.exceptions import RedisError
 
 from agent.engine import REDIS_SYMBOLS_KEY
 from agent.exchange import ExchangeError, ExchangeRest
+from agent.selection import apply_selection, load_selected
 
 logger = logging.getLogger(__name__)
 
@@ -233,39 +235,58 @@ def build_universe(
     }
 
 
+#: The last universe read from the exchange, kept so a command can validate a
+#: selection without two more HTTP calls. Selection flags are *not* stored here:
+#: they are merged into a copy at publish time.
+_LAST_UNIVERSE: dict[str, Any] | None = None
+
+
+def latest_universe() -> dict[str, Any] | None:
+    """The last universe fetched from the exchange, or ``None`` if never."""
+    return _LAST_UNIVERSE
+
+
 async def fetch_universe(network: str = UNIVERSE_NETWORK) -> dict[str, Any]:
     """Read the universe from the exchange and classify it."""
+    global _LAST_UNIVERSE
     rest = ExchangeRest.connect_public(network)  # type: ignore[arg-type]
     symbols = await rest.symbols()
     tickers = await rest.tickers_24h()
-    return build_universe(symbols, tickers)
+    _LAST_UNIVERSE = build_universe(symbols, tickers)
+    return _LAST_UNIVERSE
 
 
-async def publish_universe(redis: Redis) -> dict[str, Any] | None:
-    """Publish the universe to Redis (best effort).
+async def publish_universe(
+    redis: Redis, *, document: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Publish the universe, merged with the symbols the user marked.
 
-    A failed refresh keeps the previously published document: an exchange hiccup
-    must not empty the working-symbols page, and it must never take the agent
-    down.
+    Pass ``document`` to republish a known universe (a selection change) without
+    asking the exchange again. A failed refresh keeps the previously published
+    document, and never takes the agent down.
     """
-    try:
-        document = await fetch_universe()
-    except ExchangeError as exc:
-        logger.warning("cannot refresh the symbol universe: %s", exc)
-        return None
-    payload = json.dumps(document)
+    if document is None:
+        try:
+            document = await fetch_universe()
+        except ExchangeError as exc:
+            logger.warning("cannot refresh the symbol universe: %s", exc)
+            return None
+    merged = apply_selection(copy.deepcopy(document), await load_selected())
+    payload = json.dumps(merged)
     try:
         await redis.set(REDIS_SYMBOLS_KEY, payload)
     except RedisError:
         logger.warning("cannot publish the symbol universe (Redis unavailable)")
         return None
     logger.info(
-        "published symbol universe: %s usable of %s %s symbols",
-        document["usable"],
-        document["total"],
-        document["quote_asset"],
+        "published symbol universe: %s usable of %s %s symbols, %s marked (%s unusable)",
+        merged["usable"],
+        merged["total"],
+        merged["quote_asset"],
+        merged["selected"],
+        merged["selected_unusable"],
     )
-    return document
+    return merged
 
 
 __all__ = [
@@ -276,5 +297,6 @@ __all__ = [
     "build_universe",
     "classify",
     "fetch_universe",
+    "latest_universe",
     "publish_universe",
 ]

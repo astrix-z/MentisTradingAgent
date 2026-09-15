@@ -36,6 +36,7 @@ from typing import Any
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy.exc import SQLAlchemyError
 
 from agent.core.config import settings
 from agent.engine import (
@@ -48,7 +49,9 @@ from agent.engine import (
     Engine,
 )
 from agent.exchange import ExchangeError
+from agent.selection import save_selected, validate_selection
 from agent.strategies import STRATEGIES
+from agent.symbols import fetch_universe, latest_universe, publish_universe
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +314,59 @@ async def _stop(ctx: CommandContext, _payload: dict[str, Any]) -> None:
     logger.info("command stop")
     await ctx.engine.stop()
     await ctx.report(ok=True, data={"running": False})
+
+
+@command("symbols")
+async def _symbols(ctx: CommandContext, payload: dict[str, Any]) -> None:
+    """Replace the marked working symbols.
+
+    The agent owns this list and is the only service that can check it: a marked
+    symbol has to be listed, spot-tradable, and not a stablecoin, tokenized
+    equity, wrapped token, gold token or a non-Latin name. Rejecting the whole
+    request is deliberate — storing part of a selection would leave the user
+    believing symbols were marked that were not.
+    """
+    requested = payload.get("symbols")
+    if not isinstance(requested, list):
+        await ctx.report(ok=False, message="symbols must be a list")
+        return
+    if any(not isinstance(symbol, str) for symbol in requested):
+        await ctx.report(ok=False, message="symbols must be a list of names")
+        return
+    wanted = sorted({symbol.strip().upper() for symbol in requested if symbol.strip()})
+
+    document = latest_universe()
+    if document is None:
+        try:
+            document = await asyncio.wait_for(
+                fetch_universe(), timeout=settings.COMMAND_IO_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            await ctx.report(ok=False, message="reading the exchange timed out")
+            return
+        except ExchangeError as exc:
+            await ctx.report(ok=False, message=f"cannot read the exchange: {exc}")
+            return
+
+    rejected = validate_selection(wanted, document)
+    if rejected:
+        await ctx.report(
+            ok=False,
+            message="not usable symbols: " + ", ".join(rejected),
+        )
+        return
+
+    try:
+        stored = await save_selected(wanted)
+    except (SQLAlchemyError, RuntimeError) as exc:
+        logger.warning("cannot store the working symbols: %s", exc)
+        await ctx.report(ok=False, message=f"cannot store the selection: {exc}")
+        return
+
+    # Republish from the universe already in hand so the page updates at once.
+    await publish_universe(ctx.redis, document=document)
+    await ctx.report(ok=True, data={"symbols": stored, "count": len(stored)})
+    logger.info("working symbols set: %s", len(stored))
 
 
 @command("balance")

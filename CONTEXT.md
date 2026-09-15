@@ -154,6 +154,46 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-09-15] Рабочие символы: вселенная биржи и отметки принадлежат агенту (агентская часть)
+- Агент читает публичный `exchangeInfo` + 24h tickers, классифицирует и публикует в
+  `agent:symbols` полный список USDT-символов с причиной непригодности. Флаги выбора в
+  кэш не пишутся: они вливаются в копию документа при публикации (`apply_selection`),
+  поэтому валидация и публикация не портят друг другу вход.
+- **Классификация — наша, не биржевая.** В spot-API «особых отметок» биржи нет: `tags`
+  отсутствует, `additional_properties` пуст у всех 3699 символов, новостей о делистинге
+  тоже нет. Причина выводится из `status`/`is_spot_trading_allowed` и базового актива:
+  trading halted or delisted, spot trading not allowed, stablecoin/fiat, gold (`PAXG`/`XAUT`),
+  wrapped or staked, tokenized equity, non-latin name. Токенизированные акции Binance зовёт
+  `<TICKER>B`; правило «заканчивается на B, кроме списка реальных монет» даёт факт для
+  известного тикера и **догадку** для остальных (`suspected_tokenized_equity`) — именно это
+  поймало ложные срабатывания на `CKB`/`DGB`/`TRB`. Memecoins — только метка, из вселенной
+  не исключаются (пользователь снимает руками); иероглифические имена (`币安人生`, `牛来`) — исключаются.
+- **Хранение — в собственной БД агента** (`agent/models.py:WorkingSymbol`, PK `symbol`):
+  строка и есть отметка. `agent/core/db.py` на каждом старте идемпотентно создаёт свою БД
+  (`ensure_settings_database`, имя проверяется регульркой перед `CREATE DATABASE`) и схему
+  (`init_settings_schema`) — в `try/except`, отсутствие БД не должно мешать торговле.
+  `_use_psycopg_driver` в конфиге переписывает `postgresql://` → `postgresql+psycopg://`
+  (иначе `create_async_engine` падает на compose-URL).
+- **Валидирует агент**: команда `symbols` проверяет весь набор против вселенной и
+  отклоняет запрос целиком, если хоть один символ непригоден (частичная запись оставила бы
+  ложное впечатление, что отмечено всё); принятое сохраняется, документ перепубликовывается
+  из уже прочитанной вселенной (`latest_universe`).
+- Файлы: `agent/agent/symbols.py` (коммит 2f2ab41), `agent/agent/{selection.py,models.py}`,
+  `agent/agent/core/{db.py,config.py}`, `agent/agent/common/commands.py`, `agent/agent/main.py`,
+  `agent/tests/{test_symbols.py,test_symbol_selection.py}`, `agent/README.md`.
+- Проверено: agent 162 passed / 6 skipped; `ruff check` и `mypy --strict agent/agent` чисто.
+  Живьём (публичные эндпоинты Binance): 743 USDT-символа, 394 годных (252 halted/delisted,
+  64 tokenized equity, 14 stablecoin/fiat, 12 suspected equity, 3 wrapped/staked, 2 gold,
+  2 non-latin); отметки `[BTCUSDT,SOLUSDT,XRPUSDT]` легли в БД и восстановились после
+  `docker compose restart agent` (`3 marked (0 unusable)`, флаги True в документе);
+  `AAPLBUSDT` и несуществующий символ отклонены, `[]` очищает выбор.
+- **Хвост (не сделано):** backend-эндпоинты чтения/записи рабочих символов (чтение — из
+  опубликованного `agent:symbols`, запись — команда `symbols`) и страница `/working-symbols`
+  (таблица с сортировкой по всем столбцам, чекбоксы, тумблер исключённых), ссылка вместо
+  поля Symbols на `/strategy`. Двенадцать исключённых по шаблону имён стоит просмотреть
+  (`AAOIBUSDT, ALABBUSDT, BNCBUSDT, CBRSBUSDT, DRAMBUSDT, INTWBUSDT, MUUBUSDT, MVLLBUSDT,
+  QNTBUSDT, SNXXBUSDT, USARBUSDT, YBUSDT`) и при необходимости добавить в `CRYPTO_ENDING_IN_B`.
+
 ### [2026-09-15] Каталог стратегий: схема настроек принадлежит только агенту
 - `TripleScreenSettings` больше не импортируется backend'ом (это же чинило падение
   backend-контейнера `ModuleNotFoundError: No module named 'agent'`). Агент публикует

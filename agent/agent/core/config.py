@@ -55,5 +55,23 @@ class Settings(BaseSettings):
     def _empty_is_none(cls, value: str | PostgresDsn | None) -> str | None:
         return _normalize_db_url(value)
 
+    @field_validator("AGENT_DB_URL", "BINANCE_DB_URL", mode="after")
+    @classmethod
+    def _use_psycopg_driver(
+        cls, value: PostgresDsn | None
+    ) -> PostgresDsn | None:
+        """Point Postgres URLs at psycopg's async driver.
+
+        ``create_async_engine`` refuses a plain ``postgresql://`` URL, and the
+        compose file (like the backend's) spells it that way.
+        """
+        if value is None:
+            return None
+        url = str(value)
+        for scheme in ("postgres://", "postgresql://"):
+            if url.startswith(scheme):
+                return PostgresDsn(url.replace(scheme, "postgresql+psycopg://", 1))
+        return value
+
 
 settings = Settings()

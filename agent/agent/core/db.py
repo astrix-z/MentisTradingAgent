@@ -15,8 +15,12 @@ when a database is not yet configured.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from urllib.parse import urlsplit, urlunsplit
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -25,6 +29,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from agent.core.config import settings
+from agent.models import Base
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +39,17 @@ _external_engine: AsyncEngine | None = None
 # Make sure all async SQLAlchemy models are imported before using metadata
 # (mirrors the backend's `app.models` requirement).
 
+#: A database name goes into DDL, so it is checked rather than trusted.
+_SAFE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 
 def _build_engine(url: str) -> AsyncEngine:
     return create_async_engine(url, pool_pre_ping=True)
+
+
+def _with_database(url: str, name: str) -> str:
+    """Return ``url`` pointed at another database on the same server."""
+    return urlunsplit(urlsplit(url)._replace(path=f"/{name}"))
 
 
 def settings_engine() -> AsyncEngine | None:
@@ -59,8 +72,57 @@ def external_engine() -> AsyncEngine | None:
     return _external_engine
 
 
+async def ensure_settings_database() -> bool:
+    """Create the agent's database if it does not exist yet.
+
+    The compose Postgres creates only the backend's database, so the agent's own
+    one has to come from somewhere. It is owned end to end by the agent, and
+    this runs on every boot, so it is idempotent by construction rather than by
+    a setup step somebody has to remember.
+
+    Returns ``True`` when a database is available, ``False`` when the agent is
+    simply not configured for one.
+    """
+    if settings.AGENT_DB_URL is None:
+        logger.info("no AGENT_DB_URL configured; agent settings are not persisted")
+        return False
+    url = str(settings.AGENT_DB_URL)
+    name = urlsplit(url).path.lstrip("/")
+    if not _SAFE_NAME.fullmatch(name):
+        raise RuntimeError(f"unsafe database name in AGENT_DB_URL: {name!r}")
+
+    admin = create_async_engine(
+        _with_database(url, "postgres"), isolation_level="AUTOCOMMIT"
+    )
+    try:
+        async with admin.connect() as connection:
+            existing = await connection.scalar(
+                text("select 1 from pg_database where datname = :name"), {"name": name}
+            )
+            if existing is None:
+                await connection.execute(text(f'create database "{name}"'))
+                logger.info("created the agent settings database %r", name)
+    finally:
+        await admin.dispose()
+    return True
+
+
+async def init_settings_schema() -> None:
+    """Create the agent's tables if they are missing (idempotent)."""
+    engine = settings_engine()
+    if engine is None:
+        return
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+
+@asynccontextmanager
 async def settings_session() -> AsyncIterator[AsyncSession]:
-    """Yield a session bound to the agent's own settings DB."""
+    """A session bound to the agent's own settings DB.
+
+    Callers that need persistence must tolerate this raising: the settings DB is
+    optional at boot so the daemon can still trade when it is missing.
+    """
     engine = settings_engine()
     if engine is None:
         raise RuntimeError("AGENT_DB_URL is not configured for the agent.")
