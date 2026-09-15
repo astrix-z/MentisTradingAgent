@@ -9,6 +9,7 @@ import { DataTable } from "@/components/Common/DataTable"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
+import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import {
@@ -45,6 +46,19 @@ const volumeFormat = new Intl.NumberFormat("en-US", {
 const volumeOf = (entry: SymbolEntry) =>
   Number(entry.quote_volume_24h ?? 0) || 0
 
+/**
+ * The threshold from the input as a number, or ``null`` when it is not one.
+ *
+ * Grouping separators are stripped because the table shows volumes grouped with
+ * commas, so copying a value out of it is a normal thing to do.
+ */
+function parseVolumeThreshold(raw: string): number | null {
+  const text = raw.replace(/[,\s_]/g, "")
+  if (text === "") return null
+  const value = Number(text)
+  return Number.isFinite(value) ? value : null
+}
+
 function Marks({ entry }: { entry: SymbolEntry }) {
   const reason = entry.excluded_reason ?? null
   const label = entry.classification_label ?? null
@@ -73,6 +87,7 @@ function WorkingSymbols() {
   const [showExcluded, setShowExcluded] = useState(false)
   const [dirty, setDirty] = useState(false)
   const [selection, setSelection] = useState<string[]>([])
+  const [thresholdInput, setThresholdInput] = useState("")
 
   // Only the newest save: a repeated save replaces its section rather than
   // stacking another one, and the result is what reports rejected symbols.
@@ -129,6 +144,32 @@ function WorkingSymbols() {
         (entry.excluded_reason ?? null) === null || selected.has(entry.symbol),
     )
   }, [entries, showExcluded, selected])
+
+  // Which symbols may be marked at all. The bulk actions below skip everything
+  // else, so a halted or tokenized-equity symbol is never selected by accident,
+  // however large its volume.
+  const usableEntries = entries.filter(
+    (entry) => (entry.excluded_reason ?? null) === null,
+  )
+  const threshold = parseVolumeThreshold(thresholdInput)
+
+  const markMany = useCallback((symbols: string[]) => {
+    setDirty(true)
+    setSelection((current) => Array.from(new Set([...current, ...symbols])))
+  }, [])
+
+  // Both bulk actions edit the draft once and then forget how it was produced:
+  // the threshold is never stored as a rule, so it cannot be reapplied later —
+  // neither on reload nor when the strategy starts.
+  const selectAll = () => markMany(usableEntries.map((entry) => entry.symbol))
+  const selectAboveThreshold = () => {
+    if (threshold === null) return
+    markMany(
+      usableEntries
+        .filter((entry) => volumeOf(entry) > threshold)
+        .map((entry) => entry.symbol),
+    )
+  }
 
   const columns = useMemo<ColumnDef<SymbolEntry>[]>(
     () => [
@@ -223,6 +264,42 @@ function WorkingSymbols() {
                 them or they will be ignored.
               </p>
             )}
+          </div>
+
+          <div className="flex flex-col gap-3 rounded-md border p-3">
+            <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
+              <Button variant="outline" onClick={selectAll}>
+                Select all
+              </Button>
+              <div className="flex items-end gap-2">
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor="volume-threshold">
+                    Volume above (24h, USDT)
+                  </Label>
+                  <Input
+                    id="volume-threshold"
+                    inputMode="decimal"
+                    placeholder="e.g. 5000000"
+                    className="h-9 w-44"
+                    value={thresholdInput}
+                    onChange={(event) => setThresholdInput(event.target.value)}
+                  />
+                </div>
+                <Button
+                  variant="outline"
+                  disabled={threshold === null}
+                  onClick={selectAboveThreshold}
+                >
+                  Select above
+                </Button>
+              </div>
+            </div>
+            <p className="text-muted-foreground text-sm">
+              Both act on the draft at the moment you press them. The threshold
+              is not saved as a rule, so it is never reapplied — neither on
+              reload nor when the strategy starts. Unusable symbols are never
+              selected.
+            </p>
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-4">

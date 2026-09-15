@@ -84,6 +84,33 @@ function workingSymbols(
   }
 }
 
+//: A universe long enough to need pagination, for the rows-per-page control.
+function manySymbols(count: number): WorkingSymbols {
+  const symbols: SymbolEntry[] = []
+  for (let index = 0; index < count; index += 1) {
+    const name = `SYM${index.toString().padStart(3, "0")}`
+    symbols.push({
+      symbol: `${name}USDT`,
+      base_asset: name,
+      quote_asset: "USDT",
+      status: "TRADING",
+      spot_allowed: true,
+      quote_volume_24h: `${count - index}`,
+      classification: "crypto",
+      classification_label: null,
+      excluded_reason: null,
+      selected: index < 3,
+    })
+  }
+  return {
+    ...workingSymbols(),
+    total: count,
+    usable: count,
+    selected: 3,
+    symbols,
+  }
+}
+
 async function mock(
   page: Page,
   status = snapshot(),
@@ -314,6 +341,91 @@ test("working symbols: filter, sort on every column and save the whole set", asy
   await page.clock.runFor(2000)
   await expect(page.getByText("symbols — succeeded")).toBeVisible()
   await expect(page.getByText("Unsaved changes")).toHaveCount(0)
+})
+
+test("rows per page offers 100 and All, and All keeps the control reachable", async ({
+  page,
+}) => {
+  await mock(page, snapshot(), catalog(), manySymbols(120))
+  await page.goto("/working-symbols")
+
+  // The default page size shows one page of ten.
+  await expect(page.locator("tbody tr")).toHaveCount(10)
+  await expect(page.getByText("Showing 1 to 10 of 120 entries")).toBeVisible()
+
+  const rowsPerPage = page.getByRole("combobox")
+  await rowsPerPage.click()
+  await page.getByRole("option", { name: "100", exact: true }).click()
+  await expect(page.locator("tbody tr")).toHaveCount(100)
+  await expect(page.getByText("Showing 1 to 100 of 120 entries")).toBeVisible()
+
+  // "All" renders every row and still counts one page, so the footer — and so
+  // the control needed to page again — must stay.
+  await rowsPerPage.click()
+  await page.getByRole("option", { name: "All", exact: true }).click()
+  await expect(page.locator("tbody tr")).toHaveCount(120)
+  await expect(page.getByText("Showing 1 to 120 of 120 entries")).toBeVisible()
+  await expect(rowsPerPage).toBeVisible()
+
+  // And a smaller size brings pagination back, starting from the first page.
+  await rowsPerPage.click()
+  await page.getByRole("option", { name: "5", exact: true }).click()
+  await expect(page.locator("tbody tr")).toHaveCount(5)
+  await expect(page.getByText("Showing 1 to 5 of 120 entries")).toBeVisible()
+})
+
+test("bulk selection edits the draft once and never picks unusable symbols", async ({
+  page,
+}) => {
+  const api = await mock(page)
+  await page.goto("/working-symbols")
+
+  const marked = (count: number) =>
+    page.getByText(new RegExp(`Marked: ${count}(?!\\d)`))
+  const checkbox = (symbol: string) =>
+    page.getByRole("checkbox", { name: `Use ${symbol} in the strategy` })
+  const threshold = page.getByLabel("Volume above (24h, USDT)")
+
+  // Start from an empty draft, so what the bulk actions add is unambiguous.
+  await checkbox("ETHUSDT").click()
+  await expect(marked(0)).toBeVisible()
+
+  // 950 selects BTCUSDT (2.5e9) and not ETHUSDT (900). AAPLBUSDT's 1000 clears
+  // the bar too, but it is a tokenized equity, so it must stay out.
+  await page.getByRole("switch", { name: "Show unusable symbols" }).click()
+  await threshold.fill("950")
+  await page.getByRole("button", { name: "Select above" }).click()
+  await expect(marked(1)).toBeVisible()
+  await expect(checkbox("BTCUSDT")).toBeChecked()
+  await expect(checkbox("ETHUSDT")).not.toBeChecked()
+  await expect(checkbox("AAPLBUSDT")).not.toBeChecked()
+
+  // It adds to the draft rather than replacing it, and tolerates a grouped
+  // value copied out of the volume column.
+  await threshold.fill("500")
+  await page.getByRole("button", { name: "Select above" }).click()
+  await expect(marked(2)).toBeVisible()
+  await threshold.fill("1,000")
+  await expect(page.getByRole("button", { name: "Select above" })).toBeEnabled()
+
+  // A threshold that is not a number cannot be applied at all.
+  await threshold.fill("not a number")
+  await expect(
+    page.getByRole("button", { name: "Select above" }),
+  ).toBeDisabled()
+
+  // Select all covers every usable symbol, and still nothing else.
+  await checkbox("ETHUSDT").click()
+  await expect(marked(1)).toBeVisible()
+  await page.getByRole("button", { name: "Select all" }).click()
+  await expect(marked(2)).toBeVisible()
+  await expect(checkbox("BTCUSDT")).toBeChecked()
+  await expect(checkbox("ETHUSDT")).toBeChecked()
+  await expect(checkbox("AAPLBUSDT")).not.toBeChecked()
+
+  // Nothing reached the server: both actions edited the draft only, and no rule
+  // was stored that could be reapplied on reload or when the strategy starts.
+  expect(api.posts).toEqual([])
 })
 
 test("only the latest balance request is shown, and results stay correlated", async ({
