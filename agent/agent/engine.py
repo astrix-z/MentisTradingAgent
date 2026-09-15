@@ -49,6 +49,9 @@ REDIS_EVENTS_CHANNEL = "agent:events"
 # Published strategy catalog (settings schema + cross-field constraints) that
 # the backend validates Start params against; see agent/protocol.py.
 REDIS_STRATEGIES_KEY = "agent:strategies"
+# Published tradeable universe (symbols, 24h volume, our classification of each)
+# the working-symbols page renders; see agent/symbols.py.
+REDIS_SYMBOLS_KEY = "agent:symbols"
 
 # Command state TTLs (keep in sync with backend/app/api/routes/trading.py):
 # short while in flight, long once terminal.

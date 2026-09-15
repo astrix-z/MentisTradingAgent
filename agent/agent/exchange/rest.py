@@ -23,6 +23,7 @@ from binance_sdk_spot import (
 )
 from binance_sdk_spot.rest_api.models import (
     DeleteOrderResponse,
+    ExchangeInfoResponseSymbolsInner,
     GetAccountResponse,
     GetAccountResponseBalancesInner,
     GetOrderResponse,
@@ -31,6 +32,7 @@ from binance_sdk_spot.rest_api.models import (
     NewOrderSideEnum,
     NewOrderTimeInForceEnum,
     NewOrderTypeEnum,
+    Ticker24hrResponse2Inner,
 )
 from binance_sdk_spot.spot import Spot
 
@@ -135,6 +137,19 @@ class ExchangeRest:
         )
         return cls(network, Spot(config_rest_api=config))
 
+    @classmethod
+    def connect_public(cls, network: Network) -> ExchangeRest:
+        """Build a REST client for ``network`` without credentials.
+
+        Exchange metadata and 24h statistics are public endpoints. Requiring
+        keys for them would make the symbol universe unavailable to an agent
+        configured for only one network (or for none yet), and it is the same
+        SDK either way — the rule is that exchange access goes through this
+        adapter, not that every call is authenticated.
+        """
+        config = ConfigurationRestAPI(base_path=_REST_URL[network])
+        return cls(network, Spot(config_rest_api=config))
+
     def _call(self, method: Any, /, **kwargs: Any) -> Any:
         """Run a blocking SDK method in a worker thread, wrapping failures."""
         try:
@@ -191,6 +206,28 @@ class ExchangeRest:
         return await asyncio.to_thread(
             self._call, self._client.rest_api.exchange_info, symbol=symbol
         )
+
+    async def symbols(self) -> list[ExchangeInfoResponseSymbolsInner]:
+        """Every symbol the exchange lists, with its metadata.
+
+        One call, no ``quoteAsset`` parameter exists: filtering by quote asset
+        and status is the caller's job (see :mod:`agent.symbols`).
+        """
+        info = await self.exchange_info()
+        return list(info.symbols or [])
+
+    async def tickers_24h(self) -> dict[str, Ticker24hrResponse2Inner]:
+        """24h statistics per symbol, keyed by symbol.
+
+        The endpoint returns either one object or a list depending on the
+        parameters; asked without any, it returns every symbol.
+        """
+        response = await asyncio.to_thread(self._call, self._client.rest_api.ticker24hr)
+        payload = getattr(response, "actual_instance", None)
+        if payload is None:
+            return {}
+        entries = payload if isinstance(payload, list) else [payload]
+        return {entry.symbol: entry for entry in entries if entry.symbol}
 
     # --- orders ------------------------------------------------------------
 

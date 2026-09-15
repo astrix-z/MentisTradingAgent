@@ -31,6 +31,7 @@ from agent.engine import (
     Engine,
 )
 from agent.protocol import publish_catalog
+from agent.symbols import publish_universe
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,9 @@ _READ_COUNT = 10  # entries per XREADGROUP call
 # a Redis restart (which drops the key, the registry being static in memory)
 # cannot leave the backend without a schema to validate against.
 _CATALOG_REFRESH_SECONDS = 300.0
+# The universe changes as symbols are listed, halted and delisted, and its 24h
+# volumes are always moving, so it is refreshed on the same cadence.
+_SYMBOLS_REFRESH_SECONDS = 300.0
 
 
 async def _ensure_group(redis: Redis) -> None:
@@ -273,6 +277,21 @@ async def _catalog_loop(redis: Redis, stop: asyncio.Event) -> None:
             pass
 
 
+async def _symbols_loop(redis: Redis, stop: asyncio.Event) -> None:
+    """Keep the published tradeable universe present and current.
+
+    Runs in its own task: the two exchange calls it makes are independent of
+    commands and of the heartbeat, and a slow or unreachable exchange must not
+    delay either.
+    """
+    while not stop.is_set():
+        await publish_universe(redis)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=_SYMBOLS_REFRESH_SECONDS)
+        except TimeoutError:
+            pass
+
+
 async def run() -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -299,6 +318,7 @@ async def run() -> None:
             tg.create_task(_listen(redis, engine, stop))
             tg.create_task(_heartbeat_loop(engine, stop))
             tg.create_task(_catalog_loop(redis, stop))
+            tg.create_task(_symbols_loop(redis, stop))
     finally:
         await engine.shutdown()
         await redis.aclose()
