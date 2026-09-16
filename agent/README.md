@@ -32,6 +32,16 @@ backend lifecycle.
   the 24h ticker the universe read already fetches, so it costs no extra call; the
   `prices` command re-reads the tickers on demand and republishes, which is why a
   price is as fresh as the agent's last publish or the last time someone asked.
+- **The exchange's Monitoring tag is read from a page, not an API, and is kept
+  that way on purpose.** Binance tags some listed assets as under review; they
+  trade normally and the tag is only ever a label. No supported endpoint exposes
+  it, and the page that shows it is behind a WAF challenge, so
+  `agent/monitoring.py` reads the JSON that page renders from. That module is the
+  agent's one deliberate exception to "exchange access goes through
+  `binance_sdk_spot`": it is isolated behind a single narrow seam with an
+  injectable transport, and its failure mode is documented there — a failed read
+  never clears a stored tag, because "unknown" is not "not monitored". The list
+  is stored in the agent's own database and refreshed once a day.
 - **All exchange access is built on `binance_sdk_spot`.** Own/duplicate models
   (`Quote`, `MarketData`, `NewOrder`, ...) are forbidden; the SDK already provides
   them. Docs and examples live in `../binance-spot/`.
@@ -90,6 +100,9 @@ protection remain unimplemented.
 - `agent/symbols.py` — reads and classifies the tradeable universe, publishes it
   to `agent:symbols` (merged with the marks), and re-reads prices and volumes on
   demand for the `prices` command.
+- `agent/monitoring.py` — the exchange's Monitoring tag: where it is read from
+  (an unofficial feed, deliberately quarantined), how it is stored, and what
+  happens when the read fails.
 - `agent/selection.py` — reads, writes, validates and merges the marked working
   symbols.
 - `agent/models.py` — the agent's own tables (starting with `WorkingSymbol`).

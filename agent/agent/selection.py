@@ -105,6 +105,7 @@ def apply_selection(
                 "classification": "crypto",
                 "classification_label": None,
                 "excluded_reason": NO_LONGER_LISTED,
+                "monitoring": False,
                 "selected": True,
             }
         )

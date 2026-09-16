@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -23,6 +24,7 @@ from redis.exceptions import RedisError
 
 from agent.engine import REDIS_SYMBOLS_KEY
 from agent.exchange import ExchangeError
+from agent.monitoring import MonitoringMarks
 from agent.symbols import (
     QUOTE_ASSET,
     UNIVERSE_VERSION,
@@ -368,5 +370,43 @@ def test_refresh_reads_the_whole_universe_when_it_has_none_cached(
         assert published is not None
         assert published["symbols"][0]["last_price"] == "100"
         fetch.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+# --- the monitoring tag in the published document ----------------------------
+
+
+def test_publishing_labels_the_monitored_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tag reaches the document from the agent's table, not from a read."""
+
+    async def scenario() -> None:
+        monkeypatch.setattr("agent.symbols.load_selected", AsyncMock(return_value=set()))
+        monkeypatch.setattr(
+            "agent.symbols.load_monitoring",
+            AsyncMock(
+                return_value=MonitoringMarks(
+                    symbols=frozenset({"SYNUSDT"}),
+                    refreshed_at=datetime(2026, 9, 15, 12, 0, tzinfo=UTC),
+                )
+            ),
+        )
+        document = build_universe(
+            [symbol("BTCUSDT"), symbol("SYNUSDT")],
+            {
+                "BTCUSDT": ticker("BTCUSDT", "10", "100"),
+                "SYNUSDT": ticker("SYNUSDT", "5", "1"),
+            },
+        )
+        published = await publish_universe(Mock(set=AsyncMock()), document=document)
+
+        assert published is not None
+        assert {e["symbol"]: e["monitoring"] for e in published["symbols"]} == {
+            "BTCUSDT": False,
+            "SYNUSDT": True,
+        }
+        assert published["monitoring_updated_at"] == "2026-09-15T12:00:00+00:00"
+        # A label, not a verdict: the monitored symbol is still usable.
+        assert published["usable"] == 2
 
     asyncio.run(scenario())

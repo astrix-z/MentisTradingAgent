@@ -42,6 +42,7 @@ from redis.exceptions import RedisError
 
 from agent.engine import REDIS_SYMBOLS_KEY
 from agent.exchange import ExchangeError, ExchangeRest
+from agent.monitoring import apply_monitoring, load_monitoring
 from agent.selection import apply_selection, load_selected
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,9 @@ def build_universe(
                 "classification_label":
                     None if classification == CRYPTO else CLASSIFICATIONS[classification],
                 "excluded_reason": reason,
+                # Filled in from the agent's own table at publish time: the
+                # exchange's tag is not part of a universe read.
+                "monitoring": False,
                 **_ticker_values(ticker),
             }
         )
@@ -302,6 +306,9 @@ async def publish_universe(
             logger.warning("cannot refresh the symbol universe: %s", exc)
             return None
     merged = apply_selection(copy.deepcopy(document), await load_selected())
+    # The exchange's monitoring tag is stored, not scraped per publish: this only
+    # reads the agent's own table.
+    merged = apply_monitoring(merged, await load_monitoring())
     payload = json.dumps(merged)
     try:
         await redis.set(REDIS_SYMBOLS_KEY, payload)
@@ -309,12 +316,14 @@ async def publish_universe(
         logger.warning("cannot publish the symbol universe (Redis unavailable)")
         return None
     logger.info(
-        "published symbol universe: %s usable of %s %s symbols, %s marked (%s unusable)",
+        "published symbol universe: %s usable of %s %s symbols, %s marked (%s unusable), "
+        "%s monitored",
         merged["usable"],
         merged["total"],
         merged["quote_asset"],
         merged["selected"],
         merged["selected_unusable"],
+        sum(1 for entry in merged["symbols"] if entry["monitoring"]),
     )
     return merged
 

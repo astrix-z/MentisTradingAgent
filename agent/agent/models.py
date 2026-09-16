@@ -42,4 +42,22 @@ class WorkingSymbol(Base):
     )
 
 
-__all__ = ["Base", "WorkingSymbol"]
+class MonitoredSymbol(Base):
+    """A symbol the exchange has put under its Monitoring tag.
+
+    Again a row *is* the mark, and the whole set is replaced in one write when
+    the tag list is refreshed. It lives in the agent's own database because it
+    outlives a restart and will sometimes inform a decision, and because the
+    published document is a cache of it rather than the record (see
+    ``agent/monitoring.py`` for where the list comes from and how it fails).
+    """
+
+    __tablename__ = "monitored_symbol"
+
+    symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now
+    )
+
+
+__all__ = ["Base", "MonitoredSymbol", "WorkingSymbol"]

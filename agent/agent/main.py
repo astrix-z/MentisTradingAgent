@@ -30,8 +30,9 @@ from agent.engine import (
     REDIS_COMMAND_STREAM,
     Engine,
 )
+from agent.monitoring import MONITORING_REFRESH_SECONDS, refresh_monitoring
 from agent.protocol import publish_catalog
-from agent.symbols import publish_universe
+from agent.symbols import latest_universe, publish_universe
 
 logger = logging.getLogger(__name__)
 
@@ -300,6 +301,29 @@ async def _symbols_loop(redis: Redis, stop: asyncio.Event) -> None:
             pass
 
 
+async def _monitoring_loop(redis: Redis, stop: asyncio.Event) -> None:
+    """Keep the exchange's Monitoring tag list current, once a day.
+
+    The tag changes when Binance announces a review, not intraday, so a daily
+    read is plenty. On success the universe is republished straight away, so the
+    page shows the new labels without waiting for the next five-minute refresh;
+    on failure the stored marks stand (see ``agent/monitoring.py`` for why that
+    direction matters).
+
+    Its own task, like the universe: the read goes to a website rather than the
+    exchange API, and neither a slow nor a blocked one may delay anything else.
+    """
+    while not stop.is_set():
+        if await refresh_monitoring() is not None:
+            await publish_universe(redis, document=latest_universe())
+        try:
+            await asyncio.wait_for(
+                stop.wait(), timeout=MONITORING_REFRESH_SECONDS
+            )
+        except TimeoutError:
+            pass
+
+
 async def run() -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -336,6 +360,7 @@ async def run() -> None:
             tg.create_task(_heartbeat_loop(engine, stop))
             tg.create_task(_catalog_loop(redis, stop))
             tg.create_task(_symbols_loop(redis, stop))
+            tg.create_task(_monitoring_loop(redis, stop))
     finally:
         await engine.shutdown()
         await redis.aclose()
