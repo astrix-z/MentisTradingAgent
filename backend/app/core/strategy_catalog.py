@@ -135,9 +135,7 @@ def _leaf(schema: dict[str, Any], where: str) -> tuple[Any, dict[str, Any]]:
         if not isinstance(branches, list):
             raise CatalogError(f"{where}: anyOf must be a list")
         kinds = {
-            str(branch.get("type"))
-            for branch in branches
-            if isinstance(branch, dict)
+            str(branch.get("type")) for branch in branches if isinstance(branch, dict)
         }
         numeric = [
             branch
@@ -155,8 +153,7 @@ def _primitive(schema: dict[str, Any], where: str) -> Any:
     kind = schema.get("type")
     if kind not in _PRIMITIVES:
         raise CatalogError(
-            f"{where}: unsupported schema node {sorted(schema)} "
-            f"(no usable 'type')"
+            f"{where}: unsupported schema node {sorted(schema)} (no usable 'type')"
         )
     return _PRIMITIVES[kind]
 
@@ -368,9 +365,7 @@ def _format_message(message: str, lhs: Decimal, rhs: Decimal) -> str:
     """Substitute ``{lhs}``/``{rhs}``, leaving any other braces untouched."""
     if "{" not in message:
         return message
-    return message.format_map(  # type: ignore[arg-type]
-        _Placeholders(lhs=_render(lhs), rhs=_render(rhs))
-    )
+    return message.format_map(_Placeholders(lhs=_render(lhs), rhs=_render(rhs)))
 
 
 class _Placeholders(dict[str, str]):

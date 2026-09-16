@@ -25,6 +25,12 @@ jobs:
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: "latest-known"
+      # Kept in CI, not only in the pre-commit hook: the hook is easy to skip
+      # locally, and this is the only place that runs on every push to master.
+      # `--directory` matters — from the repository root mypy finds no
+      # [tool.mypy] and silently drops strict mode (TASKS.md T01).
+      - name: Check types
+        run: uv run --directory backend mypy app
       - run: docker compose down -v --remove-orphans
       - run: docker compose up -d --wait db mailpit
       - name: Migrate DB

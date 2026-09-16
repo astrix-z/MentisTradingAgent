@@ -45,17 +45,18 @@ repos:
         language: unsupported
         types: [python]
 
+      # Run from inside backend/ on purpose: mypy reads its configuration from the
+      # working directory, so `uv run mypy backend/app` started at the repository
+      # root finds no [tool.mypy] and silently drops both strict mode and the
+      # alembic exclude (see TASKS.md T01).
       - id: local-mypy
-        name: mypy check
-        entry: uv run mypy backend/app
+        name: mypy check (backend)
+        entry: uv run --directory backend mypy app
         require_serial: true
         language: unsupported
         pass_filenames: false
 
-      # Run from inside agent/ on purpose: mypy reads its configuration from the
-      # working directory, so from the repository root it finds no [tool.mypy] and
-      # silently drops strict mode (that is what local-mypy above runs into with
-      # the backend — see TASKS.md T01).
+      # Runs from inside agent/ for the same reason as local-mypy above.
       - id: local-mypy-agent
         name: mypy check (agent)
         entry: uv run --directory agent mypy agent tests
