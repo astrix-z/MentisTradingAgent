@@ -31,6 +31,16 @@ repos:
         types: [text]
         files: ^frontend/
 
+      # `tsc -p tsconfig.json`, not the build config: tsconfig.build.json excludes
+      # frontend/tests, so the build alone never type-checks them (TASKS.md T02).
+      - id: local-tsc-check
+        name: tsc check (frontend)
+        entry: npm run typecheck
+        language: system
+        files: ^frontend/.*\.(ts|tsx)$|^frontend/tsconfig.*\.json$|^frontend/package\.json$|^package\.json$
+        require_serial: true
+        pass_filenames: false
+
       - id: local-ruff-check
         name: ruff check
         entry: uv run ruff check --force-exclude --fix --exit-non-zero-on-fix

@@ -73,6 +73,12 @@ jobs:
       working-directory: backend
     - run: bun ci
       working-directory: frontend
+    # Deliberately not the build's tsc step: tsconfig.build.json excludes
+    # frontend/tests, so this is the only place the test code is type-checked
+    # (TASKS.md T02).
+    - name: Check frontend types
+      run: bun run typecheck
+      working-directory: frontend
     - run: bash scripts/generate-client.sh
     - run: docker compose build
     - run: docker compose down -v --remove-orphans
