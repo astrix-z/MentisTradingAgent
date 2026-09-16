@@ -105,6 +105,13 @@ SMTP_HOST=localhost SMTP_PORT=1025 EMAILS_FROM_EMAIL=noreply@example.com \
 Start mailpit first with `docker compose up -d --wait db mailpit`, which is what
 CI does.
 
+**That suite deletes data.** The session fixture in `backend/tests/conftest.py`
+deletes every `User` and `Item` row when it finishes, so pointing it at a database
+you care about — including the one a running stack uses — leaves that stack with no
+users and no way to log in. CI avoids this by starting from `docker compose down -v`.
+Locally, use `scripts/test.sh`, which does that teardown before and after, or point
+the suite at a database you are willing to lose.
+
 ### End-to-end Tests (Playwright)
 
 The suite drives the real stack, so it needs services a plain `docker compose up
