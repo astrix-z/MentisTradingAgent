@@ -66,6 +66,11 @@ services:
       - ./backend/htmlcov:/app/backend/htmlcov
     environment:
       FASTAPI_ENV: "development"
+      # The backend only sends mail when SMTP_HOST *and* EMAILS_FROM_EMAIL are
+      # set (app/core/config.py, emails_enabled). SMTP_HOST is pinned to mailpit
+      # just below, so without a from-address the reset-password flow fails
+      # before it ever reaches mailpit. A real .env value still wins.
+      EMAILS_FROM_EMAIL: "${EMAILS_FROM_EMAIL:-noreply@example.com}"
       SMTP_HOST: "mailpit"
       SMTP_PORT: "1025"
       SMTP_TLS: "false"

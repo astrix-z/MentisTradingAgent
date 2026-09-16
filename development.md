@@ -77,6 +77,65 @@ Stop a locally running FastAPI server before starting the Compose backend becaus
 
 **Note**: The first time you start the stack, it might take a minute for all the services to be ready. To monitor it, use `docker compose logs`, or `docker compose logs backend` for the backend service.
 
+## Running the Tests
+
+Unit tests run from each package directory:
+
+```bash
+cd backend && uv run pytest    # API, domain rules and the strategy catalog
+cd agent && uv run pytest      # agent logic
+```
+
+Both suites need more than the database: the reset-password tests send an email.
+The backend only sends when `SMTP_HOST` **and** `EMAILS_FROM_EMAIL` are set
+(`app/core/config.py`, `emails_enabled`), and it asserts on a missing
+from-address instead of logging one, so an empty `EMAILS_FROM_EMAIL` looks like a
+broken product. With mailpit up and both variables set, the backend suite is
+green — 201 passed:
+
+```bash
+cd backend
+# DATABASE_URL must use host port 5433, not the 5432 in .env: compose.override.yml
+# publishes the database on 5433 so it cannot clash with a local PostgreSQL.
+DATABASE_URL=postgresql://postgres:<password>@localhost:5433/app \
+SMTP_HOST=localhost SMTP_PORT=1025 EMAILS_FROM_EMAIL=noreply@example.com \
+  uv run pytest
+```
+
+Start mailpit first with `docker compose up -d --wait db mailpit`, which is what
+CI does.
+
+### End-to-end Tests (Playwright)
+
+The suite drives the real stack, so it needs services a plain `docker compose up
+-d` does not start. Mailpit lives in the optional `extras` profile, and two of
+the reset-password tests read the reset link out of an email. `compose.override.yml`
+already points the backend at mailpit and defaults `EMAILS_FROM_EMAIL`, so a
+Compose stack needs no further configuration.
+
+CI runs the suite inside the Compose image:
+
+```bash
+docker compose --profile extras up -d --wait db redis mailpit
+docker compose up -d --wait backend
+docker compose run --rm backend bash scripts/prestart.sh
+docker compose run --rm playwright bunx playwright test
+```
+
+With the stack already up, the backend serves the built frontend on port 8000,
+and you can drive it from the host with an installed browser:
+
+```bash
+cd frontend
+PLAYWRIGHT_BASE_URL=http://localhost:8000 bunx playwright test
+```
+
+**When mailpit is not running**, the two email-dependent tests skip with a message
+naming the missing prerequisite and the rest of the suite still passes: a bare
+`ECONNREFUSED` in the report reads like a product regression. A skip is still not
+a pass — start mailpit before trusting a green run. The same applies to the
+backend suite above.
+
 ## Mailpit
 
 [Mailpit](https://mailpit.axllent.org) captures emails sent during local development instead of delivering them. The local backend connects to it at `localhost:1025`, and the Compose backend connects to the `mailpit` service. Captured emails are available at <http://localhost:8025>.

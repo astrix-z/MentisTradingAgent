@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test"
-import { waitForEmailHtml } from "./utils/mailpit"
+import { mailpitUnavailableReason, waitForEmailHtml } from "./utils/mailpit"
 import { randomEmail, randomPassword } from "./utils/random"
 import { logInUser, signUpNewUser } from "./utils/user"
 
@@ -33,6 +33,9 @@ test("User can reset password successfully using the link", async ({
   page,
   request,
 }) => {
+  const mailpit = await mailpitUnavailableReason(request)
+  test.skip(mailpit !== null, mailpit ?? "")
+
   const fullName = "Test User"
   const email = randomEmail()
   const password = randomPassword()
@@ -81,6 +84,9 @@ test("Expired or invalid reset link", async ({ page }) => {
 })
 
 test("Weak new password validation", async ({ page, request }) => {
+  const mailpit = await mailpitUnavailableReason(request)
+  test.skip(mailpit !== null, mailpit ?? "")
+
   const fullName = "Test User"
   const email = randomEmail()
   const password = randomPassword()
