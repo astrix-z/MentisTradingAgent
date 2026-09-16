@@ -28,10 +28,12 @@
 | Backend API | `backend/app/api/routes/trading.py` (командный контур), `backend/app/api/main.py`, `backend/app/core/redis_client.py`, `backend/app/main.py`, `backend/app/core/config.py` |
 | Agent — ядро | `agent/agent/strategies/` (главное: `base.py`, `registry.py`, `tripple_screen/`) |
 | Agent — обвязка | `agent/agent/engine.py` (жизненный цикл, heartbeat, run), `agent/agent/common/commands.py` (реестр `@command`), `agent/agent/main.py` (подписка/диспетчер) |
+| Agent — вселенная | `agent/agent/symbols.py` (вселенная, классификация, цены), `agent/agent/selection.py` (отметки), `agent/agent/models.py` (таблицы агента) |
 | Agent — биржа | `agent/agent/exchange/rest.py`, `agent/agent/exchange/streams.py` (тонкие адаптеры над `binance_sdk_spot`) |
-| Frontend | `frontend/src/routes/_layout/strategy.tsx` (настройки+старт Стратегии), `trading.tsx` (общий контроль), `frontend/src/client/*` (сгенерировано, НЕ править руками) |
+| Frontend | `frontend/src/routes/_layout/strategy.tsx` (настройки+старт Стратегии), `working-symbols.tsx` (рабочие символы), `trading.tsx` (общий контроль), `frontend/src/client/*` (сгенерировано, НЕ править руками) |
 | Док SDK | `binance-spot/docs/`, `binance-spot/examples/` (документация и примеры `binance_sdk_spot`) |
 | Deploy | `compose.yml` + `compose.override.yml` (проект `mentis`), `.env` |
+| Задания / долги | `TASKS.md` (известные недоработки, оформлены как задания), `REVIEW.md` (история ревью) |
 
 ## 3. Ключевая архитектура: Стратегия — это ядро Агента
 
@@ -153,6 +155,52 @@
 ---
 
 ## ЖУРНАЛ (последняя задача сверху)
+
+### [2026-09-15] Цена в таблице рабочих символов: колонка и запрос кнопкой
+- **`TASKS.md` привязан к навигатору** — добавлен в `CONTEXT.md` §2, рядом с `REVIEW.md`.
+- Во вселенной появились `last_price` (Decimal-строка; `None`, если биржа цены не дала —
+  это не то же самое, что цена 0) и `prices_updated_at`. Цена берётся из того же
+  24h-тикера, который уже читается для объёма, — периодическая публикация не делает
+  ни одного лишнего вызова.
+- Новая команда `prices`: агент перечитывает тикеры, обновляет `last_price` **и**
+  `quote_volume_24h` (их отдаёт один и тот же эндпоинт — просить только цену значило
+  бы спрашивать дважды), обновляет `prices_updated_at` и перепубликовывает документ.
+  Кэш `_LAST_UNIVERSE` обновляется на месте; символ, которого в тикерах больше нет,
+  сохраняет прежние значения, а не обнуляется. Недоступная биржа/Redis → `None`,
+  прежний документ остаётся, команда сообщает об ошибке.
+- Команда — observation-only: в `_SNAPSHOT_COMMANDS` не входит, а агент выполняет её
+  вне очереди start/stop (`_INDEPENDENT_COMMANDS = ("balance", "prices")`,
+  `_handle_independent`), чтобы медленное чтение биржи не задерживало Stop.
+- Backend: `POST /trading/prices/` (superuser, 202 + конверт), `SymbolEntry.last_price`,
+  `WorkingSymbols.prices_updated_at`. Диспетчер `/commands/` сделан **исчерпывающим**:
+  последняя ветка — `if type == "stop"` плюс недостижимый `raise`, чтобы новый тип
+  команды не мог молча превратиться в `stop` (та же ловушка, что была с `symbols`).
+- UI: колонка `Price` (сортируется численно, `—` если цены нет, точное значение в
+  `title`) и кнопка `Request prices` с отметкой «когда прочитано». Обе команды
+  (`symbols`, `prices`) показываются в `CommandTrackingView`. Подтверждённый refresh
+  перечитывает документ, но **не** сбрасывает черновик отметок.
+- По ходу починен латентный баг `DataTable`: TanStack по умолчанию
+  (`autoResetPageIndex`) возвращал на первую страницу при **любом** изменении данных —
+  то есть на каждом refetch (раз в минуту) и на самом запросе цен. Теперь страница
+  сохраняется, индекс при необходимости ограничивается (клэмп по числу страниц), а
+  смена «Rows per page» явно возвращает на первую.
+- Файлы: `agent/agent/{symbols.py,selection.py,common/commands.py,main.py}`,
+  `agent/tests/{test_symbols.py,test_symbol_selection.py,test_commands_lifecycle.py,test_command_delivery_integration.py}`,
+  `backend/app/api/routes/trading.py`, `backend/tests/test_trading_contract.py`,
+  `frontend/src/{routes/_layout/working-symbols.tsx,components/Common/DataTable.tsx,client/*}`,
+  `frontend/tests/trading-contract.spec.ts`, `CONTEXT.md`, `DESIGN.md`, `agent/README.md`.
+- Проверено: agent **170 passed / 6 skipped**, `ruff check` и `mypy --strict agent` чисто;
+  backend полный сьют **172 passed / 1 skipped**, coverage **93%** (гейт 90%);
+  frontend `tsc -p tsconfig.build.json` и biome чисто, `vite build` ок;
+  Playwright mock **22 passed** (2 новых); живой e2e **82 passed**, те же 2 падения
+  `reset-password` (mailpit не запущен). Живьём в стеке: `POST /trading/prices/` →
+  `{'prices': 743, 'total': 743}`, во всех 743 записях появилась цена
+  (BTC 75953.60, ETH 2404.13), отметки `BTCUSDT/SOLUSDT/XRPUSDT` сохранились.
+- **Требовало пересборки обоих образов:** команда `prices` и `last_price` живут в
+  агенте, поэтому одного `--build backend` для проверки было мало (первый прогон
+  вернул пустой результат — старый агент просто не знал такой команды).
+- **Хвост:** цена — последняя сделка с 24h-тикера, не order book; обновляется только
+  по публикации агента (раз в 5 минут) или по кнопке.
 
 ### [2026-09-15] Working Symbols: страница и API (закрывает хвост предыдущего пункта)
 - **Backend — только API**: `GET /trading/symbols/` отдаёт опубликованный `agent:symbols`

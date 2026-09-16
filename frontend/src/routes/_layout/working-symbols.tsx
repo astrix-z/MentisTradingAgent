@@ -14,6 +14,7 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import {
   latestTrackedCommand,
+  type TrackedCommand,
   useCommandTracking,
 } from "@/hooks/useCommandTracking"
 import useCustomToast from "@/hooks/useCustomToast"
@@ -43,8 +44,18 @@ const volumeFormat = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
 })
 
+// Prices arrive as Decimal strings too, but span nine orders of magnitude: a
+// satoshi-priced memecoin and BTC both have to be legible, so the number of
+// fraction digits is left to the value instead of being fixed.
+const priceFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 })
+
 const volumeOf = (entry: SymbolEntry) =>
   Number(entry.quote_volume_24h ?? 0) || 0
+
+const priceOf = (entry: SymbolEntry): number | null => {
+  const price = entry.last_price ?? ""
+  return price === "" ? null : Number(price)
+}
 
 /**
  * The threshold from the input as a number, or ``null`` when it is not one.
@@ -89,11 +100,15 @@ function WorkingSymbols() {
   const [selection, setSelection] = useState<string[]>([])
   const [thresholdInput, setThresholdInput] = useState("")
 
-  // Only the newest save: a repeated save replaces its section rather than
-  // stacking another one, and the result is what reports rejected symbols.
+  // Only the newest of each: a repeated request replaces its section rather than
+  // stacking another one, and its result is what reports what happened.
   const latestSymbolsCommand = latestTrackedCommand(
     commands,
     (command) => command.envelope.type === "symbols",
+  )
+  const latestPricesCommand = latestTrackedCommand(
+    commands,
+    (command) => command.envelope.type === "prices",
   )
 
   // The agent is the source of truth for what is marked. Seed the draft from
@@ -116,11 +131,24 @@ function WorkingSymbols() {
     }
   }, [latestSymbolsCommand?.phase, queryClient])
 
+  // A confirmed price refresh only re-reads the document, so it must not touch
+  // the draft: marks the user has not saved yet stay theirs.
+  useEffect(() => {
+    if (latestPricesCommand?.phase === "succeeded") {
+      void queryClient.invalidateQueries({ queryKey: ["working-symbols"] })
+    }
+  }, [latestPricesCommand?.phase, queryClient])
+
   const selected = useMemo(() => new Set(selection), [selection])
 
   const saveMutation = useMutation({
     mutationFn: (symbols: string[]) =>
       TradingService.setWorkingSymbols({ body: { symbols } }),
+    onSuccess: ({ data }) => track(data),
+    onError: handleError.bind(showErrorToast),
+  })
+  const pricesMutation = useMutation({
+    mutationFn: () => TradingService.refreshPrices(),
     onSuccess: ({ data }) => track(data),
     onError: handleError.bind(showErrorToast),
   })
@@ -200,6 +228,28 @@ function WorkingSymbols() {
         ),
       },
       {
+        accessorKey: "last_price",
+        header: "Price",
+        // Decimal strings again: "9" must not beat "10". A symbol the exchange
+        // priced nothing for sorts lowest rather than poisoning the comparison
+        // with a NaN.
+        sortingFn: (left, right) =>
+          (priceOf(left.original) ?? -1) - (priceOf(right.original) ?? -1),
+        cell: ({ row }) => {
+          const price = priceOf(row.original)
+          return price === null ? (
+            <span className="text-muted-foreground">—</span>
+          ) : (
+            <span
+              className="font-mono"
+              title={row.original.last_price ?? undefined}
+            >
+              {priceFormat.format(price)}
+            </span>
+          )
+        },
+      },
+      {
         accessorKey: "quote_volume_24h",
         header: "24h volume (USDT)",
         // Decimal strings must not be compared as text, or "9" would beat "10".
@@ -226,6 +276,12 @@ function WorkingSymbols() {
   const usable = document?.usable ?? 0
   const total = document?.total ?? 0
   const unusableMarked = document?.selected_unusable ?? 0
+  // Say how old the prices are instead of letting them look live: they are read
+  // when the agent publishes or when someone asks, not continuously.
+  const pricesReadAt = document?.prices_updated_at
+  const pricesFreshness = pricesReadAt
+    ? `Prices read at ${new Date(pricesReadAt).toLocaleTimeString()}`
+    : "No prices read yet"
 
   return (
     <div className="flex flex-col gap-6">
@@ -264,6 +320,21 @@ function WorkingSymbols() {
                 them or they will be ignored.
               </p>
             )}
+            <div className="ml-auto flex flex-wrap items-center gap-3">
+              <span className="text-muted-foreground text-sm">
+                {pricesFreshness}
+              </span>
+              {/* Prices are read on demand rather than polled: the agent has to
+                  ask the exchange, and the user is the one who knows when a
+                  fresh number matters. */}
+              <Button
+                variant="outline"
+                disabled={pricesMutation.isPending}
+                onClick={() => pricesMutation.mutate()}
+              >
+                {pricesMutation.isPending ? "Requesting…" : "Request prices"}
+              </Button>
+            </div>
           </div>
 
           <div className="flex flex-col gap-3 rounded-md border p-3">
@@ -336,13 +407,16 @@ function WorkingSymbols() {
           <DataTable columns={columns} data={visible} sorting />
 
           <CommandTrackingView
-            commands={latestSymbolsCommand ? [latestSymbolsCommand] : []}
+            commands={[latestSymbolsCommand, latestPricesCommand].filter(
+              (command): command is TrackedCommand => command !== undefined,
+            )}
           />
 
           <p className="text-muted-foreground text-sm">
             Symbols the exchange does not allow (tokenized equities,
             stablecoins, wrapped or staked tokens, gold, halted markets) cannot
-            be marked.{" "}
+            be marked. Prices are read when the agent publishes and whenever you
+            ask for them, so they are as old as the time above says.{" "}
             <Link to="/strategy" className="underline">
               Back to Strategy
             </Link>

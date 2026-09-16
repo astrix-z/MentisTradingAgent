@@ -16,7 +16,7 @@ import {
   ChevronsLeft,
   ChevronsRight,
 } from "lucide-react"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -68,12 +68,24 @@ export function DataTable<TData, TValue>({
     state: { sorting: sortingState },
     onSortingChange: setSortingState,
     enableSorting: sorting,
+    // A refresh replaces the data array even when nothing changed, and the
+    // default would then throw the reader back to page 1 — including on the
+    // very refresh they asked for. The page is kept instead, and clamped below.
+    autoResetPageIndex: false,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
   })
   const { pageIndex, pageSize } = table.getState().pagination
   const firstRow = pageIndex * pageSize + 1
+  const pageCount = Math.max(1, Math.ceil(data.length / Math.max(1, pageSize)))
+
+  // Keeping the page across refreshes means nothing resets it for us any more,
+  // so a list that shrank (a shorter universe, a filter) could leave the index
+  // past the end and the table empty.
+  useEffect(() => {
+    if (pageIndex > pageCount - 1) table.setPageIndex(pageCount - 1)
+  }, [pageIndex, pageCount, table])
 
   return (
     <div className="flex flex-col gap-4">
@@ -162,6 +174,9 @@ export function DataTable<TData, TValue>({
                   table.setPageSize(
                     value === ALL_ROWS_VALUE ? ALL_ROWS : Number(value),
                   )
+                  // A different page size means a different page 1; without this
+                  // the old index could point past the end of the new set.
+                  table.setPageIndex(0)
                 }}
               >
                 <SelectTrigger className="h-9 w-[84px]">

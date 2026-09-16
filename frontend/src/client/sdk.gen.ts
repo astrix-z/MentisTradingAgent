@@ -2,7 +2,7 @@
 
 import { type Client, type Options as Options2, type TDataShape, urlSearchParamsBodySerializer } from './client';
 import { client } from './client.gen';
-import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetCommandStateData, tradingGetCommandStateErrors, tradingGetCommandStateResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingListWorkingSymbolsData, tradingListWorkingSymbolsResponses, tradingSetWorkingSymbolsData, tradingSetWorkingSymbolsErrors, tradingSetWorkingSymbolsResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
+import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetCommandStateData, tradingGetCommandStateErrors, tradingGetCommandStateResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingListWorkingSymbolsData, tradingListWorkingSymbolsResponses, tradingRefreshPricesData, tradingRefreshPricesResponses, tradingSetWorkingSymbolsData, tradingSetWorkingSymbolsErrors, tradingSetWorkingSymbolsResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -489,6 +489,25 @@ export class TradingService {
                 'Content-Type': 'application/json',
                 ...options.headers
             }
+        });
+    }
+    
+    /**
+     * Refresh Prices
+     *
+     * Ask the agent to re-read prices and republish the universe.
+     *
+     * Nothing is returned but the command envelope: the fresh values arrive in the
+     * symbol document the agent republishes immediately afterwards, so the page has
+     * one shape of the data to read rather than two. 202 only acknowledges the
+     * command.
+     */
+    public static refreshPrices<ThrowOnError extends boolean = true>(options?: Options<tradingRefreshPricesData, ThrowOnError>) {
+        return (options?.client ?? client).post<tradingRefreshPricesResponses, unknown, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/prices/',
+            ...options
         });
     }
     

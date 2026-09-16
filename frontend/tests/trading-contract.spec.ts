@@ -65,6 +65,7 @@ function workingSymbols(
     available: true,
     quote_asset: "USDT",
     generated_at: at,
+    prices_updated_at: "2026-09-15T11:30:00Z",
     total: 3,
     usable: 2,
     selected: 1,
@@ -74,10 +75,16 @@ function workingSymbols(
         classification: "tokenized_equity",
         classification_label: "tokenized equity",
         excluded_reason: "tokenized equity",
+        last_price: "180.25",
       }),
       // Deliberately huge: 2500000000 must sort after 900, which only happens
       // if the Decimal strings are compared as numbers.
-      entry("BTCUSDT", "BTC", { quote_volume_24h: "2500000000" }),
+      entry("BTCUSDT", "BTC", {
+        quote_volume_24h: "2500000000",
+        last_price: "64000.10",
+      }),
+      // No price: the exchange priced nothing for it, which the column has to
+      // show as "no reading" rather than as zero.
       entry("ETHUSDT", "ETH", { quote_volume_24h: "900", selected: true }),
     ],
     ...overrides,
@@ -426,6 +433,78 @@ test("bulk selection edits the draft once and never picks unusable symbols", asy
   // Nothing reached the server: both actions edited the draft only, and no rule
   // was stored that could be reapplied on reload or when the strategy starts.
   expect(api.posts).toEqual([])
+})
+
+test("prices are read on request and land in the price column", async ({
+  page,
+}) => {
+  const api = await mock(page)
+  await page.goto("/working-symbols")
+
+  const priceCell = (symbol: string) =>
+    page.locator("tbody tr", { hasText: symbol }).locator("td").nth(2)
+
+  // What the agent last published is shown as it stands, and a symbol it priced
+  // nothing for says so instead of showing zero.
+  await expect(priceCell("BTCUSDT")).toHaveText("64,000.1")
+  await expect(priceCell("ETHUSDT")).toHaveText("—")
+  await expect(page.getByText(/Prices read at/)).toBeVisible()
+
+  await page.clock.install()
+  await page.getByRole("button", { name: "Request prices" }).click()
+  await expect(page.getByText("prices — accepted")).toBeVisible()
+  expect(api.posts[0].path).toContain("/trading/prices/")
+  expect(api.posts[0].body).toBeFalsy()
+
+  // The agent republishes the document, so the fresh numbers arrive through the
+  // read the table already does rather than a second shape of the data.
+  for (const entry of api.universe.symbols ?? []) {
+    if (entry.symbol === "BTCUSDT") entry.last_price = "70000"
+    if (entry.symbol === "ETHUSDT") entry.last_price = "3500.25"
+  }
+  api.universe.prices_updated_at = "2026-09-15T12:34:56Z"
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "prices",
+    ok: true,
+    data: { prices: 3, total: 3, at: "2026-09-15T12:34:56Z" },
+    at,
+  })
+  await page.clock.runFor(2000)
+  await expect(page.getByText("prices — succeeded")).toBeVisible()
+  await expect(priceCell("BTCUSDT")).toHaveText("70,000")
+  await expect(priceCell("ETHUSDT")).toHaveText("3,500.25")
+  // Reading prices is not an edit: an unsaved draft stays the user's.
+  await expect(page.getByText("Unsaved changes")).toHaveCount(0)
+})
+
+test("a price refresh keeps the reader on the same page", async ({ page }) => {
+  const api = await mock(page, snapshot(), catalog(), manySymbols(120))
+  await page.goto("/working-symbols")
+  await expect(page.getByText("Showing 1 to 10 of 120 entries")).toBeVisible()
+  await page.getByRole("button", { name: "Go to next page" }).click()
+  await expect(page.getByText("Showing 11 to 20 of 120 entries")).toBeVisible()
+
+  await page.clock.install()
+  await page.getByRole("button", { name: "Request prices" }).click()
+  await expect(page.getByText("prices — accepted")).toBeVisible()
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "prices",
+    ok: true,
+    at,
+  })
+  await page.clock.runFor(2000)
+  await expect(page.getByText("prices — succeeded")).toBeVisible()
+
+  // The refresh replaces the data, and the default would send the reader back to
+  // page 1 at exactly the moment they asked for a fresher number.
+  await expect(page.getByText("Showing 11 to 20 of 120 entries")).toBeVisible()
+
+  // Choosing a different page size, on the other hand, does start from the top.
+  await page.getByRole("combobox").click()
+  await page.getByRole("option", { name: "25", exact: true }).click()
+  await expect(page.getByText("Showing 1 to 25 of 120 entries")).toBeVisible()
 })
 
 test("only the latest balance request is shown, and results stay correlated", async ({

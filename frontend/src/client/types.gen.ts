@@ -103,7 +103,7 @@ export type CommandRequest = {
     /**
      * Type
      */
-    type: 'start' | 'stop' | 'balance' | 'symbols';
+    type: 'start' | 'stop' | 'balance' | 'symbols' | 'prices';
     /**
      * Payload
      */
@@ -503,6 +503,10 @@ export type SymbolEntry = {
      */
     quote_volume_24h?: string;
     /**
+     * Last Price
+     */
+    last_price?: string | null;
+    /**
      * Classification
      */
     classification: string;
@@ -756,6 +760,10 @@ export type WorkingSymbols = {
      * Generated At
      */
     generated_at?: string | null;
+    /**
+     * Prices Updated At
+     */
+    prices_updated_at?: string | null;
     /**
      * Total
      */
@@ -1504,6 +1512,22 @@ export type tradingFetchBalanceResponses = {
 };
 
 export type tradingFetchBalanceResponse = tradingFetchBalanceResponses[keyof tradingFetchBalanceResponses];
+
+export type tradingRefreshPricesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/prices/';
+};
+
+export type tradingRefreshPricesResponses = {
+    /**
+     * Successful Response
+     */
+    202: CommandEnvelope;
+};
+
+export type tradingRefreshPricesResponse = tradingRefreshPricesResponses[keyof tradingRefreshPricesResponses];
 
 export type tradingGetCommandResultData = {
     body?: never;
