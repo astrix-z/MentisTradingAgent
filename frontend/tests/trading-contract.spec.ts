@@ -58,6 +58,7 @@ function workingSymbols(
     classification: "crypto",
     classification_label: null,
     excluded_reason: null,
+    monitoring: false,
     selected: false,
     ...extra,
   })
@@ -66,6 +67,7 @@ function workingSymbols(
     quote_asset: "USDT",
     generated_at: at,
     prices_updated_at: "2026-09-15T11:30:00Z",
+    monitoring_updated_at: "2026-09-15T09:05:00Z",
     total: 3,
     usable: 2,
     selected: 1,
@@ -83,9 +85,13 @@ function workingSymbols(
         quote_volume_24h: "2500000000",
         last_price: "64000.10",
       }),
-      // No price: the exchange priced nothing for it, which the column has to
-      // show as "no reading" rather than as zero.
-      entry("ETHUSDT", "ETH", { quote_volume_24h: "900", selected: true }),
+      // No price, and under Binance's Monitoring tag: the column has to show "no
+      // reading" rather than zero, and the tag is a label rather than a verdict.
+      entry("ETHUSDT", "ETH", {
+        quote_volume_24h: "900",
+        selected: true,
+        monitoring: true,
+      }),
     ],
     ...overrides,
   }
@@ -283,6 +289,40 @@ test("strategy seeds desired config, preserves dirty draft and reports rejected 
   await expect(page.getByText("Invalid start settings")).toBeVisible()
   await page.reload()
   await expect(page.getByLabel("Take profit %")).toHaveValue("25")
+})
+
+test("a monitored symbol is labelled, never filtered", async ({ page }) => {
+  const api = await mock(page)
+  await page.goto("/working-symbols")
+
+  const rowOf = (symbol: string) =>
+    page.locator("tbody tr", { hasText: symbol })
+
+  // The badge lives in the Marks column, and says what it means.
+  await expect(
+    rowOf("ETHUSDT").getByText("Monitoring", { exact: true }),
+  ).toBeVisible()
+  await expect(rowOf("BTCUSDT").getByText("Monitoring")).toHaveCount(0)
+  await expect(page.getByText(/Monitoring list read/)).toBeVisible()
+
+  // A label, not a verdict: the monitored symbol is still usable, still
+  // markable, and still counted among the usable ones.
+  await expect(
+    page.getByText("Marked: 1 · Usable: 2 · Listed: 3 · Monitoring: 1"),
+  ).toBeVisible()
+  const monitored = page.getByRole("checkbox", {
+    name: "Use ETHUSDT in the strategy",
+  })
+  await expect(monitored).toBeEnabled()
+  await expect(monitored).toBeChecked()
+
+  // And marking it still saves like any other symbol.
+  await page.clock.install()
+  await monitored.click()
+  await page.getByRole("button", { name: "Save", exact: true }).click()
+  await expect(page.getByText("symbols — accepted")).toBeVisible()
+  expect(api.posts[0].path).toContain("/trading/symbols/")
+  expect(api.posts[0].body).toEqual({ symbols: [] })
 })
 
 test("working symbols: filter, sort on every column and save the whole set", async ({

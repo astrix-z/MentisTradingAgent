@@ -21,6 +21,7 @@
 | T01 | Backend вообще не проверяется строгим mypy              | дыра в гейте  | P1        |
 | T02 | `tsc` не проверяет типы тестов фронтенда                | дыра в гейте  | P2        |
 | T05 | Живой e2e требует mailpit и падает сырым `ECONNREFUSED`  | неполный прогон | P2      |
+| T07 | `mypy agent tests` (заявлен в `agent/README.md`) не проходит | дыра в гейте | P2       |
 | T03 | `biome check` и генератор фикстуры не сходятся          | бумажная боль | P3        |
 | T04 | `biome` сканирует gitignore-артефакты e2e               | бумажная боль | P3        |
 | T06 | У `/working-symbols` нет живого e2e                     | покрытие      | P3        |
@@ -206,6 +207,44 @@ symbol list yet», и ни в одном из случаев не падает. 
 
 **Критерий приёмки.** Либо тест есть и проходит на чистом стеке, либо в этом пункте
 дописан явный отказ с причиной.
+
+---
+
+## T07. `mypy agent tests` не проходит, хотя заявлен как проверка
+
+**Симптом.** `agent/README.md` (раздел Checks) предлагает
+`cd agent && uv run mypy agent tests`, но эта команда не проходит. Дьявол в том, что
+никто её и не запускает: pre-commit-хук `local-mypy` проверяет только `backend/app`,
+а `Test Backend` в CI — только pytest. Ошибки живут в тестовых файлах агента.
+
+**Воспроизведение.**
+
+```bash
+cd agent && uv run mypy agent tests
+# tests/test_symbols.py:48: error: Incompatible return value type (got
+#   "ExchangeInfoResponseSymbolsInner | None", expected ...)  [return-value]
+# tests/test_symbols.py:55: ... Ticker24hrResponse2Inner | None ...
+# tests/test_symbol_selection.py:191: error: Returning Any from function declared
+#   to return "dict[str, Any]"  [no-any-return]
+# tests/test_command_delivery_integration.py:43,128,169: ...
+# Found 6 errors in 3 files
+```
+
+Проверено на HEAD (до задачи про метку Monitoring) — ошибки давние, с этим изменением
+не связаны. Пакет агента при этом чист: `uv run mypy --strict agent` — 0 ошибок.
+
+**Что сделать.** Починить шесть ошибок по-настоящему, а не `# type: ignore` пачкой:
+- `from_dict(...)` в SDK возвращает `Optional` — либо assert, либо честный
+  `cast`/проверка в хелперах `symbol()`/`ticker()`;
+- `reported()` в `test_symbol_selection.py` возвращает `json.loads(...)`: либо
+  аннотация `Any`, либо разбор с проверкой типа;
+- в `test_command_delivery_integration.py` — тип Redis-заглушки и `await` на
+  `Awaitable | NotAwaitable` (там `Mock` вместо `AsyncMock` в двух местах).
+Затем добавить шаг `uv run mypy agent tests` в CI (или в хук), иначе дыра откроется
+снова.
+
+**Критерий приёмки.** `cd agent && uv run mypy agent tests` возвращает 0; шаг есть
+в CI/хуке; искусственная ошибка типов в тесте агента валит сборку.
 
 ---
 

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { createFileRoute, Link, redirect } from "@tanstack/react-router"
 import type { ColumnDef } from "@tanstack/react-table"
+import { TriangleAlert } from "lucide-react"
 import { useCallback, useEffect, useMemo, useState } from "react"
 
 import { type SymbolEntry, TradingService, UsersService } from "@/client"
@@ -82,7 +83,21 @@ function Marks({ entry }: { entry: SymbolEntry }) {
         <Badge variant="outline">{reason}</Badge>
       ) : label !== null ? (
         <Badge variant="secondary">{label}</Badge>
-      ) : (
+      ) : null}
+      {/* A warning, not a verdict: Binance reviews these assets periodically and
+          may delist them, but they trade normally, so this never filters or
+          blocks anything. */}
+      {entry.monitoring === true && (
+        <Badge
+          variant="outline"
+          className="gap-1 border-amber-500/60 text-amber-700 dark:text-amber-400"
+          title="Binance has this asset under its Monitoring tag: it trades normally, but the exchange reviews it periodically and may delist it."
+        >
+          <TriangleAlert className="size-3" aria-hidden="true" />
+          Monitoring
+        </Badge>
+      )}
+      {reason === null && label === null && entry.monitoring !== true && (
         <span className="text-muted-foreground">—</span>
       )}
     </div>
@@ -264,7 +279,12 @@ function WorkingSymbols() {
       {
         id: "marks",
         accessorFn: (entry) =>
-          entry.excluded_reason ?? entry.classification_label ?? "",
+          [
+            entry.excluded_reason ?? entry.classification_label,
+            entry.monitoring === true ? "monitoring" : null,
+          ]
+            .filter(Boolean)
+            .join(" · "),
         header: "Marks",
         cell: ({ row }) => <Marks entry={row.original} />,
       },
@@ -276,12 +296,18 @@ function WorkingSymbols() {
   const usable = document?.usable ?? 0
   const total = document?.total ?? 0
   const unusableMarked = document?.selected_unusable ?? 0
+  const monitored = entries.filter((entry) => entry.monitoring === true).length
   // Say how old the prices are instead of letting them look live: they are read
   // when the agent publishes or when someone asks, not continuously.
   const pricesReadAt = document?.prices_updated_at
   const pricesFreshness = pricesReadAt
     ? `Prices read at ${new Date(pricesReadAt).toLocaleTimeString()}`
     : "No prices read yet"
+  // The monitoring list is read daily, so its age is a date, not a clock time.
+  const monitoringReadAt = document?.monitoring_updated_at
+  const monitoringFreshness = monitoringReadAt
+    ? `Monitoring list read ${new Date(monitoringReadAt).toLocaleString()}`
+    : "Monitoring list not read yet"
 
   return (
     <div className="flex flex-col gap-6">
@@ -313,6 +339,7 @@ function WorkingSymbols() {
           <div className="flex flex-wrap items-center gap-4">
             <p role="status">
               Marked: {selection.length} · Usable: {usable} · Listed: {total}
+              {monitored > 0 ? ` · Monitoring: ${monitored}` : ""}
             </p>
             {unusableMarked > 0 && (
               <p role="alert" className="text-destructive">
@@ -321,6 +348,9 @@ function WorkingSymbols() {
               </p>
             )}
             <div className="ml-auto flex flex-wrap items-center gap-3">
+              <span className="text-muted-foreground text-sm">
+                {monitoringFreshness}
+              </span>
               <span className="text-muted-foreground text-sm">
                 {pricesFreshness}
               </span>
@@ -416,7 +446,11 @@ function WorkingSymbols() {
             Symbols the exchange does not allow (tokenized equities,
             stablecoins, wrapped or staked tokens, gold, halted markets) cannot
             be marked. Prices are read when the agent publishes and whenever you
-            ask for them, so they are as old as the time above says.{" "}
+            ask for them, so they are as old as the time above says. The
+            Monitoring tag is read once a day from Binance's public markets
+            listing — an unofficial source, since Binance publishes no API for
+            it — and it is a label: a monitored symbol still trades, and is
+            still markable.{" "}
             <Link to="/strategy" className="underline">
               Back to Strategy
             </Link>

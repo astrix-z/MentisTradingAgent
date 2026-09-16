@@ -519,6 +519,10 @@ export type SymbolEntry = {
      */
     excluded_reason?: string | null;
     /**
+     * Monitoring
+     */
+    monitoring?: boolean;
+    /**
      * Selected
      */
     selected?: boolean;
@@ -764,6 +768,10 @@ export type WorkingSymbols = {
      * Prices Updated At
      */
     prices_updated_at?: string | null;
+    /**
+     * Monitoring Updated At
+     */
+    monitoring_updated_at?: string | null;
     /**
      * Total
      */
