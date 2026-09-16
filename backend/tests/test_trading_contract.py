@@ -527,7 +527,7 @@ def test_read_redis_failure(client: TestClient, redis: MemoryRedis, path: str) -
     )
 
 
-@pytest.mark.parametrize("command", ["start", "stop", "balance", "symbols"])
+@pytest.mark.parametrize("command", ["start", "stop", "balance", "symbols", "prices"])
 def test_generic_commands_share_the_same_commit_path(
     client: TestClient,
     redis: MemoryRedis,
@@ -541,7 +541,7 @@ def test_generic_commands_share_the_same_commit_path(
     assert response.status_code == 202
     assert len(redis.publications) == 1
     assert redis.publications[0][1] == response.json()
-    if command in ("balance", "symbols"):
+    if command in ("balance", "symbols", "prices"):
         assert trading.REDIS_RUNTIME_KEY not in redis.values
     else:
         snapshot = json.loads(redis.values[trading.REDIS_RUNTIME_KEY])
@@ -754,6 +754,7 @@ def universe_payload() -> dict[str, Any]:
         base_asset: str,
         *,
         volume: str,
+        price: str | None = None,
         classification: str = "crypto",
         label: str | None = None,
         excluded_reason: str | None = None,
@@ -766,6 +767,7 @@ def universe_payload() -> dict[str, Any]:
             "status": "TRADING",
             "spot_allowed": True,
             "quote_volume_24h": volume,
+            "last_price": price,
             "classification": classification,
             "classification_label": label,
             "excluded_reason": excluded_reason,
@@ -775,6 +777,7 @@ def universe_payload() -> dict[str, Any]:
     return {
         "version": 1,
         "generated_at": "2026-09-15T00:00:00+00:00",
+        "prices_updated_at": "2026-09-15T00:05:00+00:00",
         # Fields the backend does not model must not break the read.
         "network": "live",
         "quote_asset": "USDT",
@@ -787,11 +790,12 @@ def universe_payload() -> dict[str, Any]:
                 "AAPLBUSDT",
                 "AAPLB",
                 volume="10",
+                price="180.25",
                 classification="tokenized_equity",
                 label="tokenized equity",
                 excluded_reason="tokenized equity",
             ),
-            entry("BTCUSDT", "BTC", volume="123.45", selected=True),
+            entry("BTCUSDT", "BTC", volume="123.45", price="64000.10", selected=True),
             entry("ETHUSDT", "ETH", volume="99.9"),
         ],
     }
@@ -817,6 +821,11 @@ def test_symbols_endpoint_serves_the_published_universe(
     assert by_symbol["BTCUSDT"]["selected"] is True
     # Volume stays a Decimal string: the UI sorts it numerically, not lexically.
     assert by_symbol["BTCUSDT"]["quote_volume_24h"] == "123.45"
+    # So does the price, and a symbol the exchange priced nothing for says so
+    # rather than claiming a price of zero.
+    assert by_symbol["BTCUSDT"]["last_price"] == "64000.10"
+    assert by_symbol["ETHUSDT"]["last_price"] is None
+    assert body["prices_updated_at"] == "2026-09-15T00:05:00+00:00"
 
 
 def test_symbols_endpoint_reports_a_missing_agent_without_erroring(
@@ -829,6 +838,7 @@ def test_symbols_endpoint_reports_a_missing_agent_without_erroring(
         "available": False,
         "quote_asset": "USDT",
         "generated_at": None,
+        "prices_updated_at": None,
         "total": 0,
         "usable": 0,
         "selected": 0,
@@ -940,15 +950,45 @@ def test_generic_symbols_command_shares_the_payload_rules(
     assert trading.REDIS_RUNTIME_KEY not in redis.values
 
 
+def test_refresh_prices_enqueues_a_command(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    response = client.post("/api/v1/trading/prices/", headers=headers(client))
+    assert response.status_code == 202
+    assert len(redis.publications) == 1
+    stream, envelope, _ = redis.publications[0]
+    assert stream == trading.REDIS_COMMAND_STREAM
+    assert envelope["type"] == "prices"
+    assert envelope["payload"] == {}
+    # Asking for prices says nothing about whether the strategy is running.
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+@pytest.mark.parametrize("role,expected", [(None, 401), ("user", 403)])
+def test_refresh_prices_is_superuser_only(
+    client: TestClient, redis: MemoryRedis, role: str | None, expected: int
+) -> None:
+    redis.fail = "get"  # Unauthorized calls must not even reach Redis.
+    response = client.post(
+        "/api/v1/trading/prices/",
+        headers=headers(client, role) if role else {},
+    )
+    assert response.status_code == expected
+
+
 def test_openapi_exposes_typed_working_symbols(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     models = schema["components"]["schemas"]
-    assert {"excluded_reason", "selected", "quote_volume_24h"} <= set(
+    assert {"excluded_reason", "selected", "quote_volume_24h", "last_price"} <= set(
         models["SymbolEntry"]["properties"]
     )
-    assert {"available", "usable", "selected_unusable", "symbols"} <= set(
-        models["WorkingSymbols"]["properties"]
-    )
+    assert {
+        "available",
+        "usable",
+        "selected_unusable",
+        "symbols",
+        "prices_updated_at",
+    } <= set(models["WorkingSymbols"]["properties"])
     paths = schema["paths"]["/api/v1/trading/symbols/"]
     assert (
         paths["get"]["responses"]["200"]["content"]["application/json"]["schema"][
@@ -957,6 +997,12 @@ def test_openapi_exposes_typed_working_symbols(client: TestClient) -> None:
     )
     assert (
         paths["post"]["responses"]["202"]["content"]["application/json"]["schema"][
+            "$ref"
+        ].endswith("/CommandEnvelope")
+    )
+    prices = schema["paths"]["/api/v1/trading/prices/"]["post"]
+    assert (
+        prices["responses"]["202"]["content"]["application/json"]["schema"][
             "$ref"
         ].endswith("/CommandEnvelope")
     )

@@ -112,7 +112,7 @@ SuperUserDep = Annotated[User, Depends(get_current_active_superuser)]
 
 # Trading network the agent should run against (must match agent key selection).
 Network = Literal["testnet", "live"]
-CommandType = Literal["start", "stop", "balance", "symbols"]
+CommandType = Literal["start", "stop", "balance", "symbols", "prices"]
 
 # Commands that describe the running intent and therefore rewrite the runtime
 # snapshot. Everything else is observation-only (balance, symbols) and goes
@@ -271,6 +271,9 @@ class SymbolEntry(BaseModel):
     status: str
     spot_allowed: bool = False
     quote_volume_24h: str = "0"
+    #: Last trade price as a Decimal string, or ``null`` when the exchange gave
+    #: none — which is not the same as a price of zero.
+    last_price: str | None = None
     classification: str
     classification_label: str | None = None
     excluded_reason: str | None = None
@@ -292,6 +295,9 @@ class WorkingSymbols(BaseModel):
     available: bool = True
     quote_asset: str = "USDT"
     generated_at: str | None = None
+    #: When ``last_price`` and ``quote_volume_24h`` were read from the exchange,
+    #: which is later than ``generated_at`` once a price refresh has run.
+    prices_updated_at: str | None = None
     total: int = 0
     usable: int = 0
     selected: int = 0
@@ -665,7 +671,15 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
                 status_code=422, detail=json_safe_errors(exc)
             ) from exc
         return await _apply_command("symbols", symbols.model_dump())
-    return await _apply_command("stop", {})
+    if request.type == "prices":
+        return await _apply_command("prices", {})
+    if request.type == "stop":
+        return await _apply_command("stop", {})
+    # Unreachable while CommandType lists every type: the branches above are
+    # exhaustive on purpose, so a new type cannot silently become a stop.
+    raise HTTPException(  # pragma: no cover
+        status_code=422, detail=f"unknown command type {request.type!r}"
+    )
 
 
 @router.post("/start/", status_code=202, response_model=CommandEnvelope)
@@ -689,6 +703,18 @@ async def fetch_balance(request: NetworkRequest, _: SuperUserDep) -> CommandEnve
     implicitly reusing whatever network the agent currently happens to run.
     """
     return await _apply_command("balance", {"network": request.network})
+
+
+@router.post("/prices/", status_code=202, response_model=CommandEnvelope)
+async def refresh_prices(_: SuperUserDep) -> CommandEnvelope:
+    """Ask the agent to re-read prices and republish the universe.
+
+    Nothing is returned but the command envelope: the fresh values arrive in the
+    symbol document the agent republishes immediately afterwards, so the page has
+    one shape of the data to read rather than two. 202 only acknowledges the
+    command.
+    """
+    return await _apply_command("prices", {})
 
 
 @router.get("/result/", response_model=CommandResult | None)
