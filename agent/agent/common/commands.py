@@ -51,7 +51,12 @@ from agent.engine import (
 from agent.exchange import ExchangeError
 from agent.selection import save_selected, validate_selection
 from agent.strategies import STRATEGIES
-from agent.symbols import fetch_universe, latest_universe, publish_universe
+from agent.symbols import (
+    fetch_universe,
+    latest_universe,
+    publish_universe,
+    refresh_tickers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +372,44 @@ async def _symbols(ctx: CommandContext, payload: dict[str, Any]) -> None:
     await publish_universe(ctx.redis, document=document)
     await ctx.report(ok=True, data={"symbols": stored, "count": len(stored)})
     logger.info("working symbols set: %s", len(stored))
+
+
+@command("prices")
+async def _prices(ctx: CommandContext, _payload: dict[str, Any]) -> None:
+    """Refresh the universe's last prices (and 24h volumes) on demand.
+
+    Prices go stale between the periodic publishes, and the agent is the only
+    service that can read them. The refresh republishes the universe document, so
+    the page picks the values up from the document it already reads instead of
+    being handed a second shape of the same data.
+    """
+    logger.info("command prices")
+    try:
+        document = await asyncio.wait_for(
+            refresh_tickers(ctx.redis), timeout=settings.COMMAND_IO_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        message = f"prices timed out after {settings.COMMAND_IO_TIMEOUT_SECONDS}s"
+        logger.warning(message)
+        await ctx.report(ok=False, message=message, timed_out=True)
+        return
+    if document is None:
+        await ctx.report(
+            ok=False,
+            message="cannot refresh prices; the published list is unchanged",
+        )
+        return
+    entries = document.get("symbols", [])
+    priced = sum(1 for entry in entries if entry.get("last_price"))
+    await ctx.report(
+        ok=True,
+        data={
+            "prices": priced,
+            "total": len(entries),
+            "at": document.get("prices_updated_at"),
+        },
+    )
+    logger.info("refreshed prices: %s of %s symbols", priced, len(entries))
 
 
 @command("balance")

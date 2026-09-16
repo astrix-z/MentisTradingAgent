@@ -27,7 +27,7 @@ from redis.exceptions import RedisError
 from agent.common import commands
 from agent.core.config import settings
 from agent.engine import REDIS_COMMAND_GROUP, REDIS_COMMAND_STREAM, Engine
-from agent.main import _CommandQueue, _ensure_group, _handle_balance
+from agent.main import _CommandQueue, _ensure_group, _handle_independent
 
 TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 
@@ -196,7 +196,7 @@ def test_stop_completes_without_waiting_for_a_slow_balance_via_real_redis(
             control = _CommandQueue(redis, engine)
             worker = asyncio.create_task(control.run())
             balance_task = asyncio.create_task(
-                _handle_balance(
+                _handle_independent(
                     redis,
                     engine,
                     envelope("balance", str(uuid.uuid4()), network="testnet"),

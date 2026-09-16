@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from agent.common import commands
+from agent.core.config import settings
 from agent.selection import (
     NO_LONGER_LISTED,
     apply_selection,
@@ -40,7 +41,9 @@ def document(*entries: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def entry(symbol: str, reason: str | None = None) -> dict[str, Any]:
+def entry(
+    symbol: str, reason: str | None = None, price: str | None = None
+) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "base_asset": symbol.removesuffix("USDT"),
@@ -48,6 +51,7 @@ def entry(symbol: str, reason: str | None = None) -> dict[str, Any]:
         "status": "TRADING",
         "spot_allowed": True,
         "quote_volume_24h": "1",
+        "last_price": price,
         "classification": "crypto",
         "classification_label": None,
         "excluded_reason": reason,
@@ -288,8 +292,65 @@ def test_the_symbols_command_reports_a_storage_failure(
     assert "no database" in result["message"]
 
 
+# --- the prices command -----------------------------------------------------
+
+
+def test_the_prices_command_reports_what_it_priced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redis, pipe = redis_mock()
+    refreshed = document(entry("BTCUSDT", price="150"), entry("ETHUSDT"))
+    refreshed["prices_updated_at"] = "2026-09-15T12:00:00+00:00"
+    refresh = AsyncMock(return_value=refreshed)
+    monkeypatch.setattr(commands, "refresh_tickers", refresh)
+
+    run_command(envelope({}, "prices"), redis)
+
+    result = reported(pipe)
+    assert result["ok"] is True
+    # Only what was actually priced is counted: an entry without a price is not
+    # reported as one.
+    assert result["data"] == {
+        "prices": 1,
+        "total": 2,
+        "at": "2026-09-15T12:00:00+00:00",
+    }
+    refresh.assert_awaited_once()
+
+
+def test_the_prices_command_says_so_when_nothing_could_be_refreshed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable exchange or Redis is a failure, not a silent no-op."""
+    redis, pipe = redis_mock()
+    monkeypatch.setattr(commands, "refresh_tickers", AsyncMock(return_value=None))
+
+    run_command(envelope({}, "prices"), redis)
+
+    result = reported(pipe)
+    assert result["ok"] is False
+    assert "unchanged" in result["message"]
+
+
+def test_the_prices_command_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    redis, pipe = redis_mock()
+
+    async def never_finishes(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(commands, "refresh_tickers", never_finishes)
+    monkeypatch.setattr(settings, "COMMAND_IO_TIMEOUT_SECONDS", 0.01)
+
+    run_command(envelope({}, "prices"), redis)
+
+    result = reported(pipe)
+    assert result["ok"] is False
+    assert "timed out" in result["message"]
+
+
 def test_the_command_is_registered() -> None:
     assert "symbols" in commands.HANDLERS
+    assert "prices" in commands.HANDLERS
 
 
 def test_the_universe_builder_is_what_validation_reads() -> None:

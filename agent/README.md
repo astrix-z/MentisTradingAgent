@@ -28,6 +28,10 @@ backend lifecycle.
   document and asks for changes over the command lane. Validation is the agent's
   alone: it is the only service that can say whether a marked symbol is still
   listed, still spot-tradable and still not one of the excluded classes.
+- **Prices travel in that same document.** Each entry carries `last_price` from
+  the 24h ticker the universe read already fetches, so it costs no extra call; the
+  `prices` command re-reads the tickers on demand and republishes, which is why a
+  price is as fresh as the agent's last publish or the last time someone asked.
 - **All exchange access is built on `binance_sdk_spot`.** Own/duplicate models
   (`Quote`, `MarketData`, `NewOrder`, ...) are forbidden; the SDK already provides
   them. Docs and examples live in `../binance-spot/`.
@@ -80,10 +84,12 @@ protection remain unimplemented.
 - `agent/engine.py` — `Engine`: builds the SDK-backed services, starts/stops the
   strategy, publishes the heartbeat and signal events. Boots in `idle`.
 - `agent/common/commands.py` — command envelope + handler registry (`@command`),
-  built-in `start`/`stop`/`balance`/`symbols`, and boot-time resume from the
-  snapshot.
-- `agent/symbols.py` — reads and classifies the tradeable universe and publishes
-  it to `agent:symbols` (merged with the marks).
+  built-in `start`/`stop`/`balance`/`symbols`/`prices`, and boot-time resume from
+  the snapshot. `balance` and `prices` read the outside world and change no
+  intent, so they run outside the serialized start/stop queue.
+- `agent/symbols.py` — reads and classifies the tradeable universe, publishes it
+  to `agent:symbols` (merged with the marks), and re-reads prices and volumes on
+  demand for the `prices` command.
 - `agent/selection.py` — reads, writes, validates and merges the marked working
   symbols.
 - `agent/models.py` — the agent's own tables (starting with `WorkingSymbol`).

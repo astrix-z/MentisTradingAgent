@@ -77,8 +77,8 @@ class _CommandQueue:
 
     Only one handler runs at a time. Stop cancels active bootstrap/resume and
     invalidates queued starts preceding it, not commands arriving after it.
-    Balance commands never enter this queue (see ``_handle_balance``) so a
-    slow balance fetch can never make Stop wait behind it.
+    Observation-only commands never enter this queue (see ``_handle_independent``)
+    so a slow balance or price fetch can never make Stop wait behind it.
     """
 
     def __init__(self, redis: Redis, engine: Engine) -> None:
@@ -148,20 +148,28 @@ class _CommandQueue:
                 self.queue.task_done()
 
 
-async def _handle_balance(redis: Redis, engine: Engine, raw: str, ack_id: str) -> None:
-    """Run one balance command as an independent task, outside the serialized
-    start/stop queue, and ack once it's actually done (success or failure)."""
+async def _handle_independent(
+    redis: Redis, engine: Engine, raw: str, ack_id: str
+) -> None:
+    """Run one observation-only command as an independent task, outside the
+    serialized start/stop queue, and ack once it's actually done (success or
+    failure)."""
     try:
         await commands.dispatch(engine, redis, raw)
     finally:
         await _ack(redis, ack_id)
 
 
+#: Command types that read the outside world and change nothing about the
+#: running intent. They must not queue behind (or in front of) Start/Stop.
+_INDEPENDENT_COMMANDS = ("balance", "prices")
+
+
 async def _route(
     redis: Redis,
     engine: Engine,
     control: _CommandQueue,
-    balance_tasks: set[asyncio.Task[None]],
+    background_tasks: set[asyncio.Task[None]],
     entry_id: str,
     fields: dict[str, str],
 ) -> None:
@@ -176,10 +184,10 @@ async def _route(
         logger.warning("dropping malformed command envelope (acked)")
         await _ack(redis, entry_id)
         return
-    if kind == "balance":
-        task = asyncio.create_task(_handle_balance(redis, engine, raw, entry_id))
-        balance_tasks.add(task)
-        task.add_done_callback(balance_tasks.discard)
+    if kind in _INDEPENDENT_COMMANDS:
+        task = asyncio.create_task(_handle_independent(redis, engine, raw, entry_id))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
     else:
         control.submit(raw, entry_id)
 
@@ -187,19 +195,19 @@ async def _route(
 async def _listen(redis: Redis, engine: Engine, stop: asyncio.Event) -> None:
     """Subscribe before resume; receiving commands never waits for bootstrap."""
     control = _CommandQueue(redis, engine)
-    balance_tasks: set[asyncio.Task[None]] = set()
+    background_tasks: set[asyncio.Task[None]] = set()
     worker = asyncio.create_task(control.run())
     try:
-        await _receive(redis, engine, stop, control, balance_tasks)
+        await _receive(redis, engine, stop, control, background_tasks)
     finally:
         worker.cancel()
         try:
             await worker
         except asyncio.CancelledError:
             pass
-        for task in list(balance_tasks):
+        for task in list(background_tasks):
             task.cancel()
-        for task in list(balance_tasks):
+        for task in list(background_tasks):
             try:
                 await task
             except asyncio.CancelledError:
@@ -211,7 +219,7 @@ async def _receive(
     engine: Engine,
     stop: asyncio.Event,
     control: _CommandQueue,
-    balance_tasks: set[asyncio.Task[None]],
+    background_tasks: set[asyncio.Task[None]],
 ) -> None:
     resume_pending = True
     while not stop.is_set():
@@ -247,7 +255,7 @@ async def _receive(
                         read_id = ">"
                     for entry_id, fields in entries:
                         await _route(
-                            redis, engine, control, balance_tasks, entry_id, fields
+                            redis, engine, control, background_tasks, entry_id, fields
                         )
         except RedisError as exc:
             logger.warning("command stream error: %s; retrying", exc)

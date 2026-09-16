@@ -29,6 +29,7 @@ from agent.symbols import (
     build_universe,
     classify,
     publish_universe,
+    refresh_tickers,
 )
 
 
@@ -47,8 +48,11 @@ def symbol(name: str, **overrides: Any) -> ExchangeInfoResponseSymbolsInner:
     return ExchangeInfoResponseSymbolsInner.from_dict(payload)
 
 
-def ticker(name: str, volume: str) -> Ticker24hrResponse2Inner:
-    return Ticker24hrResponse2Inner.from_dict({"symbol": name, "quoteVolume": volume})
+def ticker(name: str, volume: str, price: str | None = None) -> Ticker24hrResponse2Inner:
+    payload: dict[str, Any] = {"symbol": name, "quoteVolume": volume}
+    if price is not None:
+        payload["lastPrice"] = price
+    return Ticker24hrResponse2Inner.from_dict(payload)
 
 
 # --- classify ---------------------------------------------------------------
@@ -246,5 +250,123 @@ def test_publish_survives_redis_being_down(monkeypatch: pytest.MonkeyPatch) -> N
         )
         redis = Mock(set=AsyncMock(side_effect=RedisError("down")))
         assert await publish_universe(redis) is None
+
+    asyncio.run(scenario())
+
+
+# --- prices ------------------------------------------------------------------
+
+
+def test_universe_reports_the_last_price() -> None:
+    published = build_universe(
+        [symbol("BTCUSDT"), symbol("ETHUSDT")],
+        {"BTCUSDT": ticker("BTCUSDT", "10", "12345.67800000")},
+    )
+    by_symbol = {entry["symbol"]: entry for entry in published["symbols"]}
+    # A Decimal string, exactly as the exchange sent it (trailing zeros and all,
+    # like the volume), so it survives the JSON round-trip without becoming a
+    # binary float somewhere in between.
+    assert by_symbol["BTCUSDT"]["last_price"] == "12345.67800000"
+    # No ticker means no price read, which is not the same as a price of zero.
+    assert by_symbol["ETHUSDT"]["last_price"] is None
+    assert isinstance(published["prices_updated_at"], str)
+
+
+def test_refresh_updates_prices_and_volumes_and_republishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setattr("agent.symbols.load_selected", AsyncMock(return_value=set()))
+        monkeypatch.setattr(
+            "agent.symbols.ExchangeRest.connect_public",
+            Mock(
+                return_value=Mock(
+                    tickers_24h=AsyncMock(
+                        return_value={"BTCUSDT": ticker("BTCUSDT", "42", "150")}
+                    )
+                )
+            ),
+        )
+        document = build_universe(
+            [symbol("BTCUSDT")], {"BTCUSDT": ticker("BTCUSDT", "10", "100")}
+        )
+        redis = Mock(set=AsyncMock())
+        refreshed = await refresh_tickers(redis, document=document)
+
+        assert refreshed is not None
+        assert refreshed["symbols"][0]["last_price"] == "150"
+        assert refreshed["symbols"][0]["quote_volume_24h"] == "42"
+        # The cached universe is updated in place, so the next periodic publish
+        # is fresh too rather than reverting to what it had.
+        assert document["symbols"][0]["last_price"] == "150"
+        payload = json.loads(redis.set.await_args.args[1])
+        assert payload["symbols"][0]["last_price"] == "150"
+
+    asyncio.run(scenario())
+
+
+def test_refresh_leaves_a_symbol_the_exchange_no_longer_quotes_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing ticker is not a zero price: the entry keeps what it had."""
+
+    async def scenario() -> None:
+        monkeypatch.setattr("agent.symbols.load_selected", AsyncMock(return_value=set()))
+        monkeypatch.setattr(
+            "agent.symbols.ExchangeRest.connect_public",
+            Mock(return_value=Mock(tickers_24h=AsyncMock(return_value={}))),
+        )
+        document = build_universe(
+            [symbol("BTCUSDT"), symbol("GONEUSDT")],
+            {
+                "BTCUSDT": ticker("BTCUSDT", "10", "100"),
+                "GONEUSDT": ticker("GONEUSDT", "5", "2"),
+            },
+        )
+        refreshed = await refresh_tickers(Mock(set=AsyncMock()), document=document)
+        assert refreshed is not None
+        by_symbol = {entry["symbol"]: entry for entry in refreshed["symbols"]}
+        assert by_symbol["GONEUSDT"]["last_price"] == "2"
+        assert by_symbol["GONEUSDT"]["quote_volume_24h"] == "5"
+
+    asyncio.run(scenario())
+
+
+def test_refresh_keeps_the_published_document_when_the_exchange_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setattr(
+            "agent.symbols.ExchangeRest.connect_public",
+            Mock(side_effect=ExchangeError("exchange down")),
+        )
+        document = build_universe(
+            [symbol("BTCUSDT")], {"BTCUSDT": ticker("BTCUSDT", "10", "100")}
+        )
+        redis = Mock(set=AsyncMock())
+        assert await refresh_tickers(redis, document=document) is None
+        redis.set.assert_not_awaited()
+        assert document["symbols"][0]["last_price"] == "100"
+
+    asyncio.run(scenario())
+
+
+def test_refresh_reads_the_whole_universe_when_it_has_none_cached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A price request before the first publish must still answer."""
+
+    async def scenario() -> None:
+        fresh = build_universe(
+            [symbol("BTCUSDT")], {"BTCUSDT": ticker("BTCUSDT", "10", "100")}
+        )
+        fetch = AsyncMock(return_value=fresh)
+        monkeypatch.setattr("agent.symbols.latest_universe", lambda: None)
+        monkeypatch.setattr("agent.symbols.fetch_universe", fetch)
+        monkeypatch.setattr("agent.symbols.load_selected", AsyncMock(return_value=set()))
+        published = await refresh_tickers(Mock(set=AsyncMock()))
+        assert published is not None
+        assert published["symbols"][0]["last_price"] == "100"
+        fetch.assert_awaited_once()
 
     asyncio.run(scenario())

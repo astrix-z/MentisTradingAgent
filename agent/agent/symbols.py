@@ -181,6 +181,32 @@ def _volume(value: Any) -> str:
         return "0"
 
 
+def _price(value: Any) -> str | None:
+    """Last trade price as a Decimal string, or ``None`` when unknown.
+
+    Unlike volume, a missing price stays missing rather than becoming ``0``: a
+    price of zero is not a price, and the UI has to be able to tell "no price
+    read" from "trades at nothing".
+    """
+    try:
+        return str(Decimal(str(value))) if value not in (None, "") else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _ticker_values(ticker: Any) -> dict[str, Any]:
+    """The document fields one 24h ticker supplies.
+
+    A full read (:func:`build_universe`) and a price refresh
+    (:func:`refresh_tickers`) both go through here, so the two cannot disagree
+    about what a ticker contributes to an entry.
+    """
+    return {
+        "quote_volume_24h": _volume(getattr(ticker, "quote_volume", None)),
+        "last_price": _price(getattr(ticker, "last_price", None)),
+    }
+
+
 def build_universe(
     symbols: list[Any],
     tickers: dict[str, Any],
@@ -216,17 +242,21 @@ def build_universe(
                 "quote_asset": symbol.quote_asset,
                 "status": symbol.status,
                 "spot_allowed": spot_allowed,
-                "quote_volume_24h": _volume(getattr(ticker, "quote_volume", None)),
                 "classification": classification,
                 "classification_label":
                     None if classification == CRYPTO else CLASSIFICATIONS[classification],
                 "excluded_reason": reason,
+                **_ticker_values(ticker),
             }
         )
     entries.sort(key=lambda entry: entry["symbol"])
+    now = datetime.now(UTC).isoformat()
     return {
         "version": UNIVERSE_VERSION,
-        "generated_at": datetime.now(UTC).isoformat(),
+        "generated_at": now,
+        #: When ``last_price`` and ``quote_volume_24h`` were read. A refresh
+        #: updates only this one, so the UI can say how fresh a price is.
+        "prices_updated_at": now,
         "network": UNIVERSE_NETWORK,
         "quote_asset": quote_asset,
         "usable": sum(1 for entry in entries if entry["excluded_reason"] is None),
@@ -289,6 +319,42 @@ async def publish_universe(
     return merged
 
 
+async def refresh_tickers(
+    redis: Redis, *, document: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Re-read prices and 24h volumes, then republish the universe.
+
+    One endpoint supplies both, so one call refreshes both: asking for the price
+    alone would mean asking twice for the same numbers. The passed document is
+    updated in place (it is the cached universe, so the next publish is fresh
+    too); without one, the cached universe is used, and if there is none either,
+    a full read happens instead.
+
+    Returns the merged document, or ``None`` when the exchange or Redis could not
+    be reached — the previously published document is then left alone, exactly as
+    a failed periodic refresh leaves it.
+    """
+    if document is None:
+        document = latest_universe()
+    if document is None:
+        return await publish_universe(redis)
+    try:
+        rest = ExchangeRest.connect_public(UNIVERSE_NETWORK)  # type: ignore[arg-type]
+        tickers = await rest.tickers_24h()
+    except ExchangeError as exc:
+        logger.warning("cannot refresh prices: %s", exc)
+        return None
+    for entry in document.get("symbols", []):
+        ticker = tickers.get(entry["symbol"])
+        # A symbol the exchange no longer quotes keeps what it had rather than
+        # being zeroed: it is still in the list, and the reason it cannot be
+        # marked comes from the universe, not from here.
+        if ticker is not None:
+            entry.update(_ticker_values(ticker))
+    document["prices_updated_at"] = datetime.now(UTC).isoformat()
+    return await publish_universe(redis, document=document)
+
+
 __all__ = [
     "CRYPTO",
     "MEMECOINS",
@@ -299,4 +365,5 @@ __all__ = [
     "fetch_universe",
     "latest_universe",
     "publish_universe",
+    "refresh_tickers",
 ]

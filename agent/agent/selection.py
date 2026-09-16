@@ -101,6 +101,7 @@ def apply_selection(
                 "status": "MISSING",
                 "spot_allowed": False,
                 "quote_volume_24h": "0",
+                "last_price": None,
                 "classification": "crypto",
                 "classification_label": None,
                 "excluded_reason": NO_LONGER_LISTED,

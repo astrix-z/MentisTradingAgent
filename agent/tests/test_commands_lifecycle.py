@@ -11,7 +11,7 @@ import pytest
 from agent.common import commands
 from agent.core.config import settings
 from agent.engine import Engine
-from agent.main import _CommandQueue, _handle_balance, _heartbeat_loop, _listen
+from agent.main import _CommandQueue, _handle_independent, _heartbeat_loop, _listen
 from agent.strategies import STRATEGIES
 
 
@@ -409,7 +409,7 @@ def test_stop_completes_without_waiting_for_a_slow_balance(
         control = _CommandQueue(redis, engine)
         worker = asyncio.create_task(control.run())
         balance_task = asyncio.create_task(
-            _handle_balance(
+            _handle_independent(
                 redis,
                 engine,
                 envelope("balance", "slow-bal", network="testnet"),
