@@ -64,7 +64,9 @@ def test_correlated_results() -> None:
         # Each report() does two pipelined blocks: the result write (2 SETs)
         # and the state-hash transition to "succeeded" (HSET + EXPIRE).
         assert pipe.execute.await_count == 4
-        assert [call.kwargs["mapping"]["status"] for call in pipe.hset.call_args_list] == [
+        assert [
+            call.kwargs["mapping"]["status"] for call in pipe.hset.call_args_list
+        ] == [
             "succeeded",
             "succeeded",
         ]
@@ -184,7 +186,12 @@ def test_listener_and_heartbeat_during_resume(
             subscribed.set()
 
         async def xreadgroup(
-            _group: str, _consumer: str, streams: dict[str, str], *, block: int, **_kw: Any
+            _group: str,
+            _consumer: str,
+            streams: dict[str, str],
+            *,
+            block: int,
+            **_kw: Any,
         ) -> list[tuple[str, list[tuple[str, dict[str, str]]]]]:
             (stream_name,) = streams
             try:
@@ -266,7 +273,9 @@ def test_balance_missing_network_reports_failure() -> None:
     asyncio.run(scenario())
 
 
-def test_balance_command_returns_typed_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_balance_command_returns_typed_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def scenario() -> None:
         redis = redis_mock()
         engine = Engine(redis)
@@ -379,7 +388,9 @@ def test_balance_timeout_reports_timed_out_not_a_hang(
         assert result["ok"] is False
         assert "timed out" in result["message"]
         pipe = redis.pipeline.return_value.__aenter__.return_value
-        statuses = [call.kwargs["mapping"]["status"] for call in pipe.hset.call_args_list]
+        statuses = [
+            call.kwargs["mapping"]["status"] for call in pipe.hset.call_args_list
+        ]
         assert statuses[-1] == "timed_out"
 
     asyncio.run(scenario())

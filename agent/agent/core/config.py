@@ -57,9 +57,7 @@ class Settings(BaseSettings):
 
     @field_validator("AGENT_DB_URL", "BINANCE_DB_URL", mode="after")
     @classmethod
-    def _use_psycopg_driver(
-        cls, value: PostgresDsn | None
-    ) -> PostgresDsn | None:
+    def _use_psycopg_driver(cls, value: PostgresDsn | None) -> PostgresDsn | None:
         """Point Postgres URLs at psycopg's async driver.
 
         ``create_async_engine`` refuses a plain ``postgresql://`` URL, and the

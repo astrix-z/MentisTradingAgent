@@ -61,9 +61,7 @@ async def save_selected(symbols: Iterable[str]) -> list[str]:
     return wanted
 
 
-def validate_selection(
-    symbols: Sequence[str], document: dict[str, Any]
-) -> list[str]:
+def validate_selection(symbols: Sequence[str], document: dict[str, Any]) -> list[str]:
     """The subset of ``symbols`` the exchange does not currently allow.
 
     Only *usable* symbols qualify: a delisted, non-spot, stable, gold, wrapped,
@@ -80,9 +78,7 @@ def validate_selection(
     )
 
 
-def apply_selection(
-    document: dict[str, Any], selected: set[str]
-) -> dict[str, Any]:
+def apply_selection(document: dict[str, Any], selected: set[str]) -> dict[str, Any]:
     """Mark the document with the selection, in place, and return it.
 
     A marked symbol that the universe no longer lists at all gets a stub entry

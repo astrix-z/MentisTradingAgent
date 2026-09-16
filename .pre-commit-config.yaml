@@ -52,6 +52,18 @@ repos:
         language: unsupported
         pass_filenames: false
 
+      # Run from inside agent/ on purpose: mypy reads its configuration from the
+      # working directory, so from the repository root it finds no [tool.mypy] and
+      # silently drops strict mode (that is what local-mypy above runs into with
+      # the backend — see TASKS.md T01).
+      - id: local-mypy-agent
+        name: mypy check (agent)
+        entry: uv run --directory agent mypy agent tests
+        files: ^agent/.*\.py$|^agent/pyproject\.toml$|^uv\.lock$
+        require_serial: true
+        language: unsupported
+        pass_filenames: false
+
       - id: local-ty
         name: ty check
         entry: uv run ty check backend/app

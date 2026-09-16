@@ -156,6 +156,36 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-09-15] T07 закрыт: `mypy agent tests` проходит и проверяется хуком
+- Починены шесть давних ошибок типов в тестах агента — по-настоящему, а не пачкой
+  `# type: ignore`: `parsed[Model]()` разворачивает `from_dict` (он `Optional`),
+  `reported()` проверяет `isinstance` вместо возврата `Any`, Redis-клиент аннотирован
+  там, где `from_url` отдаёт `Any`, и два узких `# type: ignore[misc]` с объяснением на
+  `redis.hgetall` (redis-py типизирует его как awaitable-или-нет; продакшен-код носит
+  такой же — `agent/common/commands.py`). `warn_unused_ignores` включён, поэтому когда
+  стабы починят, игноры сами станут ошибками.
+- **Новый хук `local-mypy-agent`** — и именно в форме
+  `uv run --directory agent mypy agent tests`: mypy читает конфиг из текущего каталога,
+  поэтому из корня он не находит `agent/pyproject.toml` и **молча теряет `strict`**.
+  Доказано пробой: временная неаннотированная функция проходит
+  `uv run mypy agent/agent agent/tests` из корня (36 файлов, «success») и падает из
+  `agent/` (`no-untyped-def`). Тот же корень у T01.
+- Проверено: `cd agent && uv run mypy agent tests` → 0 (35 файлов);
+  `prek run local-mypy-agent` проходит, а с искусственной ошибкой типов в тесте — падает.
+- **Заодно применён `ruff format` ко всему агенту.** Стек проверок в `CONTEXT.md` §1
+  включает `ruff format`, `agent/README.md` документирует `ruff format --check .`, а
+  дерево не сходилось (12 файлов) — в том числе из-за прошлой сессии, которая решила,
+  что `ruff format` «сломан», и правила код руками. Проверено: `--check` теперь 36/36.
+  **Цена:** ручные таблицы в `symbols.py` (`STABLE_OR_FIAT`, `EQUITY_TICKERS`,
+  `MEMECOINS`, `CRYPTO_ENDING_IN_B`) разворачиваются в один элемент на строку (+~130
+  строк, зато правка таблицы становится однострочным diff'ом). Если компактный вид
+  важнее — откатывается точечно.
+- Backend не форматировал: там `ruff format --check` нигде не документирован, а его
+  mypy-гейт — отдельный T01. Дрейф там тот же, 3 файла: `app/api/deps.py`,
+  `app/api/routes/trading.py`, `app/core/strategy_catalog.py`.
+- Файлы: `.pre-commit-config.yaml`, `agent/tests/{test_symbols.py,test_symbol_selection.py,test_command_delivery_integration.py}`,
+  `agent/README.md`, `TASKS.md` (+ `ruff format` по каталогу `agent/`).
+
 ### [2026-09-15] Метка Monitoring: ярлык в таблице, поддельный адаптер и хранение у агента
 - **Где метка (проверено на живом API):** в официальном spot-API её нет — у
   `exchangeInfo` одинаковые 26 полей на всех 3699 символах, подстрок `tag`/`monitoring`

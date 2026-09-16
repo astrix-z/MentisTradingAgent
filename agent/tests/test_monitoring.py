@@ -48,7 +48,8 @@ def populated_feed() -> dict[str, Any]:
 
 def reading(*symbols: str) -> MonitoringMarks:
     return MonitoringMarks(
-        symbols=frozenset(symbols), refreshed_at=datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+        symbols=frozenset(symbols),
+        refreshed_at=datetime(2026, 9, 15, 12, 0, tzinfo=UTC),
     )
 
 

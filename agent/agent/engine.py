@@ -131,7 +131,9 @@ class Engine:
             self._balances = balances
         return balances
 
-    async def fetch_account_balance_snapshot(self, network: str) -> list[dict[str, str]]:
+    async def fetch_account_balance_snapshot(
+        self, network: str
+    ) -> list[dict[str, str]]:
         """Return non-zero ``{asset, free, locked}`` rows (Decimal strings) for
         ``network`` — the typed shape returned by the ``balance`` command."""
         rest = self._ensure_rest(network)

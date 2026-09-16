@@ -105,7 +105,7 @@ protection remain unimplemented.
   happens when the read fails.
 - `agent/selection.py` — reads, writes, validates and merges the marked working
   symbols.
-- `agent/models.py` — the agent's own tables (starting with `WorkingSymbol`).
+- `agent/models.py` — the agent's own tables (`WorkingSymbol`, `MonitoredSymbol`).
   Created with `create_all` on boot; the backend never queries them.
 - `agent/core/db.py` — async engines (own settings DB + external read-only DB),
   plus the idempotent database/schema setup for the agent's own DB.
@@ -131,3 +131,8 @@ protection remain unimplemented.
 cd agent && uv run ruff check . && uv run ruff format --check . && uv run mypy agent tests
 cd agent && uv run pytest
 ```
+
+The repository's pre-commit hook enforces the type check with
+`uv run --directory agent mypy agent tests`, from the agent directory on purpose:
+mypy reads its configuration from the working directory, so run from the repository
+root it finds no `[tool.mypy]` and silently drops `strict`.

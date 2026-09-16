@@ -33,7 +33,8 @@ TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 
 
 async def _connect() -> Redis:
-    client = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
+    # Annotated because redis-py's ``from_url`` is untyped and returns ``Any``.
+    client: Redis = Redis.from_url(TEST_REDIS_URL, decode_responses=True)
     try:
         await client.ping()
     except RedisError as exc:
@@ -125,7 +126,12 @@ def test_duplicate_delivery_does_not_rerun_a_completed_command() -> None:
 
             await commands.dispatch(engine, redis, raw)
             engine.stop.assert_awaited_once()
-            state = await redis.hgetall(f"agent:command:{command_id}")
+            # redis-py types hgetall as ``Awaitable[dict] | dict`` to serve the sync
+            # and async clients with one stub, which the async call cannot use; the
+            # narrow ignore is the same one production code carries
+            # (``agent/common/commands.py``). ``warn_unused_ignores`` is on, so the
+            # day the stub is fixed this becomes an error and gets removed.
+            state = await redis.hgetall(f"agent:command:{command_id}")  # type: ignore[misc]
             assert state["status"] == "succeeded"
 
             await commands.dispatch(engine, redis, raw)  # redelivered
@@ -166,7 +172,7 @@ def test_balance_timeout_reports_timed_out_via_real_redis(
             result = json.loads(result_raw)
             assert result["ok"] is False
             assert "timed out" in result["message"]
-            state = await redis.hgetall(f"agent:command:{command_id}")
+            state = await redis.hgetall(f"agent:command:{command_id}")  # type: ignore[misc]
             assert state["status"] == "timed_out"
         finally:
             await redis.aclose()

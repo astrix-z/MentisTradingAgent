@@ -55,9 +55,7 @@ class MonitoredSymbol(Base):
     __tablename__ = "monitored_symbol"
 
     symbol: Mapped[str] = mapped_column(String(32), primary_key=True)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_now
-    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 __all__ = ["Base", "MonitoredSymbol", "WorkingSymbol"]

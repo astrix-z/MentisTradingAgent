@@ -228,7 +228,9 @@ async def refresh_monitoring(
         return None
 
 
-def apply_monitoring(document: dict[str, Any], marks: MonitoringMarks) -> dict[str, Any]:
+def apply_monitoring(
+    document: dict[str, Any], marks: MonitoringMarks
+) -> dict[str, Any]:
     """Mark the document with the tags, in place, and return it.
 
     Unlike the working symbols there is no stub for a tagged symbol that the

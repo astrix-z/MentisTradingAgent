@@ -61,10 +61,40 @@ UNIVERSE_NETWORK = "live"
 #: Base assets that are not a crypto asset: cash and its tokens.
 STABLE_OR_FIAT = frozenset(
     {
-        "AEUR", "ARS", "BFUSD", "BRL", "BUSD", "COP", "CZK", "DAI", "EUR", "EURC",
-        "EURI", "FDUSD", "FRAX", "GBP", "IDRT", "JPY", "MXN", "PEN", "PLN", "PYUSD",
-        "RLUSD", "RON", "TRY", "TUSD", "UAH", "USD", "USD1", "USDC", "USDE", "USDP",
-        "USDS", "USTC", "XUSD", "ZAR",
+        "AEUR",
+        "ARS",
+        "BFUSD",
+        "BRL",
+        "BUSD",
+        "COP",
+        "CZK",
+        "DAI",
+        "EUR",
+        "EURC",
+        "EURI",
+        "FDUSD",
+        "FRAX",
+        "GBP",
+        "IDRT",
+        "JPY",
+        "MXN",
+        "PEN",
+        "PLN",
+        "PYUSD",
+        "RLUSD",
+        "RON",
+        "TRY",
+        "TUSD",
+        "UAH",
+        "USD",
+        "USD1",
+        "USDC",
+        "USDE",
+        "USDP",
+        "USDS",
+        "USTC",
+        "XUSD",
+        "ZAR",
     }
 )
 
@@ -87,14 +117,71 @@ CRYPTO_ENDING_IN_B = frozenset({"ARB", "BB", "BNB", "CKB", "DGB", "TRB"})
 #: for a new listing.
 EQUITY_TICKERS = frozenset(
     {
-        "AAPL", "AMAT", "AMD", "AMZN", "ARM", "ASML", "ASTS", "AVGO", "AXTI",
-        "BABA", "BE", "BMNR", "COHR", "COIN", "CRCL", "CRDO", "CRM", "CRWD",
-        "CRWV", "DELL", "DJT", "EWY", "FLNC", "GLW", "GME", "GOOGL", "GS",
-        "HIMS", "HOOD", "IBM", "INTC", "INTU", "IREN", "KORU", "LITE", "META",
-        "MRNA", "MRVL", "MSFT", "MSTR", "MU", "NBIS", "NFLX", "NOK", "NVDA",
-        "ORCL", "PLTR", "PYPL", "QCOM", "QQQ", "RKLB", "SKHY", "SMCI", "SMH",
-        "SNDK", "SOXL", "SOXS", "SPCX", "SPY", "SQQQ", "STX", "TQQQ", "TSLA",
-        "TSM", "WDC",
+        "AAPL",
+        "AMAT",
+        "AMD",
+        "AMZN",
+        "ARM",
+        "ASML",
+        "ASTS",
+        "AVGO",
+        "AXTI",
+        "BABA",
+        "BE",
+        "BMNR",
+        "COHR",
+        "COIN",
+        "CRCL",
+        "CRDO",
+        "CRM",
+        "CRWD",
+        "CRWV",
+        "DELL",
+        "DJT",
+        "EWY",
+        "FLNC",
+        "GLW",
+        "GME",
+        "GOOGL",
+        "GS",
+        "HIMS",
+        "HOOD",
+        "IBM",
+        "INTC",
+        "INTU",
+        "IREN",
+        "KORU",
+        "LITE",
+        "META",
+        "MRNA",
+        "MRVL",
+        "MSFT",
+        "MSTR",
+        "MU",
+        "NBIS",
+        "NFLX",
+        "NOK",
+        "NVDA",
+        "ORCL",
+        "PLTR",
+        "PYPL",
+        "QCOM",
+        "QQQ",
+        "RKLB",
+        "SKHY",
+        "SMCI",
+        "SMH",
+        "SNDK",
+        "SOXL",
+        "SOXS",
+        "SPCX",
+        "SPY",
+        "SQQQ",
+        "STX",
+        "TQQQ",
+        "TSLA",
+        "TSM",
+        "WDC",
     }
 )
 
@@ -106,10 +193,30 @@ EQUITY_TICKERS = frozenset(
 #: page leaves them unchecked by hand instead.
 MEMECOINS = frozenset(
     {
-        "1000CAT", "1000CHEEMS", "1000SATS", "1MBABYDOGE", "BANANAS31", "BOME",
-        "BONK", "BROCCOLI714", "DOGE", "DOGS", "FLOKI", "GIGGLE", "HMSTR",
-        "MARSCOIN", "MUBARAK", "NEIRO", "PENGU", "PEPE", "PNUT", "SHIB", "TRUMP",
-        "TURBO", "TUT", "WIF",
+        "1000CAT",
+        "1000CHEEMS",
+        "1000SATS",
+        "1MBABYDOGE",
+        "BANANAS31",
+        "BOME",
+        "BONK",
+        "BROCCOLI714",
+        "DOGE",
+        "DOGS",
+        "FLOKI",
+        "GIGGLE",
+        "HMSTR",
+        "MARSCOIN",
+        "MUBARAK",
+        "NEIRO",
+        "PENGU",
+        "PEPE",
+        "PNUT",
+        "SHIB",
+        "TRUMP",
+        "TURBO",
+        "TUT",
+        "WIF",
     }
 )
 
@@ -178,7 +285,7 @@ def _volume(value: Any) -> str:
     """24h quote volume as a Decimal string, never a binary float."""
     try:
         return str(Decimal(str(value))) if value not in (None, "") else "0"
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return "0"
 
 
@@ -191,7 +298,7 @@ def _price(value: Any) -> str | None:
     """
     try:
         return str(Decimal(str(value))) if value not in (None, "") else None
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return None
 
 
@@ -244,8 +351,9 @@ def build_universe(
                 "status": symbol.status,
                 "spot_allowed": spot_allowed,
                 "classification": classification,
-                "classification_label":
-                    None if classification == CRYPTO else CLASSIFICATIONS[classification],
+                "classification_label": None
+                if classification == CRYPTO
+                else CLASSIFICATIONS[classification],
                 "excluded_reason": reason,
                 # Filled in from the agent's own table at publish time: the
                 # exchange's tag is not part of a universe read.

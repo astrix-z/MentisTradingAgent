@@ -1,7 +1,8 @@
 # Задания агенту: известные недоработки
 
-Дата: 2026-09-15. Собрано по итогам задачи «Working Symbols»
-(коммиты `a2c2820` — агент, `b6cfee6` — backend, `2ad80cd` — frontend).
+Дата: 2026-09-15. Собрано по итогам задач «Working Symbols» (коммиты `a2c2820` — агент,
+`b6cfee6` — backend, `2ad80cd` — frontend) и «метка Monitoring» (`ae87817`, `16c681b`,
+`789c19c`); T07 найден при работе над второй и там же закрыт.
 
 Это не список падений продукта: основной сценарий работает. Это список того, из-за
 чего **проверкам нельзя доверять в полной мере** (T01, T02), что **мешает локальной
@@ -9,10 +10,11 @@
 
 Состояние проверок на момент составления (перепроверять перед работой):
 
-- agent: `pytest` 162 passed / 6 skipped; `ruff check` и `mypy --strict agent/agent` чисто.
-- backend: `pytest` 168 passed / 1 skipped, coverage 93% (гейт 90%); `ruff check` чисто.
+- agent: `pytest` 192 passed / 6 skipped; `ruff check` чисто; `mypy agent tests` чисто
+  (и теперь действительно строгий — см. «Исправлено» ниже).
+- backend: `pytest` 172 passed / 1 skipped, coverage 93% (гейт 90%); `ruff check` чисто.
 - frontend: `tsc -p tsconfig.build.json` и `biome` чисто на исходниках; `vite build` ок;
-  Playwright mock **19 passed**; живой e2e **78 passed, 2 failed** (см. T05).
+  Playwright mock **23 passed**; живой e2e **83 passed, 2 failed** (см. T05).
 
 ## Сводка
 
@@ -21,10 +23,22 @@
 | T01 | Backend вообще не проверяется строгим mypy              | дыра в гейте  | P1        |
 | T02 | `tsc` не проверяет типы тестов фронтенда                | дыра в гейте  | P2        |
 | T05 | Живой e2e требует mailpit и падает сырым `ECONNREFUSED`  | неполный прогон | P2      |
-| T07 | `mypy agent tests` (заявлен в `agent/README.md`) не проходит | дыра в гейте | P2       |
 | T03 | `biome check` и генератор фикстуры не сходятся          | бумажная боль | P3        |
 | T04 | `biome` сканирует gitignore-артефакты e2e               | бумажная боль | P3        |
 | T06 | У `/working-symbols` нет живого e2e                     | покрытие      | P3        |
+
+### Исправлено
+
+- **T07 (был P2).** `agent/README.md` заявлял проверку `mypy agent tests`, которая падала
+  на 6 давних ошибках в тестах. Ошибки починены по-настоящему — `parsed[Model]()`
+  разворачивает `from_dict` (он `Optional`), `reported()` проверяет `isinstance`,
+  Redis-клиент аннотирован там, где `from_url` возвращает `Any`, и два узких
+  `# type: ignore[misc]` с объяснением на `hgetall` (так же поступает продакшен-код).
+  Проверка добавлена хуком `local-mypy-agent` и **обязана** запускаться из каталога
+  агента: из корня mypy не находит `agent/pyproject.toml` и молча теряет `strict`
+  (проверено пробой — неаннотированная функция проходит из корня и падает из `agent/`).
+  Проверено: `cd agent && uv run mypy agent tests` → 0; `prek run local-mypy-agent`
+  проходит, а с искусственной ошибкой типов в тесте — падает.
 
 ---
 
@@ -55,15 +69,24 @@ cd backend && ../.venv/bin/mypy app  # 1 error: unused "type: ignore" (22 source
 Разница 28 против 22 файлов — это `backend/app/alembic/`, который `exclude` не
 отфильтровал, потому что конфиг не был прочитан.
 
+**Доказательство, что из корня `strict` действительно теряется** (та же проба, что
+закрыла T07): временный файл с неаннотированной функцией.
+
+```bash
+# A) из корня (так запускается хук) — strict не применён, ошибка не найдена:
+uv run mypy agent/agent agent/tests              # Success: no issues found in 36 source files
+# B) из каталога проекта — strict применён, ошибка найдена:
+uv run --directory agent mypy agent tests        # error: Function is missing a type annotation
+```
+
 **Что сделать.**
 
-1. Выбрать **одну** каноничную команду и привести к ней всё. Ожидаемый вариант:
-   `uv run mypy --strict backend/app` из корня, а `exclude` (alembic, venv)
-   перенести туда, где он реально читается, либо запускать mypy из `backend/`.
-2. Починить единственную настоящую ошибку строгого режима (при запуске из `backend/`):
-   `backend/app/core/strategy_catalog.py:371` — `# type: ignore[arg-type]` больше не
-   нужен (в 19 ошибках из корня он тоже виден как `unused-ignore`). Его следует
-   **удалить**, а не глушить предупреждение через настройки.
+1. Выбрать **одну** каноничную команду и привести к ней всё. Рекомендация: запускать
+   из каталога проекта, чтобы читался его `pyproject.toml` — `entry:
+   uv run --directory backend mypy app` в хуке вместо `uv run mypy backend/app`.
+   (Так уже сделано для агента: хук `local-mypy-agent`.)
+2. Удалить устаревший `# type: ignore[arg-type]` в `backend/app/core/strategy_catalog.py`
+   — это и есть единственная настоящая ошибка строгого режима.
 3. Добавить шаг mypy в `.github/workflows/test-backend.yml` (или в
    `backend/scripts/tests-start.sh`), чтобы гейт был в CI, а не только в хуке.
 
@@ -207,44 +230,6 @@ symbol list yet», и ни в одном из случаев не падает. 
 
 **Критерий приёмки.** Либо тест есть и проходит на чистом стеке, либо в этом пункте
 дописан явный отказ с причиной.
-
----
-
-## T07. `mypy agent tests` не проходит, хотя заявлен как проверка
-
-**Симптом.** `agent/README.md` (раздел Checks) предлагает
-`cd agent && uv run mypy agent tests`, но эта команда не проходит. Дьявол в том, что
-никто её и не запускает: pre-commit-хук `local-mypy` проверяет только `backend/app`,
-а `Test Backend` в CI — только pytest. Ошибки живут в тестовых файлах агента.
-
-**Воспроизведение.**
-
-```bash
-cd agent && uv run mypy agent tests
-# tests/test_symbols.py:48: error: Incompatible return value type (got
-#   "ExchangeInfoResponseSymbolsInner | None", expected ...)  [return-value]
-# tests/test_symbols.py:55: ... Ticker24hrResponse2Inner | None ...
-# tests/test_symbol_selection.py:191: error: Returning Any from function declared
-#   to return "dict[str, Any]"  [no-any-return]
-# tests/test_command_delivery_integration.py:43,128,169: ...
-# Found 6 errors in 3 files
-```
-
-Проверено на HEAD (до задачи про метку Monitoring) — ошибки давние, с этим изменением
-не связаны. Пакет агента при этом чист: `uv run mypy --strict agent` — 0 ошибок.
-
-**Что сделать.** Починить шесть ошибок по-настоящему, а не `# type: ignore` пачкой:
-- `from_dict(...)` в SDK возвращает `Optional` — либо assert, либо честный
-  `cast`/проверка в хелперах `symbol()`/`ticker()`;
-- `reported()` в `test_symbol_selection.py` возвращает `json.loads(...)`: либо
-  аннотация `Any`, либо разбор с проверкой типа;
-- в `test_command_delivery_integration.py` — тип Redis-заглушки и `await` на
-  `Awaitable | NotAwaitable` (там `Mock` вместо `AsyncMock` в двух местах).
-Затем добавить шаг `uv run mypy agent tests` в CI (или в хук), иначе дыра откроется
-снова.
-
-**Критерий приёмки.** `cd agent && uv run mypy agent tests` возвращает 0; шаг есть
-в CI/хуке; искусственная ошибка типов в тесте агента валит сборку.
 
 ---
 

@@ -85,7 +85,7 @@ def _to_float(value: Any) -> float:
     """Best-effort conversion of the SDK's string numerics to ``float``."""
     try:
         return float(value) if value not in (None, "") else 0.0
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return 0.0
 
 
@@ -93,7 +93,7 @@ def _to_decimal(value: Any) -> Decimal:
     """Best-effort conversion of the SDK's string numerics to ``Decimal``."""
     try:
         return Decimal(str(value)) if value not in (None, "") else Decimal(0)
-    except (InvalidOperation, TypeError, ValueError):
+    except InvalidOperation, TypeError, ValueError:
         return Decimal(0)
 
 
@@ -111,7 +111,9 @@ def balance_snapshot(
         free = _to_decimal(row.free)
         locked = _to_decimal(row.locked)
         if free > 0 or locked > 0:
-            result.append({"asset": row.asset, "free": str(free), "locked": str(locked)})
+            result.append(
+                {"asset": row.asset, "free": str(free), "locked": str(locked)}
+            )
     return result
 
 

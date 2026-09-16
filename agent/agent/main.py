@@ -93,7 +93,7 @@ class _CommandQueue:
     def submit(self, raw: str, ack_id: str) -> None:
         try:
             envelope = commands.AgentCommand.from_json(raw)
-        except (ValueError, KeyError, TypeError):
+        except ValueError, KeyError, TypeError:
             logger.warning("dropping malformed command envelope")
             return
         if envelope.type == "stop":
@@ -181,7 +181,7 @@ async def _route(
         return
     try:
         kind = commands.AgentCommand.from_json(raw).type
-    except (ValueError, KeyError, TypeError):
+    except ValueError, KeyError, TypeError:
         logger.warning("dropping malformed command envelope (acked)")
         await _ack(redis, entry_id)
         return
@@ -317,9 +317,7 @@ async def _monitoring_loop(redis: Redis, stop: asyncio.Event) -> None:
         if await refresh_monitoring() is not None:
             await publish_universe(redis, document=latest_universe())
         try:
-            await asyncio.wait_for(
-                stop.wait(), timeout=MONITORING_REFRESH_SECONDS
-            )
+            await asyncio.wait_for(stop.wait(), timeout=MONITORING_REFRESH_SECONDS)
         except TimeoutError:
             pass
 

@@ -35,6 +35,18 @@ from agent.symbols import (
 )
 
 
+def parsed[Model](model: Model | None, fixture: str) -> Model:
+    """Unwrap the SDK's ``from_dict``, which is typed ``Optional``.
+
+    It only returns ``None`` for a ``None`` argument, so a fixture that comes back
+    empty means this helper was called with something malformed. Asserting here
+    keeps the callers plainly typed instead of scattering casts.
+    """
+    if model is None:
+        raise AssertionError(f"the SDK refused the fixture for {fixture}")
+    return model
+
+
 def symbol(name: str, **overrides: Any) -> ExchangeInfoResponseSymbolsInner:
     """An exchange-info row, built the way the SDK builds it from the wire."""
     base = name[: -len(QUOTE_ASSET)]
@@ -47,14 +59,16 @@ def symbol(name: str, **overrides: Any) -> ExchangeInfoResponseSymbolsInner:
         "isMarginTradingAllowed": True,
     }
     payload.update(overrides)
-    return ExchangeInfoResponseSymbolsInner.from_dict(payload)
+    return parsed(ExchangeInfoResponseSymbolsInner.from_dict(payload), name)
 
 
-def ticker(name: str, volume: str, price: str | None = None) -> Ticker24hrResponse2Inner:
+def ticker(
+    name: str, volume: str, price: str | None = None
+) -> Ticker24hrResponse2Inner:
     payload: dict[str, Any] = {"symbol": name, "quoteVolume": volume}
     if price is not None:
         payload["lastPrice"] = price
-    return Ticker24hrResponse2Inner.from_dict(payload)
+    return parsed(Ticker24hrResponse2Inner.from_dict(payload), name)
 
 
 # --- classify ---------------------------------------------------------------
@@ -138,7 +152,9 @@ def test_universe_keeps_only_quoted_symbols_and_labels_each_one() -> None:
         ],
         {"BTCUSDT": ticker("BTCUSDT", "1234.50000000")},
     )
-    reasons = {entry["symbol"]: entry["excluded_reason"] for entry in document["symbols"]}
+    reasons = {
+        entry["symbol"]: entry["excluded_reason"] for entry in document["symbols"]
+    }
     assert reasons == {
         "AAPLBUSDT": "tokenized equity",
         "BTCUPUSDT": "spot trading not allowed",
@@ -211,7 +227,9 @@ def test_a_symbol_without_a_name_is_skipped() -> None:
 # --- publishing -------------------------------------------------------------
 
 
-def test_publish_writes_the_universe_to_its_key(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_publish_writes_the_universe_to_its_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def scenario() -> None:
         document = build_universe([symbol("BTCUSDT")], {})
         monkeypatch.setattr(
@@ -278,7 +296,9 @@ def test_refresh_updates_prices_and_volumes_and_republishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
-        monkeypatch.setattr("agent.symbols.load_selected", AsyncMock(return_value=set()))
+        monkeypatch.setattr(
+            "agent.symbols.load_selected", AsyncMock(return_value=set())
+        )
         monkeypatch.setattr(
             "agent.symbols.ExchangeRest.connect_public",
             Mock(
@@ -313,7 +333,9 @@ def test_refresh_leaves_a_symbol_the_exchange_no_longer_quotes_alone(
     """A missing ticker is not a zero price: the entry keeps what it had."""
 
     async def scenario() -> None:
-        monkeypatch.setattr("agent.symbols.load_selected", AsyncMock(return_value=set()))
+        monkeypatch.setattr(
+            "agent.symbols.load_selected", AsyncMock(return_value=set())
+        )
         monkeypatch.setattr(
             "agent.symbols.ExchangeRest.connect_public",
             Mock(return_value=Mock(tickers_24h=AsyncMock(return_value={}))),
@@ -365,7 +387,9 @@ def test_refresh_reads_the_whole_universe_when_it_has_none_cached(
         fetch = AsyncMock(return_value=fresh)
         monkeypatch.setattr("agent.symbols.latest_universe", lambda: None)
         monkeypatch.setattr("agent.symbols.fetch_universe", fetch)
-        monkeypatch.setattr("agent.symbols.load_selected", AsyncMock(return_value=set()))
+        monkeypatch.setattr(
+            "agent.symbols.load_selected", AsyncMock(return_value=set())
+        )
         published = await refresh_tickers(Mock(set=AsyncMock()))
         assert published is not None
         assert published["symbols"][0]["last_price"] == "100"
@@ -377,11 +401,15 @@ def test_refresh_reads_the_whole_universe_when_it_has_none_cached(
 # --- the monitoring tag in the published document ----------------------------
 
 
-def test_publishing_labels_the_monitored_symbols(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_publishing_labels_the_monitored_symbols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The tag reaches the document from the agent's table, not from a read."""
 
     async def scenario() -> None:
-        monkeypatch.setattr("agent.symbols.load_selected", AsyncMock(return_value=set()))
+        monkeypatch.setattr(
+            "agent.symbols.load_selected", AsyncMock(return_value=set())
+        )
         monkeypatch.setattr(
             "agent.symbols.load_monitoring",
             AsyncMock(

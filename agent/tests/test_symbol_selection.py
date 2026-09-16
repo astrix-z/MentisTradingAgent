@@ -188,7 +188,12 @@ def reported(pipe: Mock) -> dict[str, Any]:
     for call in reversed(pipe.set.call_args_list):
         key, payload = call.args
         if key == "agent:result":
-            return json.loads(payload)
+            result = json.loads(payload)
+            if not isinstance(result, dict):
+                raise AssertionError(
+                    f"a command result must be a JSON object: {payload!r}"
+                )
+            return result
     raise AssertionError("no command result was reported")
 
 
@@ -212,7 +217,9 @@ def test_the_symbols_command_stores_and_republishes(
 ) -> None:
     redis, pipe = redis_mock()
     monkeypatch.setattr(
-        commands, "latest_universe", lambda: document(entry("BTCUSDT"), entry("ETHUSDT"))
+        commands,
+        "latest_universe",
+        lambda: document(entry("BTCUSDT"), entry("ETHUSDT")),
     )
     save = AsyncMock(return_value=["BTCUSDT", "ETHUSDT"])
     monkeypatch.setattr(commands, "save_selected", save)
