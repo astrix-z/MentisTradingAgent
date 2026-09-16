@@ -758,6 +758,7 @@ def universe_payload() -> dict[str, Any]:
         classification: str = "crypto",
         label: str | None = None,
         excluded_reason: str | None = None,
+        monitoring: bool = False,
         selected: bool = False,
     ) -> dict[str, Any]:
         return {
@@ -771,6 +772,7 @@ def universe_payload() -> dict[str, Any]:
             "classification": classification,
             "classification_label": label,
             "excluded_reason": excluded_reason,
+            "monitoring": monitoring,
             "selected": selected,
         }
 
@@ -778,6 +780,7 @@ def universe_payload() -> dict[str, Any]:
         "version": 1,
         "generated_at": "2026-09-15T00:00:00+00:00",
         "prices_updated_at": "2026-09-15T00:05:00+00:00",
+        "monitoring_updated_at": "2026-09-15T00:06:00+00:00",
         # Fields the backend does not model must not break the read.
         "network": "live",
         "quote_asset": "USDT",
@@ -795,8 +798,15 @@ def universe_payload() -> dict[str, Any]:
                 label="tokenized equity",
                 excluded_reason="tokenized equity",
             ),
-            entry("BTCUSDT", "BTC", volume="123.45", price="64000.10", selected=True),
-            entry("ETHUSDT", "ETH", volume="99.9"),
+            entry(
+                "BTCUSDT",
+                "BTC",
+                volume="123.45",
+                price="64000.10",
+                selected=True,
+            ),
+            # Monitored, and still perfectly tradable: the tag must not exclude.
+            entry("ETHUSDT", "ETH", volume="99.9", monitoring=True),
         ],
     }
 
@@ -826,6 +836,13 @@ def test_symbols_endpoint_serves_the_published_universe(
     assert by_symbol["BTCUSDT"]["last_price"] == "64000.10"
     assert by_symbol["ETHUSDT"]["last_price"] is None
     assert body["prices_updated_at"] == "2026-09-15T00:05:00+00:00"
+    # The exchange's Monitoring tag is served as a label and nothing else: the
+    # monitored symbol is still usable, and still markable.
+    assert by_symbol["ETHUSDT"]["monitoring"] is True
+    assert by_symbol["ETHUSDT"]["excluded_reason"] is None
+    assert by_symbol["BTCUSDT"]["monitoring"] is False
+    assert body["usable"] == 2
+    assert body["monitoring_updated_at"] == "2026-09-15T00:06:00+00:00"
 
 
 def test_symbols_endpoint_reports_a_missing_agent_without_erroring(
@@ -839,6 +856,7 @@ def test_symbols_endpoint_reports_a_missing_agent_without_erroring(
         "quote_asset": "USDT",
         "generated_at": None,
         "prices_updated_at": None,
+        "monitoring_updated_at": None,
         "total": 0,
         "usable": 0,
         "selected": 0,
@@ -979,15 +997,20 @@ def test_refresh_prices_is_superuser_only(
 def test_openapi_exposes_typed_working_symbols(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
     models = schema["components"]["schemas"]
-    assert {"excluded_reason", "selected", "quote_volume_24h", "last_price"} <= set(
-        models["SymbolEntry"]["properties"]
-    )
+    assert {
+        "excluded_reason",
+        "selected",
+        "quote_volume_24h",
+        "last_price",
+        "monitoring",
+    } <= set(models["SymbolEntry"]["properties"])
     assert {
         "available",
         "usable",
         "selected_unusable",
         "symbols",
         "prices_updated_at",
+        "monitoring_updated_at",
     } <= set(models["WorkingSymbols"]["properties"])
     paths = schema["paths"]["/api/v1/trading/symbols/"]
     assert (

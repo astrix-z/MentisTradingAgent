@@ -277,6 +277,9 @@ class SymbolEntry(BaseModel):
     classification: str
     classification_label: str | None = None
     excluded_reason: str | None = None
+    #: The exchange's Monitoring tag. A label, never a verdict: a monitored
+    #: symbol trades normally, so this only ever informs.
+    monitoring: bool = False
     selected: bool = False
 
 
@@ -298,6 +301,9 @@ class WorkingSymbols(BaseModel):
     #: When ``last_price`` and ``quote_volume_24h`` were read from the exchange,
     #: which is later than ``generated_at`` once a price refresh has run.
     prices_updated_at: str | None = None
+    #: When the exchange's Monitoring tag list was last read. ``null`` means it
+    #: has never been read, which is not the same as nothing being monitored.
+    monitoring_updated_at: str | None = None
     total: int = 0
     usable: int = 0
     selected: int = 0
