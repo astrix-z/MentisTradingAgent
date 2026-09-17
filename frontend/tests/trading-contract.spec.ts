@@ -475,6 +475,39 @@ test("bulk selection edits the draft once and never picks unusable symbols", asy
   expect(api.posts).toEqual([])
 })
 
+test("Monitoring selection and inversion can be saved as the whole set", async ({
+  page,
+}) => {
+  const api = await mock(page)
+  await page.goto("/working-symbols")
+
+  const checkbox = (symbol: string) =>
+    page.getByRole("checkbox", { name: `Use ${symbol} in the strategy` })
+
+  // Start empty, then select by the exchange label. Only ETH carries Monitoring.
+  await checkbox("ETHUSDT").click()
+  await page.getByRole("button", { name: "Select Monitoring" }).click()
+  await expect(checkbox("ETHUSDT")).toBeChecked()
+  await expect(checkbox("BTCUSDT")).not.toBeChecked()
+
+  // Inversion applies to usable symbols: ETH leaves the set and BTC enters it.
+  await page.getByRole("button", { name: "Invert selection" }).click()
+  await expect(checkbox("ETHUSDT")).not.toBeChecked()
+  await expect(checkbox("BTCUSDT")).toBeChecked()
+
+  // An unusable symbol stays outside every bulk operation.
+  await page.getByRole("switch", { name: "Show unusable symbols" }).click()
+  await expect(checkbox("AAPLBUSDT")).not.toBeChecked()
+  await expect(checkbox("AAPLBUSDT")).toBeDisabled()
+  expect(api.posts).toEqual([])
+
+  // The actions only changed the normal draft; Save still sends its complete set.
+  await page.getByRole("button", { name: "Save", exact: true }).click()
+  await expect(page.getByText("symbols — accepted")).toBeVisible()
+  expect(api.posts[0].path).toContain("/trading/symbols/")
+  expect(api.posts[0].body).toEqual({ symbols: ["BTCUSDT"] })
+})
+
 test("prices are read on request and land in the price column", async ({
   page,
 }) => {

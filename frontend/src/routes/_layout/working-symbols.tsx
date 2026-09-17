@@ -201,10 +201,15 @@ function WorkingSymbols() {
     setSelection((current) => Array.from(new Set([...current, ...symbols])))
   }, [])
 
-  // Both bulk actions edit the draft once and then forget how it was produced:
-  // the threshold is never stored as a rule, so it cannot be reapplied later —
-  // neither on reload nor when the strategy starts.
+  // Bulk actions edit the draft once and then forget how it was produced: no
+  // selection rule is stored or reapplied on reload or when the strategy starts.
   const selectAll = () => markMany(usableEntries.map((entry) => entry.symbol))
+  const selectMonitoring = () =>
+    markMany(
+      usableEntries
+        .filter((entry) => entry.monitoring === true)
+        .map((entry) => entry.symbol),
+    )
   const selectAboveThreshold = () => {
     if (threshold === null) return
     markMany(
@@ -212,6 +217,21 @@ function WorkingSymbols() {
         .filter((entry) => volumeOf(entry) > threshold)
         .map((entry) => entry.symbol),
     )
+  }
+  const invertSelection = () => {
+    const usableSymbols = new Set(usableEntries.map((entry) => entry.symbol))
+    setDirty(true)
+    setSelection((current) => {
+      const currentSet = new Set(current)
+      return [
+        // Preserve stale unusable marks so an action on hidden usable rows does
+        // not silently discard them. They can still be unmarked explicitly.
+        ...current.filter((symbol) => !usableSymbols.has(symbol)),
+        ...usableEntries
+          .filter((entry) => !currentSet.has(entry.symbol))
+          .map((entry) => entry.symbol),
+      ]
+    })
   }
 
   const columns = useMemo<ColumnDef<SymbolEntry>[]>(
@@ -372,6 +392,12 @@ function WorkingSymbols() {
               <Button variant="outline" onClick={selectAll}>
                 Select all
               </Button>
+              <Button variant="outline" onClick={selectMonitoring}>
+                Select Monitoring
+              </Button>
+              <Button variant="outline" onClick={invertSelection}>
+                Invert selection
+              </Button>
               <div className="flex items-end gap-2">
                 <div className="flex flex-col gap-1">
                   <Label htmlFor="volume-threshold">
@@ -396,10 +422,9 @@ function WorkingSymbols() {
               </div>
             </div>
             <p className="text-muted-foreground text-sm">
-              Both act on the draft at the moment you press them. The threshold
-              is not saved as a rule, so it is never reapplied — neither on
-              reload nor when the strategy starts. Unusable symbols are never
-              selected.
+              Bulk actions edit the draft at the moment you press them. No rule
+              is saved or reapplied on reload or when the strategy starts.
+              Unusable symbols are never selected or changed by these actions.
             </p>
           </div>
 

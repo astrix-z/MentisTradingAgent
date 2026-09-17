@@ -125,6 +125,32 @@ def test_a_new_equity_listing_is_caught_by_the_suffix_rule() -> None:
     assert classify("SOMENEWTICKERB") == "suspected_tokenized_equity"
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "AAOIBUSDT",
+        "ALABBUSDT",
+        "BNCBUSDT",
+        "CBRSBUSDT",
+        "DRAMBUSDT",
+        "INTWBUSDT",
+        "MUUBUSDT",
+        "MVLLBUSDT",
+        "QNTBUSDT",
+        "SNXXBUSDT",
+        "USARBUSDT",
+        "YBUSDT",
+    ],
+)
+def test_owner_reviewed_suffix_symbols_remain_excluded(name: str) -> None:
+    """The owner reviewed these live listings and confirmed their exclusion."""
+    document = build_universe([symbol(name)], {})
+    entry = document["symbols"][0]
+    assert entry["classification"] == "suspected_tokenized_equity"
+    assert entry["excluded_reason"] == "tokenized equity (name pattern, please review)"
+    assert document["usable"] == 0
+
+
 def test_a_suspected_equity_says_so_in_the_published_document() -> None:
     document = build_universe([symbol("SOMENEWTICKERBUSDT")], {})
     entry = document["symbols"][0]
