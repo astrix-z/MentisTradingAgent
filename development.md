@@ -155,6 +155,10 @@ The `compose.override.yml` file adds local development settings, such as mountin
 
 The `compose.deploy.yml` file contains the deployment-specific settings, including HTTPS and automatic certificate handling. It is explicitly combined with `compose.yml` when deploying the application.
 
+Services are also gated by Compose profiles. Traefik, Adminer, Mailpit, and Playwright all carry `profiles: ["extras"]`, so a plain `docker compose up` starts none of them: the first two would need the privileged port `80` and the `docker.sock` mount, and the last two are testing tools. Naming a service overrides its profile, which is why `docker compose up -d db mailpit` works without any flag. The shortcut is `docker compose --profile extras up -d`, but it also starts Traefik, Adminer, and a Playwright container that has no `CMD` and exits immediately, so prefer naming the services you want. Note that stopping the stack takes the opposite treatment: `docker compose down` skips profile services, so use `docker compose --profile "*" down -v` to remove Mailpit as well.
+
+A deployment enables the profile deliberately, because Traefik is the only way into the deployed stack: the backend publishes no ports of its own. Mailpit and Playwright stay out of a deployment either way, because they are only declared here, in `compose.override.yml`. See the [Docker Compose deployment guide](./deployment-docker-compose.md).
+
 The backend reads local settings from the `.env` file. Docker Compose also uses it for variable interpolation and passes the settings each container needs.
 
 After changing variables, make sure you restart the stack:

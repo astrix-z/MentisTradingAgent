@@ -53,10 +53,14 @@ To use an authenticated email provider, also set `SMTP_PASSWORD`.
 cd /root/code/app/
 docker compose -f compose.yml -f compose.deploy.yml build
 docker compose -f compose.yml -f compose.deploy.yml run --rm backend bash scripts/prestart.sh
-docker compose -f compose.yml -f compose.deploy.yml up -d
+docker compose -f compose.yml -f compose.deploy.yml --profile extras up -d
 ```
 
 The `compose.deploy.yml` file adds HTTPS and automatic certificate handling to the shared `compose.yml` configuration. Explicitly listing both files excludes the local settings from `compose.override.yml`.
+
+The `--profile extras` flag on the last command is required. Traefik and Adminer carry `profiles: ["extras"]` in `compose.yml` so that a plain `docker compose up` on a workstation does not need the privileged port `80` or the `docker.sock` mount, and a profile is not enabled unless it is asked for. Without the flag the stack comes up with no way in from the outside, because the backend publishes no ports of its own and relies entirely on Traefik: no HTTPS, and neither the application nor Adminer is reachable.
+
+Mailpit and Playwright share that profile, but they are declared only in `compose.override.yml`, which the file list above excludes, so enabling `extras` here starts Traefik and Adminer and cannot pull them into the deployment.
 
 The backend Docker image builds the frontend, so the server does not need Bun or prebuilt frontend files.
 

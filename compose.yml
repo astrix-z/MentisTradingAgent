@@ -7,7 +7,10 @@ services:
   proxy:
     # Runs only when explicitly enabled (avoids needing the privileged host port
     # 80 and the docker.sock mount for a plain local `docker compose up`).
-    # Enable with: docker compose --profile extras up -d
+    # Enable locally with: docker compose --profile extras up -d
+    # A deployment enables this profile too, and has to: the backend publishes no
+    # ports of its own, so without Traefik nothing serves the stack
+    # (see deployment-docker-compose.md).
     profiles: ["extras"]
     image: traefik:v3.7
     volumes:
@@ -49,6 +52,7 @@ services:
       timeout: 5s
 
   adminer:
+    # Shares the deploy-enabled `extras` profile with Traefik.
     profiles: ["extras"]
     image: adminer
     depends_on:

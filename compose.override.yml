@@ -76,6 +76,9 @@ services:
       SMTP_TLS: "false"
 
   mailpit:
+    # Shares the `extras` profile with Traefik and Adminer so that a plain
+    # `docker compose up` does not publish 1025/8025, but unlike them it is
+    # declared only in this override file, so it never reaches a deployment.
     profiles: ["extras"]
     image: axllent/mailpit
     ports:

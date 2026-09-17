@@ -38,4 +38,7 @@ jobs:
       - name: Prepare database
         run: docker compose -f compose.yml -f compose.deploy.yml run --rm backend bash scripts/prestart.sh
       - name: Start application
-        run: docker compose -f compose.yml -f compose.deploy.yml up -d
+        # `extras` holds Traefik and Adminer, which carry a profile so a plain
+        # local `docker compose up` does not need port 80. The deployment has to
+        # opt in, because Traefik is the only way into the stack.
+        run: docker compose -f compose.yml -f compose.deploy.yml --profile extras up -d
