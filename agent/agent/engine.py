@@ -328,6 +328,11 @@ class Engine:
                 "network": self._network,
                 "strategy": self._strategy_name,
                 "balances": self._balances,
+                "active_symbols": (
+                    self._strategy.active_symbols
+                    if self._strategy is not None
+                    else None
+                ),
                 "updated_at": _now().isoformat(),
             }
         )

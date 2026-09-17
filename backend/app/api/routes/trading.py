@@ -214,6 +214,7 @@ class AgentHeartbeat(BaseModel):
     network: Network | None = None
     strategy: str | None = None
     balances: dict[str, float] | None = None
+    active_symbols: list[str] | None = None
     updated_at: datetime
 
 

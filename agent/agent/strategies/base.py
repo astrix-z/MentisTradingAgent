@@ -164,5 +164,12 @@ class Strategy(abc.ABC):
     async def on_price(self, symbol: str, price: float) -> None:  # noqa: B027
         """Handle a live price tick for ``symbol``."""
 
+    @property
+    def active_symbols(self) -> list[str] | None:
+        """Symbols currently fully processed, for strategies that stage their
+        universe through a pre-filter. ``None`` if the strategy has no such
+        concept (every requested symbol is processed as given)."""
+        return None
+
 
 __all__ = ["Signal", "SignalSink", "SignalType", "Strategy", "StrategyServices"]

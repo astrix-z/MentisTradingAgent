@@ -33,6 +33,10 @@ export type AgentHeartbeat = {
         [key: string]: number;
     } | null;
     /**
+     * Active Symbols
+     */
+    active_symbols?: Array<string> | null;
+    /**
      * Updated At
      */
     updated_at: string;

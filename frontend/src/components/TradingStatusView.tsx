@@ -44,7 +44,26 @@ export function TradingStatusView({
       <p>Desired state: {desired.running ? "running" : "stopped"}</p>
       <p>Desired network: {desired.network?.toUpperCase()}</p>
       <p>Desired strategy: {desired.strategy ?? "none"}</p>
-      <p>Desired symbols: {desired.symbols?.join(", ") || "none"}</p>
+      <details>
+        <summary className="cursor-pointer select-none">
+          Desired symbols ({desired.symbols?.length ?? 0})
+        </summary>
+        <p className="font-mono text-xs">
+          {desired.symbols?.join(", ") || "none"}
+        </p>
+      </details>
+      {actual?.active_symbols != null && (
+        <div>
+          <p>
+            Screened symbols ({actual.active_symbols.length} of{" "}
+            {desired.symbols?.length ?? 0})
+            {stale ? " (stale)" : ""}:
+          </p>
+          <p className="font-mono text-xs">
+            {actual.active_symbols.join(", ") || "none"}
+          </p>
+        </div>
+      )}
       <p>Revision: {desired.revision}</p>
       {(mismatch || stale) && (
         <p role="status">

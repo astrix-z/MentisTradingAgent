@@ -64,6 +64,11 @@ class TripleScreenStrategy(Strategy):
     def settings(self) -> TripleScreenSettings:
         return self._settings
 
+    @property
+    def active_symbols(self) -> list[str] | None:
+        """Symbols that passed stage-1 screening and are stage-2 WS-wired."""
+        return sorted(self._active_symbols)
+
     def _intervals(self) -> tuple[str, str, str]:
         return (
             self.settings.tide_interval,
