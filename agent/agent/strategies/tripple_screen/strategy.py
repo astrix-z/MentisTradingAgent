@@ -367,6 +367,16 @@ class TripleScreenStrategy(Strategy):
                 return None
             snapshot[interval] = selected
         tide = self._tide(snapshot[settings.tide_interval])
+        logger.debug(
+            "tripple_screen tide symbol=%s ripple_open_time=%s bullish=%s "
+            "classification=%s conditions=%s ema=%s",
+            symbol,
+            trigger.open_time,
+            tide["bullish_tide"],
+            tide["classification"],
+            tide["conditions"],
+            tide["ema"],
+        )
         if not tide["bullish_tide"]:
             return None
         wave_candles = snapshot[settings.wave_interval]
@@ -429,6 +439,17 @@ class TripleScreenStrategy(Strategy):
             interval: hashlib.sha256(repr(candles).encode()).hexdigest()
             for interval, candles in snapshot.items()
         }
+        logger.debug(
+            "tripple_screen decision symbol=%s epoch=%s type=%s reason=%s wave=%s "
+            "ripple=%s state=%s",
+            symbol,
+            epoch,
+            "HOLD" if reason else "ENTRY",
+            reason or "entry",
+            wave,
+            provenance["ripple"],
+            provenance["state"],
+        )
         return Signal(
             type="HOLD" if reason else "ENTRY",
             symbol=symbol,
