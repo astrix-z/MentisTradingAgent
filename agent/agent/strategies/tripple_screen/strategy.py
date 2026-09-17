@@ -94,20 +94,29 @@ class TripleScreenStrategy(Strategy):
             raise
 
     async def _wire_streams(self, symbols: list[str]) -> None:
-        for symbol in symbols:
-            for interval in self._intervals():
-                await self.services.streams.subscribe_kline(
-                    symbol=symbol,
-                    interval=interval,
-                    callback=self._kline_callback(symbol, interval),
-                )
+        subscriptions = [
+            (symbol, interval, self._kline_callback(symbol, interval))
+            for symbol in symbols
+            for interval in self._intervals()
+        ]
+        await self.services.streams.subscribe_klines_batch(subscriptions)
 
     async def _bootstrap(self, symbols: list[str]) -> None:
         cutoff = int(datetime.now(UTC).timestamp() * 1000) - 1
-        for symbol in symbols:
-            for interval in self._intervals():
+        semaphore = asyncio.Semaphore(self.settings.rest_concurrency)
+
+        async def load_one(symbol: str, interval: str) -> None:
+            async with semaphore:
                 candles = await self._load_window(symbol, interval, cutoff)
-                self._merge(symbol, interval, candles)
+            self._merge(symbol, interval, candles)
+
+        await asyncio.gather(
+            *(
+                load_one(symbol, interval)
+                for symbol in symbols
+                for interval in self._intervals()
+            )
+        )
 
     async def _screen_universe(self) -> set[str]:
         """Stage 1: REST-only EMA13/EMA34 rising filter over the full universe.

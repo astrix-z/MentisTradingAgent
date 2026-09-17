@@ -69,6 +69,38 @@ def test_start_rollback(monkeypatch: pytest.MonkeyPatch, stage: str) -> None:
         assert strategy.on_stop.await_count == (stage in ("on_start", "heartbeat"))
         await engine.shutdown()
 
+
+def test_start_run_cancellation_stops_the_orphaned_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller giving up on ``start_run`` (e.g. the ``start`` command's own
+    timeout) must actually cancel the in-flight bootstrap, not merely stop
+    awaiting it — otherwise it keeps running unobserved and can clobber a
+    later start/stop."""
+
+    async def scenario() -> None:
+        engine, _redis, strategy, _streams = setup_engine(monkeypatch)
+        entered = asyncio.Event()
+
+        async def hang(*_a: Any, **_kw: Any) -> None:
+            entered.set()
+            await asyncio.sleep(10)
+
+        strategy.on_start.side_effect = hang
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(start(engine), timeout=0.05)
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        for _ in range(200):
+            if strategy.on_stop.await_count:
+                break
+            await asyncio.sleep(0.01)
+        assert strategy.on_stop.await_count == 1
+        assert engine.state == "error"
+        assert engine._startup is None
+        await engine.shutdown()
+
+    asyncio.run(scenario())
+
     asyncio.run(scenario())
 
 

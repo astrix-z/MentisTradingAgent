@@ -135,10 +135,12 @@ class Streams:
     def __init__(self) -> None:
         self.callbacks: dict[str, Callable[[KlineResponse], None]] = {}
 
-    async def subscribe_kline(
-        self, *, symbol: str, interval: str, callback: Callable[[KlineResponse], None]
+    async def subscribe_klines_batch(
+        self,
+        subscriptions: list[tuple[str, str, Callable[[KlineResponse], None]]],
     ) -> None:
-        self.callbacks[interval] = callback
+        for _symbol, interval, callback in subscriptions:
+            self.callbacks[interval] = callback
 
 
 class RedisSink:
@@ -830,10 +832,12 @@ class MultiStreams:
         self.subscribed: set[tuple[str, str]] = set()
         self.unsubscribed: list[tuple[str, str]] = []
 
-    async def subscribe_kline(
-        self, *, symbol: str, interval: str, callback: Callable[[KlineResponse], None]
+    async def subscribe_klines_batch(
+        self,
+        subscriptions: list[tuple[str, str, Callable[[KlineResponse], None]]],
     ) -> None:
-        self.subscribed.add((symbol, interval))
+        for symbol, interval, _callback in subscriptions:
+            self.subscribed.add((symbol, interval))
 
     async def unsubscribe_kline(self, *, symbol: str, interval: str) -> None:
         self.subscribed.discard((symbol, interval))

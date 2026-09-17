@@ -15,10 +15,11 @@ Message callbacks receive the SDK's own models (``KlineResponse``,
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from binance_common.configuration import ConfigurationWebSocketStreams
+from binance_common.websocket import RequestStreamHandle
 from binance_sdk_spot import (
     SPOT_WS_STREAMS_PROD_URL,
     SPOT_WS_STREAMS_TESTNET_URL,
@@ -81,18 +82,38 @@ class MarketDataStreams:
             )
         logger.info("market streams connected network=%s", self._network)
 
-    async def subscribe_kline(
-        self, *, symbol: str, interval: str, callback: KlineCallback
+    async def subscribe_klines_batch(
+        self, subscriptions: Sequence[tuple[str, str, KlineCallback]]
     ) -> None:
-        """Subscribe to ``<symbol>@kline_<interval>`` and forward closed bars."""
+        """Subscribe to many ``<symbol>@kline_<interval>`` streams at once.
+
+        The SDK paces one ``asyncio.sleep(0.5s)`` per call to its low-level
+        ``subscribe()``, not per stream in the list passed to it — going
+        through the SDK's one-stream-at-a-time ``kline()`` helper N times costs
+        N such delays, which matters once N is large (e.g. a 30-symbol ×
+        3-interval stage-2 admission is 90 streams, ~45s one at a time).
+        Batching all of them into a single ``subscribe()`` call turns that
+        into one delay, at the cost of building ``RequestStreamHandle``
+        objects ourselves instead of through the SDK's per-stream helper.
+        """
+        if not subscriptions:
+            return
         await self._ensure_started()
-        handle = await self._client.kline(
-            symbol=symbol.lower(),
-            interval=KlineIntervalEnum(interval).value,  # type: ignore[arg-type]
+        streams = [
+            f"{symbol.lower()}@kline_{KlineIntervalEnum(interval).value}"
+            for symbol, interval, _ in subscriptions
+        ]
+        await self._client.subscribe(
+            streams=streams,
+            response_model=KlineResponse,  # type: ignore[arg-type]
         )
-        handle.on("message", callback)
-        self._handles.append(handle)
-        self._kline_handles[(symbol.upper(), interval)] = handle
+        for (symbol, interval, callback), stream in zip(
+            subscriptions, streams, strict=True
+        ):
+            handle = RequestStreamHandle(self._client, stream, KlineResponse)
+            handle.on("message", callback)
+            self._handles.append(handle)
+            self._kline_handles[(symbol.upper(), interval)] = handle
 
     async def unsubscribe_kline(self, *, symbol: str, interval: str) -> None:
         """Drop one symbol/interval kline subscription, leaving the rest of
