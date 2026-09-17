@@ -332,6 +332,44 @@ def test_start_failure_result(monkeypatch: pytest.MonkeyPatch) -> None:
     asyncio.run(scenario())
 
 
+def test_start_timeout_scales_with_symbol_count() -> None:
+    base, per_symbol, ceiling = (
+        commands.START_TIMEOUT_BASE_SECONDS,
+        commands.START_TIMEOUT_PER_SYMBOL_SECONDS,
+        commands.START_TIMEOUT_MAX_SECONDS,
+    )
+    assert commands._start_timeout_seconds(0) == base
+    assert commands._start_timeout_seconds(10) == base + 10 * per_symbol
+    assert commands._start_timeout_seconds(10_000) == ceiling
+
+
+def test_start_timeout_reports_timed_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        redis = redis_mock()
+        engine = Engine(redis)
+
+        async def hang(*_a: Any, **_kw: Any) -> None:
+            await asyncio.sleep(10)
+
+        monkeypatch.setattr(engine, "start_run", AsyncMock(side_effect=hang))
+        monkeypatch.setattr(commands, "START_TIMEOUT_BASE_SECONDS", 0.01)
+        monkeypatch.setattr(commands, "START_TIMEOUT_PER_SYMBOL_SECONDS", 0.0)
+        monkeypatch.setattr(commands, "START_TIMEOUT_MAX_SECONDS", 1.0)
+        await asyncio.wait_for(
+            commands.dispatch(
+                engine,
+                redis,
+                envelope("start", "slow-start", strategy="test", symbols=["BTCUSDT"]),
+            ),
+            2,
+        )
+        result = results(redis)["agent:result:slow-start"]
+        assert result["ok"] is False
+        assert "timed out" in result["message"]
+
+    asyncio.run(scenario())
+
+
 def test_dispatch_skips_redelivery_of_an_already_terminal_command() -> None:
     """Prompt 5 dedup: redelivery of a completed command_id never re-runs it."""
 

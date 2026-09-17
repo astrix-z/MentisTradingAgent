@@ -73,7 +73,16 @@ class TripleScreenSettings(BaseModel):
         default=15, title="Signal validity (minutes)"
     )
     rest_concurrency: int = Field(default=3, ge=3, le=5, title="REST concurrency")
-    ws_top_n: PositiveInt = Field(default=50, title="WS top N symbols")
+    ws_top_n: PositiveInt = Field(
+        default=30,
+        le=100,
+        title="Max active symbols",
+        description=(
+            "Stage-2 cap: of the symbols that pass the EMA13/EMA34 screen, at "
+            "most this many are streamed and fully processed, ranked by trend "
+            "strength (EMA13-over-EMA34 spread)."
+        ),
+    )
     volume_window: Literal["24h"] = Field(default="24h", title="Volume window")
     kline_window: PositiveInt = Field(default=1000, title="Kline window")
 

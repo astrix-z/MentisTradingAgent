@@ -60,6 +60,7 @@ class MarketDataStreams:
         self._client = Spot(config_ws_streams=config).websocket_streams
         self._connection: Any = None
         self._handles: list[Any] = []
+        self._kline_handles: dict[tuple[str, str], Any] = {}
 
     @property
     def network(self) -> Network:
@@ -91,6 +92,27 @@ class MarketDataStreams:
         )
         handle.on("message", callback)
         self._handles.append(handle)
+        self._kline_handles[(symbol.upper(), interval)] = handle
+
+    async def unsubscribe_kline(self, *, symbol: str, interval: str) -> None:
+        """Drop one symbol/interval kline subscription, leaving the rest of
+        the connection (and its other subscriptions) untouched."""
+        handle = self._kline_handles.pop((symbol.upper(), interval), None)
+        if handle is None:
+            return
+        try:
+            self._handles.remove(handle)
+        except ValueError:
+            pass
+        try:
+            await handle.unsubscribe()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            logger.debug(
+                "kline unsubscribe failed symbol=%s interval=%s",
+                symbol,
+                interval,
+                exc_info=True,
+            )
 
     async def subscribe_ticker(self, *, symbol: str, callback: TickerCallback) -> None:
         """Subscribe to the rolling 24h ticker (last price in ``.c``)."""
@@ -115,6 +137,7 @@ class MarketDataStreams:
     async def stop(self) -> None:
         """Unsubscribe every stream and close the connection (best effort)."""
         handles, self._handles = self._handles, []
+        self._kline_handles.clear()
         for handle in handles:
             try:
                 await handle.unsubscribe()

@@ -421,7 +421,10 @@ def test_bootstrap_buffers_callback_and_cancel_awaits_sink(
 
         class InterleavedRest(Rest):
             async def klines(self, **kwargs: Any) -> list[Any]:
-                if not self.calls:
+                # Call 0 is stage-1 screening (no streams wired yet); call 1 is
+                # stage-2 bootstrap's first fetch, by which point streams must
+                # already be wired so a closed bar buffers instead of being lost.
+                if len(self.calls) == 1:
                     assert set(streams.callbacks) == {"4h", "1h", "15m"}
                     clock.now_ms = TRIGGER + 900_000
                     streams.callbacks["15m"](message(windows["15m"][-1]))
@@ -453,7 +456,11 @@ def test_start_failure_gates_late_callbacks() -> None:
     async def run() -> None:
         class BrokenRest(Rest):
             async def klines(self, **kwargs: Any) -> list[Any]:
-                raise RuntimeError("bootstrap failed")
+                # Call 0 (stage-1 screening) succeeds so the symbol qualifies
+                # and streams get wired; bootstrap's first call then fails.
+                if self.calls:
+                    raise RuntimeError("bootstrap failed")
+                return await super().klines(**kwargs)
 
         streams = Streams()
         strategy = TripleScreenStrategy(PARAMS)
@@ -764,3 +771,170 @@ def test_transport_all_types_nested_precision() -> None:
         assert payload["provenance"]["nested"] == ["1E-19", now.isoformat()]
         assert payload["entry_ref"] is None and payload["side"] == "LONG"
         assert set(payload) == set(signal.__dataclass_fields__)
+
+
+# --- Stage-1 screening / stage-2 selection --------------------------------
+
+SCREEN_PARAMS: dict[str, Any] = {**PARAMS, "ws_top_n": 30}
+
+
+def sloped_4h(
+    windows: dict[str, list[Candle]], step_size: int
+) -> dict[str, list[Candle]]:
+    """Same shape as ``fixture()`` but with a 4h close series that changes by
+    ``step_size`` per bar (positive: rising, negative: falling), so EMA13/
+    EMA34 (periods 3/4 under ``PARAMS``) rise or fall accordingly, and a
+    steeper slope yields a larger EMA13-over-EMA34 spread."""
+    windows["4h"] = [
+        replace(c, close=Decimal(100 + step_size * i))
+        for i, c in enumerate(windows["4h"])
+    ]
+    return windows
+
+
+def falling_4h(windows: dict[str, list[Candle]]) -> dict[str, list[Candle]]:
+    return sloped_4h(windows, -1)
+
+
+class MultiRest:
+    """Per-symbol REST fake for multi-symbol screening/rescreen tests."""
+
+    def __init__(self, windows: dict[str, dict[str, list[Candle]]]) -> None:
+        self.windows = windows
+        self.calls: list[dict[str, Any]] = []
+
+    async def klines(self, **kwargs: Any) -> list[Any]:
+        self.calls.append(kwargs)
+        await asyncio.sleep(0)
+        bars = [
+            c
+            for c in self.windows[kwargs["symbol"]][kwargs["interval"]]
+            if kwargs["start_time"] <= c.open_time <= kwargs["end_time"]
+        ]
+        return [
+            [
+                c.open_time,
+                str(c.open),
+                str(c.high),
+                str(c.low),
+                str(c.close),
+                str(c.volume),
+                c.close_time,
+            ]
+            for c in bars[: kwargs["limit"]]
+        ]
+
+
+class MultiStreams:
+    def __init__(self) -> None:
+        self.subscribed: set[tuple[str, str]] = set()
+        self.unsubscribed: list[tuple[str, str]] = []
+
+    async def subscribe_kline(
+        self, *, symbol: str, interval: str, callback: Callable[[KlineResponse], None]
+    ) -> None:
+        self.subscribed.add((symbol, interval))
+
+    async def unsubscribe_kline(self, *, symbol: str, interval: str) -> None:
+        self.subscribed.discard((symbol, interval))
+        self.unsubscribed.append((symbol, interval))
+
+
+def multi_services(
+    rest: MultiRest, streams: MultiStreams, sink: RedisSink, symbols: list[str]
+) -> StrategyServices:
+    return StrategyServices(
+        "testnet",
+        symbols,
+        cast(ExchangeRest, rest),
+        cast(MarketDataStreams, streams),
+        sink.emit,
+    )
+
+
+def test_screening_admits_by_cap_and_trend_strength() -> None:
+    async def run() -> None:
+        # STRONG and WEAK both qualify (rising EMAs); WEAK's slope (and thus
+        # EMA13-over-EMA34 spread) is much shallower. DOWN never qualifies.
+        windows = {
+            "STRONG": sloped_4h(fixture(), 5),
+            "WEAK": sloped_4h(fixture(), 1),
+            "DOWN": falling_4h(fixture()),
+        }
+        rest = MultiRest(windows)
+        streams, sink = MultiStreams(), RedisSink()
+        strategy = TripleScreenStrategy({**SCREEN_PARAMS, "ws_top_n": 1})
+        await strategy.on_start(
+            multi_services(rest, streams, sink, ["STRONG", "WEAK", "DOWN"])
+        )
+        try:
+            assert strategy._active_symbols == {"STRONG"}
+            assert ("STRONG", "4h") in streams.subscribed
+            assert not any(sym == "WEAK" for sym, _ in streams.subscribed)
+            assert not any(sym == "DOWN" for sym, _ in streams.subscribed)
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
+def test_open_position_retained_past_failed_rescreen() -> None:
+    async def run() -> None:
+        windows = {"BTCUSDT": fixture(), "ETHUSDT": falling_4h(fixture())}
+        rest = MultiRest(windows)
+        streams, sink = MultiStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        await strategy.on_start(
+            multi_services(rest, streams, sink, ["BTCUSDT", "ETHUSDT"])
+        )
+        try:
+            assert strategy._active_symbols == {"BTCUSDT"}
+            strategy.mark_position_open("BTCUSDT")
+            # BTCUSDT now fails the screen; it must still be kept.
+            rest.windows["BTCUSDT"] = falling_4h(fixture())
+            selected = await strategy._screen_universe()
+            assert selected == {"BTCUSDT"}
+            await strategy._apply_selection(selected)
+            assert strategy._active_symbols == {"BTCUSDT"}
+            assert ("BTCUSDT", "4h") not in streams.unsubscribed
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
+def test_rescreen_adds_and_removes_symbols() -> None:
+    async def run() -> None:
+        windows = {"BTCUSDT": fixture(), "ETHUSDT": falling_4h(fixture())}
+        rest = MultiRest(windows)
+        streams, sink = MultiStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        await strategy.on_start(
+            multi_services(rest, streams, sink, ["BTCUSDT", "ETHUSDT"])
+        )
+        try:
+            assert strategy._active_symbols == {"BTCUSDT"}
+            assert strategy._candles["BTCUSDT"]
+            # Flip: BTCUSDT now falls, ETHUSDT now rises.
+            rest.windows["BTCUSDT"] = falling_4h(fixture())
+            rest.windows["ETHUSDT"] = fixture()
+            selected = await strategy._screen_universe()
+            assert selected == {"ETHUSDT"}
+            await strategy._apply_selection(selected)
+            assert strategy._active_symbols == {"ETHUSDT"}
+            assert "BTCUSDT" not in strategy._candles
+            assert ("BTCUSDT", "4h") in streams.unsubscribed
+            assert ("ETHUSDT", "4h") in streams.subscribed
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
+def test_next_rescreen_ms_is_tide_boundary_plus_buffer() -> None:
+    strategy = TripleScreenStrategy(PARAMS)
+    step = interval_ms("4h")
+    now_ms = step * 10 + 1_000
+    assert strategy._next_rescreen_ms(now_ms) == step * 11 + 5_000
+    # Exactly on a boundary still waits for the *next* one, not this instant.
+    assert strategy._next_rescreen_ms(step * 10) == step * 11 + 5_000

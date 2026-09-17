@@ -267,6 +267,7 @@ def test_streams_close_partial_sdk_connection() -> None:
         streams._handles = [
             Mock(unsubscribe=AsyncMock(side_effect=RuntimeError("unsubscribe")))
         ]
+        streams._kline_handles = {}
         streams._client = Mock(close_connection=AsyncMock())
         await streams.stop()
         streams._client.close_connection.assert_awaited_once_with(close_session=True)

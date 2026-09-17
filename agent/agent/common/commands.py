@@ -60,6 +60,22 @@ from agent.symbols import (
 
 logger = logging.getLogger(__name__)
 
+# `start` scales with the symbol count (stage-1 REST screening is O(symbols);
+# stage-2 WS wiring is bounded by the strategy's own cap, not by this list) —
+# unlike the other commands below, a flat timeout does not fit it. Kept as
+# plain module constants (not `settings`) so tests can monkeypatch them the
+# same way `settings.COMMAND_IO_TIMEOUT_SECONDS` is patched elsewhere.
+START_TIMEOUT_BASE_SECONDS = 20.0
+START_TIMEOUT_PER_SYMBOL_SECONDS = 0.5
+START_TIMEOUT_MAX_SECONDS = 100.0  # stays under the frontend's 120s poll budget
+
+
+def _start_timeout_seconds(symbol_count: int) -> float:
+    return min(
+        START_TIMEOUT_BASE_SECONDS + START_TIMEOUT_PER_SYMBOL_SECONDS * symbol_count,
+        START_TIMEOUT_MAX_SECONDS,
+    )
+
 
 def _as_params(value: Any) -> dict[str, Any]:
     """Coerce a command payload slice into a ``str -> Any`` params dict."""
@@ -284,6 +300,7 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
         symbols,
         sorted(params),
     )
+    timeout = _start_timeout_seconds(len(symbols))
     try:
         await asyncio.wait_for(
             ctx.engine.start_run(
@@ -292,14 +309,14 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
                 symbols=symbols,
                 params=params,
             ),
-            timeout=settings.COMMAND_IO_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
     except ValueError as exc:
         logger.warning("start rejected: %s", exc)
         await ctx.report(ok=False, message=str(exc))
         return
     except TimeoutError:
-        message = f"start timed out after {settings.COMMAND_IO_TIMEOUT_SECONDS}s"
+        message = f"start timed out after {timeout}s"
         logger.warning(message)
         await ctx.report(ok=False, message=message, timed_out=True)
         return

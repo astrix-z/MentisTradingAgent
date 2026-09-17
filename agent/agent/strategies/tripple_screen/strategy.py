@@ -26,6 +26,10 @@ from agent.strategies.tripple_screen.settings import TripleScreenSettings, inter
 
 logger = logging.getLogger(__name__)
 
+# Grace period after a tide-interval boundary before re-screening, so the
+# exchange's own bar (and its REST availability) has had time to close.
+_RESCREEN_BUFFER_MS = 5_000
+
 
 @strategy("tripple_screen")
 class TripleScreenStrategy(Strategy):
@@ -51,6 +55,10 @@ class TripleScreenStrategy(Strategy):
         self._evaluated: dict[str, int] = {}
         self._wake = asyncio.Event()
         self._active = False
+        # Stage 1: the full symbol list handed to on_start, re-screened every
+        # tide-interval boundary. Stage 2: the subset currently wired/bootstrapped.
+        self._universe: list[str] = []
+        self._active_symbols: set[str] = set()
 
     @property
     def settings(self) -> TripleScreenSettings:
@@ -68,30 +76,168 @@ class TripleScreenStrategy(Strategy):
             raise RuntimeError("strategy is already started")
         self._services = services
         self._active = True
+        self._universe = list(dict.fromkeys(services.symbols))
         try:
-            # Subscribe first: callbacks buffer closes while REST is in flight.
-            await self._wire_streams(services)
-            await self._bootstrap(services)
+            # Stage 1: REST-only screen of the full universe, no streams yet.
+            selected = await self._screen_universe()
+            logger.info(
+                "tripple_screen initial screening universe=%s selected=%s",
+                len(self._universe),
+                sorted(selected),
+            )
+            # Stage 2: only the screened subset gets wired/bootstrapped.
+            await self._apply_selection(selected)
             self._spawn(self._run())
+            self._spawn(self._rescreen_loop())
         except BaseException:
             await self.on_stop()
             raise
 
-    async def _wire_streams(self, services: StrategyServices) -> None:
-        for symbol in services.symbols:
+    async def _wire_streams(self, symbols: list[str]) -> None:
+        for symbol in symbols:
             for interval in self._intervals():
-                await services.streams.subscribe_kline(
+                await self.services.streams.subscribe_kline(
                     symbol=symbol,
                     interval=interval,
                     callback=self._kline_callback(symbol, interval),
                 )
 
-    async def _bootstrap(self, services: StrategyServices) -> None:
+    async def _bootstrap(self, symbols: list[str]) -> None:
         cutoff = int(datetime.now(UTC).timestamp() * 1000) - 1
-        for symbol in services.symbols:
+        for symbol in symbols:
             for interval in self._intervals():
                 candles = await self._load_window(symbol, interval, cutoff)
                 self._merge(symbol, interval, candles)
+
+    async def _screen_universe(self) -> set[str]:
+        """Stage 1: REST-only EMA13/EMA34 rising filter over the full universe.
+
+        Ranks qualifiers by relative EMA-spread (trend strength) so the cap
+        (``ws_top_n``) admits the strongest trends first; a symbol with an open
+        position is always kept regardless of rank, per spec.
+        """
+        settings = self.settings
+        _, mid_period, slow_period = settings.ema_tide_periods
+        semaphore = asyncio.Semaphore(settings.rest_concurrency)
+        cutoff = int(datetime.now(UTC).timestamp() * 1000) - 1
+
+        async def screen_one(symbol: str) -> tuple[str, Decimal] | None:
+            # A REST failure here propagates (via gather) exactly like a
+            # bootstrap failure already did before screening existed: on_start
+            # aborts rather than silently starting with zero active symbols.
+            async with semaphore:
+                candles = await self._load_window(
+                    symbol, settings.tide_interval, cutoff
+                )
+            if len(candles) < slow_period + 1:
+                return None
+            closes = [c.close for c in candles]
+            ema_mid = ema_series(closes, mid_period)
+            ema_slow = ema_series(closes, slow_period)
+            mid_prev, mid_now = ema_mid[-2], ema_mid[-1]
+            slow_prev, slow_now = ema_slow[-2], ema_slow[-1]
+            if (
+                mid_prev is None
+                or mid_now is None
+                or slow_prev is None
+                or slow_now is None
+            ):
+                return None
+            rising = mid_now > mid_prev and slow_now > slow_prev
+            logger.debug(
+                "tripple_screen screen symbol=%s rising=%s ema_mid=%s ema_slow=%s",
+                symbol,
+                rising,
+                {"previous": mid_prev, "current": mid_now},
+                {"previous": slow_prev, "current": slow_now},
+            )
+            if not rising or slow_now == 0:
+                return None
+            return symbol, (mid_now - slow_now) / slow_now
+
+        results = await asyncio.gather(
+            *(screen_one(symbol) for symbol in self._universe)
+        )
+        qualifiers = sorted(
+            (item for item in results if item is not None),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        keep_for_position = {s for s in self._active_symbols if s in self._positions}
+        budget = max(0, settings.ws_top_n - len(keep_for_position))
+        admitted_new = [
+            symbol for symbol, _ in qualifiers if symbol not in keep_for_position
+        ][:budget]
+        selected = keep_for_position | set(admitted_new)
+        logger.debug(
+            "tripple_screen screening cycle universe=%s qualifiers=%s "
+            "kept_for_position=%s admitted=%s selected=%s",
+            len(self._universe),
+            len(qualifiers),
+            sorted(keep_for_position),
+            sorted(admitted_new),
+            sorted(selected),
+        )
+        return selected
+
+    async def _apply_selection(self, selected: set[str]) -> None:
+        """Stage 2: wire newly-admitted symbols, unwire dropped ones."""
+        to_add = sorted(selected - self._active_symbols)
+        to_remove = sorted(self._active_symbols - selected)
+        if to_add:
+            # Subscribe first: callbacks buffer closes while REST is in flight.
+            await self._wire_streams(to_add)
+            await self._bootstrap(to_add)
+        for symbol in to_remove:
+            await self._unwire_symbol(symbol)
+        self._active_symbols = selected
+        if to_add or to_remove:
+            logger.info(
+                "tripple_screen active symbols updated added=%s removed=%s total=%s",
+                to_add,
+                to_remove,
+                len(selected),
+            )
+
+    async def _unwire_symbol(self, symbol: str) -> None:
+        for interval in self._intervals():
+            try:
+                await self.services.streams.unsubscribe_kline(
+                    symbol=symbol, interval=interval
+                )
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                logger.debug(
+                    "tripple_screen unsubscribe failed symbol=%s interval=%s",
+                    symbol,
+                    interval,
+                    exc_info=True,
+                )
+        self._candles.pop(symbol, None)
+        self._last_price.pop(symbol, None)
+        self._pending.pop(symbol, None)
+        self._evaluated.pop(symbol, None)
+        self._cooldown_until.pop(symbol, None)
+        prefix = f"{symbol}:"
+        self._consumed_epochs.difference_update(
+            {epoch for epoch in self._consumed_epochs if epoch.startswith(prefix)}
+        )
+        for epoch in [e for e in self._outbox if e.startswith(prefix)]:
+            self._outbox.pop(epoch, None)
+
+    def _next_rescreen_ms(self, now_ms: int) -> int:
+        """First instant after ``now_ms`` at which the next tide bar has
+        closed, plus a small buffer for the exchange's own bar to settle."""
+        step = interval_ms(self.settings.tide_interval)
+        return (now_ms // step + 1) * step + _RESCREEN_BUFFER_MS
+
+    async def _rescreen_loop(self) -> None:
+        """Re-run stage 1 over the full universe at every tide-interval close."""
+        while True:
+            now_ms = int(datetime.now(UTC).timestamp() * 1000)
+            next_ms = self._next_rescreen_ms(now_ms)
+            await asyncio.sleep(max(0.0, (next_ms - now_ms) / 1000))
+            selected = await self._screen_universe()
+            await self._apply_selection(selected)
 
     async def _load_window(
         self, symbol: str, interval: str, cutoff: int
@@ -163,6 +309,8 @@ class TripleScreenStrategy(Strategy):
         self._pending.clear()
         self._outbox.clear()
         self._wake.clear()
+        self._universe = []
+        self._active_symbols = set()
         # Streams belong to Engine; late callbacks are gated by _active.
 
     def mark_position_open(self, symbol: str) -> None:

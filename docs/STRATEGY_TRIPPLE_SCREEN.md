@@ -1,9 +1,28 @@
-# Стратегия «Три Экрана» (Triple Screen) — Strategy Spec v1.0
+# Стратегия «Три Экрана» (Triple Screen) — Strategy Spec v1.1
 
 - **Owner decision:** `OWNER-STRATEGY-02`
-- **Статус:** утверждено владельцем
+- **Статус:** утверждено владельцем; §1.2/§9/§10 пересмотрены реализацией
+  2026-09-17 (см. «Ревизия v1.1» ниже) — требует owner-review при следующем
+  формальном пересмотре.
 - **История:** Design Draft v0.1
 - **Продукт:** Binance Spot, **long-only**
+
+### Ревизия v1.1 (2026-09-17)
+
+Пункты §1.2/§9/§10 v1.0 описывали promotion-фильтр по одной EMA(34)-slope и
+ранжирование WS-set по 24h quote volume. Фактическая реализация (`agent/agent/
+strategies/tripple_screen/strategy.py`, метод `_screen_universe`) была
+согласована и построена иначе:
+
+- **Slope-filter** — обе EMA (13 **и** 34), не только EMA(34).
+- **Ранжирование WS-set** — по силе тренда (относительный спред
+  EMA(13)/EMA(34)), не по 24h quote volume. Поле `volume_window` осталось
+  зарезервированным и не используется.
+- **`ws_top_n` default** — 30, не 50.
+- Символ с открытой позицией **исключён из ранжирования и cap**: остаётся в
+  WS-set до закрытия позиции, даже если перестал проходить slope-filter.
+
+Секции ниже отражают эту (v1.1) версию.
 
 Документ описывает точный алгоритм стратегии для исполнителя. Разделы 1–8
 разделы 9–13 —
@@ -44,13 +63,13 @@
 
 ```mermaid
 flowchart TD
-    A[Eligible universe] --> B[REST H4-скан всех eligible на каждом H4-close, семафор 3–5]
-    B --> C{EMA34-slope: EMA34 H4 поднимается}
-    C -- нет --> D[Вне анализа, WS не поддерживается]
-    C -- да --> E[Promotion list]
-    E --> F{Top-N по 24h quote volume snapshot}
-    F -- нет --> G[Ожидание, пересмотр на следующем H4-close]
-    F -- да --> H[WS-set: bootstrap H1+M15, подписка WS H4/H1/M15]
+    A[Eligible universe] --> B[REST H4-скан всех eligible на старте и каждом H4-close, семафор rest_concurrency 3–5]
+    B --> C{EMA13&EMA34-slope: обе EMA H4 растут}
+    C -- нет и нет открытой позиции --> D[Вне анализа, WS не поддерживается]
+    C -- да --> E[Qualifiers]
+    E --> F{Top-N по силе тренда: спред EMA13/EMA34}
+    F -- нет и нет открытой позиции --> G[Ожидание, пересмотр на следующем H4-close]
+    F -- да, или открыта позиция --> H[WS-set: bootstrap H1+M15, подписка WS H4/H1/M15]
     H --> I[Полный Screen 1 на каждом H4-close]
     I --> J{BullishTide: 5 условий AND}
     J -- нет --> K[Не кандидат: BUY/HOLD не эмитируются до следующего H4-close]
@@ -61,18 +80,20 @@ flowchart TD
 
 | Стадия | Триггер пересмотра | Действие |
 |---|---|---|
-| 1. REST-скан | каждый H4-close | H4-снапшоты закрытых свечей для **всех** eligible, семафор 3–5 одновременных загрузок (конфиг, default 3) |
-| 2. Slope-filter | каждый H4-close | `EMA(34)[1] > EMA(34)[2]` (строго) → promotion list |
-| 3. Top-N / WS-set | каждый H4-close | ранжирование promotion list по 24h quote volume snapshot (desc, tie-break: symbol asc); top-N (default 50) → WS-set |
+| 1. REST-скан | на старте стратегии и на каждом H4-close | H4-снапшоты закрытых свечей для **всех** символов в исходном списке (universe), семафор `rest_concurrency` одновременных загрузок (конфиг, default 3, допустимо 3–5) |
+| 2. Slope-filter | на старте и каждый H4-close | `EMA(13)[1] > EMA(13)[2]` **И** `EMA(34)[1] > EMA(34)[2]` (строго, оба условия) → qualifiers |
+| 3. Top-N / WS-set | на старте и каждый H4-close | ранжирование qualifiers по силе тренда — относительный спред `(EMA(13)[1] − EMA(34)[1]) / EMA(34)[1]` (desc); top-N (`ws_top_n`, default 30) → WS-set. Символ с открытой позицией сохраняется в WS-set вне зависимости от ранга/прохождения slope-filter |
 | 4. Экран 1 | каждый H4-close | для WS-set: BullishTide = AND 5 условий (§4.2) |
 | 5. Экраны 2–3 | каждый M15-close | только для BullishTide-символов: PullbackUp + M15-триггер → BUY / HOLD |
 
 Правила жизненного цикла WS-set:
 
-- Promotion в WS-set → REST bootstrap H1 и M15 (окно 1000, `OWNER-KLINE-01`) →
+- Promotion в WS-set → REST bootstrap H4, H1 и M15 (окно 1000, `OWNER-KLINE-01`) →
   подписка WS (H4, H1, M15). Динамический add/remove без рестарта — `MARKET-05`.
 - Symbol выбывает из WS-set на следующем H4-close, если slope не прошёл или
-  символ вне top-N → отписка WS.
+  символ вне top-N по силе тренда — **если и только если** по нему нет открытой
+  позиции; иначе остаётся в WS-set до закрытия позиции, затем выбывает на
+  следующем пересмотре по обычным правилам.
 - Символы вне WS-set не участвуют в анализе, WS для них не поддерживается.
 
 ---
@@ -315,9 +336,9 @@ evaluation event не создаёт duplicate signal (`STRATEGY-03`).
 
 | Стадия | Данные | Ограничение |
 |---|---|---|
-| REST-скан | H4 закрытые свечи всех eligible, каждый H4-close | семафор 3–5 одновременных загрузок (конфиг, default 3) |
-| Promotion | bootstrap H1 + M15 (окно 1000) при входе в WS-set | через тот же семафор |
-| WS-set | подписки WS H4/H1/M15 | только top-N по 24h quote volume среди promoted; **safety cap = top-N** (default 50) |
+| REST-скан | H4 закрытые свечи всех символов из universe, на старте и каждый H4-close | семафор `rest_concurrency` одновременных загрузок (конфиг, default 3, допустимо 3–5) |
+| Promotion | bootstrap H4 + H1 + M15 (окно 1000) при входе в WS-set | через `_load_window`, без семафора (последовательно по интервалам) |
+| WS-set | подписки WS H4/H1/M15 | только top-N по силе тренда (спред EMA13/EMA34) среди qualifiers; **safety cap = `ws_top_n`** (default 30); символ с открытой позицией — вне cap |
 | Кандидаты | оценка Э2/Э3 на каждом M15-close | только BullishTide-символы |
 | Открытые позиции | live ticker / User Data Stream | непрерывно |
 
@@ -343,9 +364,9 @@ evaluation event не создаёт duplicate signal (`STRATEGY-03`).
 | `tp_pct` | `10%` | `fill × 1.10` |
 | `cooldown_minutes` | `60` | после любого закрытия, от exit fill; персистентный |
 | `signal_validity_minutes` | `15` | `valid_until`; проверка перед отправкой ордера |
-| `rest_concurrency` | `3` | семафор REST-загрузок (допустимо 3–5) |
-| `ws_top_n` | `50` | safety cap числа WS-подписок; ранжирование по 24h quote volume |
-| `volume_window` | `24h` | snapshot quote volume на каждом H4-close |
+| `rest_concurrency` | `3` | семафор REST-загрузок стадии REST-скана (допустимо 3–5) |
+| `ws_top_n` | `30` | safety cap числа символов в WS-set; ранжирование — по силе тренда (относительный спред EMA13/EMA34), не по объёму |
+| `volume_window` | `24h` | зарезервировано; не используется текущим ранжированием (ранжирование — по тренду, см. `ws_top_n`) |
 | `kline_window` | `1000` | `OWNER-KLINE-01` (engine-level, не стратегия) |
 | max позиций на символ | `1` | инвариант стратегии (не конфиг) |
 

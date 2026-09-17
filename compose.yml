@@ -133,6 +133,7 @@ services:
       BINANCE_TESTNET_API_KEY: ${BINANCE_TESTNET_API_KEY:-}
       BINANCE_TESTNET_API_SECRET: ${BINANCE_TESTNET_API_SECRET:-}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     # NOTE: no public ports / Traefik labels on purpose.
     # The UI must reach the agent only through the backend.
 
