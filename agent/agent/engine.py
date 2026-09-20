@@ -32,6 +32,10 @@ from agent.exchange import (
 from agent.strategies import Signal, Strategy, StrategyServices, build_strategy
 
 logger = logging.getLogger(__name__)
+# Dedicated, durable record of ENTRY/EXIT only — configured with its own file
+# handler in agent.main._configure_signal_log(); still propagates to the root
+# handler too, so nothing disappears from the normal console/docker log.
+signal_logger = logging.getLogger("agent.signals")
 
 # Redis keys/streams shared with the backend (keep in sync with
 # backend/app/api/routes/trading.py).
@@ -258,6 +262,25 @@ class Engine:
             signal.reason or signal.exit_reason or "-",
             signal.epoch_id or "-",
         )
+        if signal.type in ("ENTRY", "EXIT"):
+            # Logged before the Redis publish: this record must not depend on
+            # that call succeeding (see the RedisError path just below).
+            signal_logger.info(
+                "%s %s network=%s signal_id=%s epoch=%s reason=%s "
+                "entry_ref=%s swing_low_ref=%s tp_rule=%s valid_until=%s "
+                "exit_reason=%s",
+                signal.type,
+                signal.symbol,
+                self._network,
+                signal.signal_id,
+                signal.epoch_id or "-",
+                signal.reason or "-",
+                signal.entry_ref,
+                signal.swing_low_ref,
+                signal.tp_rule,
+                signal.valid_until,
+                signal.exit_reason or "-",
+            )
         await self._publish_event("signal", signal)
 
     async def _publish_event(self, kind: str, signal: Signal) -> None:

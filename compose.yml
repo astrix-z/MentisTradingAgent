@@ -134,8 +134,13 @@ services:
       BINANCE_TESTNET_API_SECRET: ${BINANCE_TESTNET_API_SECRET:-}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # Durable across a container recreate/rebuild — ENTRY/EXIT signals can be
+    # rare, so they must not depend on the container's own ephemeral disk.
+    volumes:
+      - agent-signal-log:/app/agent/logs
     # NOTE: no public ports / Traefik labels on purpose.
     # The UI must reach the agent only through the backend.
 
 volumes:
   app-db-data:
+  agent-signal-log:

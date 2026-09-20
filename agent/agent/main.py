@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
 import signal
+from pathlib import Path
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, ResponseError
@@ -366,11 +368,31 @@ async def run() -> None:
         logger.info("agent stopped")
 
 
+def _configure_signal_log() -> None:
+    """Give ENTRY/EXIT trading signals their own durable, on-disk record.
+
+    Signals can be rare — waiting on the main log stream's rotation/retention
+    to still have one days later is not reliable. This handler is additional
+    (the "agent.signals" logger still propagates to the root handler too), so
+    every signal still shows up in the normal console/docker log as before.
+    """
+    path = Path(settings.SIGNAL_LOG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=10_000_000, backupCount=5
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    signal_logger = logging.getLogger("agent.signals")
+    signal_logger.addHandler(handler)
+    signal_logger.setLevel(logging.INFO)
+
+
 def main() -> None:
     logging.basicConfig(
         level=getattr(logging, settings.LOG_LEVEL),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    _configure_signal_log()
     try:
         asyncio.run(run())
     except KeyboardInterrupt:

@@ -1,5 +1,6 @@
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import EmailStr
 from sqlalchemy import DateTime
@@ -110,6 +111,45 @@ class ItemPublic(ItemBase):
 class ItemsPublic(SQLModel):
     data: list[ItemPublic]
     count: int
+
+
+# A "position" opened by a strategy ENTRY signal (D-SIGNAL-ONLY: the strategy
+# never places a real order). Populated by app.core.signal_listener as ENTRY
+# signals arrive on Redis; closed lazily on read once the last known price has
+# actually crossed its stop or take level (see GET /trading/positions/).
+# Plain string status (not a Python/SQL enum type) to match this codebase's
+# existing convention (e.g. agent's ``SignalType``/``AgentState`` are
+# ``Literal[...]``, not ``enum.Enum``) and to keep the column a plain VARCHAR.
+SignalPositionStatus = Literal["open", "hit_take", "hit_stop"]
+
+
+class SignalPosition(SQLModel, table=True):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    signal_id: str = Field(unique=True, index=True)
+    symbol: str = Field(index=True)
+    network: str
+    epoch_id: str
+    # Decimal-precise string amounts (never binary float), matching how the
+    # agent/backend already carry these values everywhere else.
+    entry_ref: str
+    swing_low_ref: str  # stop
+    tp_rule: str
+    take_ref: str  # entry_ref * multiplier parsed from tp_rule, cached once
+    emitted_at: datetime = Field(sa_type=DateTime(timezone=True))  # type: ignore
+    valid_until: datetime | None = Field(
+        default=None,
+        sa_type=DateTime(timezone=True),  # type: ignore
+    )
+    status: str = "open"
+    closed_at: datetime | None = Field(
+        default=None,
+        sa_type=DateTime(timezone=True),  # type: ignore
+    )
+    closed_price: str | None = None
+    created_at: datetime = Field(
+        default_factory=get_datetime_utc,
+        sa_type=DateTime(timezone=True),  # type: ignore
+    )
 
 
 # Generic message

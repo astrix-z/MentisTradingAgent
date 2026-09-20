@@ -303,6 +303,16 @@ export type NewPassword = {
 };
 
 /**
+ * PositionsList
+ */
+export type PositionsList = {
+    /**
+     * Positions
+     */
+    positions: Array<SignalPositionPublic>;
+};
+
+/**
  * PrivateUserCreate
  */
 export type PrivateUserCreate = {
@@ -364,6 +374,63 @@ export type RuntimeSnapshot = {
      * Revision
      */
     revision?: number;
+};
+
+/**
+ * SignalPositionPublic
+ *
+ * One ENTRY-signal-derived virtual position (D-SIGNAL-ONLY: the strategy
+ * never places a real order, so this reflects "if this signal had been
+ * acted on", not an actual exchange position). ``status`` is evaluated
+ * lazily on each read against whatever ``agent:symbols`` last published —
+ * not a continuous monitor — so it can lag the real market by up to the
+ * symbol-universe refresh interval (~5 min).
+ */
+export type SignalPositionPublic = {
+    /**
+     * Symbol
+     */
+    symbol: string;
+    /**
+     * Network
+     */
+    network: string;
+    /**
+     * Entry Ref
+     */
+    entry_ref: string;
+    /**
+     * Stop Ref
+     */
+    stop_ref: string;
+    /**
+     * Take Ref
+     */
+    take_ref: string;
+    /**
+     * Current Price
+     */
+    current_price: string | null;
+    /**
+     * Pnl Pct
+     */
+    pnl_pct: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Emitted At
+     */
+    emitted_at: string;
+    /**
+     * Closed At
+     */
+    closed_at: string | null;
+    /**
+     * Closed Price
+     */
+    closed_price: string | null;
 };
 
 /**
@@ -1433,6 +1500,22 @@ export type tradingSetWorkingSymbolsResponses = {
 };
 
 export type tradingSetWorkingSymbolsResponse = tradingSetWorkingSymbolsResponses[keyof tradingSetWorkingSymbolsResponses];
+
+export type tradingListPositionsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/positions/';
+};
+
+export type tradingListPositionsResponses = {
+    /**
+     * Successful Response
+     */
+    200: PositionsList;
+};
+
+export type tradingListPositionsResponse = tradingListPositionsResponses[keyof tradingListPositionsResponses];
 
 export type tradingIssueCommandData = {
     body: CommandRequest;

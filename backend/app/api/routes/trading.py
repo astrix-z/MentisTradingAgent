@@ -50,13 +50,15 @@ import logging
 import re
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal, Self
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from redis.exceptions import RedisError
+from sqlmodel import col, select
 
-from app.api.deps import CurrentUser, get_current_active_superuser
+from app.api.deps import CurrentUser, SessionDep, get_current_active_superuser
 from app.core.redis_client import get_redis
 from app.core.strategy_catalog import (
     CatalogError,
@@ -65,7 +67,7 @@ from app.core.strategy_catalog import (
     json_safe_errors,
     read_catalog,
 )
-from app.models import User
+from app.models import SignalPosition, User
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +366,31 @@ class BalanceSnapshot(BaseModel):
     assets: list[BalanceAsset]
 
 
+class SignalPositionPublic(BaseModel):
+    """One ENTRY-signal-derived virtual position (D-SIGNAL-ONLY: the strategy
+    never places a real order, so this reflects "if this signal had been
+    acted on", not an actual exchange position). ``status`` is evaluated
+    lazily on each read against whatever ``agent:symbols`` last published —
+    not a continuous monitor — so it can lag the real market by up to the
+    symbol-universe refresh interval (~5 min)."""
+
+    symbol: str
+    network: str
+    entry_ref: str
+    stop_ref: str
+    take_ref: str
+    current_price: str | None
+    pnl_pct: str | None
+    status: str
+    emitted_at: datetime
+    closed_at: datetime | None
+    closed_price: str | None
+
+
+class PositionsList(BaseModel):
+    positions: list[SignalPositionPublic]
+
+
 class CommandResult(BaseModel):
     """Execution outcome produced by the agent, not an acceptance receipt."""
 
@@ -549,9 +576,7 @@ async def _compiled_strategy(name: str) -> CompiledStrategy:
     return compiled
 
 
-async def _enforce_strategy_params(
-    strategy: str, params: dict[str, Any]
-) -> None:
+async def _enforce_strategy_params(strategy: str, params: dict[str, Any]) -> None:
     """Reject an invalid Start here, so nothing invalid reaches Redis.
 
     The rules enforced are the agent's own published ones (schema + cross-field
@@ -643,6 +668,86 @@ async def list_working_symbols(_: SuperUserDep) -> WorkingSymbols:
     return await _get_working_symbols()
 
 
+@router.get("/positions/", response_model=PositionsList)
+async def list_positions(session: SessionDep, _: SuperUserDep) -> PositionsList:
+    """ENTRY-signal-derived virtual positions (see `SignalPositionPublic`).
+
+    Recorded by ``app.core.signal_listener`` as ENTRY signals arrive on
+    ``agent:events``; a still-``open`` row is closed here, lazily, the first
+    time a read observes the last known price having crossed its stop or take
+    level — this endpoint is the only place that evaluates/persists that
+    transition, so "closed" always reflects what a viewer actually saw.
+    """
+    rows = session.exec(
+        select(SignalPosition).order_by(col(SignalPosition.emitted_at).desc())
+    ).all()
+    prices: dict[str, str] = {}
+    if any(row.status == "open" for row in rows):
+        universe = await _get_working_symbols()
+        prices = {
+            entry.symbol: entry.last_price
+            for entry in universe.symbols
+            if entry.last_price is not None
+        }
+    positions = [_position_public(row, prices, session) for row in rows]
+    session.commit()
+    return PositionsList(positions=positions)
+
+
+def _cross_status(current: str, take_ref: str, stop_ref: str) -> str | None:
+    """Long-only: ``take_ref > entry > stop_ref`` always holds (the
+    strategy's own invariant), so a simple threshold check suffices."""
+    try:
+        current_dec, take_dec, stop_dec = (
+            Decimal(current),
+            Decimal(take_ref),
+            Decimal(stop_ref),
+        )
+    except InvalidOperation:
+        return None
+    if current_dec >= take_dec:
+        return "hit_take"
+    if current_dec <= stop_dec:
+        return "hit_stop"
+    return None
+
+
+def _pnl_pct(reference: str | None, entry_ref: str) -> str | None:
+    if reference is None:
+        return None
+    try:
+        return str((Decimal(reference) - Decimal(entry_ref)) / Decimal(entry_ref) * 100)
+    except InvalidOperation, ZeroDivisionError:
+        return None
+
+
+def _position_public(
+    row: SignalPosition, prices: dict[str, str], session: SessionDep
+) -> SignalPositionPublic:
+    current = prices.get(row.symbol)
+    if row.status == "open" and current is not None:
+        crossed = _cross_status(current, row.take_ref, row.swing_low_ref)
+        if crossed is not None:
+            row.status = crossed
+            row.closed_at = datetime.now(UTC)
+            row.closed_price = current
+            session.add(row)
+    reference = row.closed_price if row.closed_price is not None else current
+    return SignalPositionPublic(
+        symbol=row.symbol,
+        network=row.network,
+        entry_ref=row.entry_ref,
+        stop_ref=row.swing_low_ref,
+        take_ref=row.take_ref,
+        current_price=current,
+        pnl_pct=_pnl_pct(reference, row.entry_ref),
+        status=row.status,
+        emitted_at=row.emitted_at,
+        closed_at=row.closed_at,
+        closed_price=row.closed_price,
+    )
+
+
 @router.post("/symbols/", status_code=202, response_model=CommandEnvelope)
 async def set_working_symbols(
     payload: SymbolsPayload, _: SuperUserDep
@@ -663,9 +768,7 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
         try:
             parsed = StartPayload(**request.payload)
         except ValidationError as exc:
-            raise HTTPException(
-                status_code=422, detail=json_safe_errors(exc)
-            ) from exc
+            raise HTTPException(status_code=422, detail=json_safe_errors(exc)) from exc
         await _enforce_strategy_params(parsed.strategy, parsed.params)
         return await _apply_command("start", _start_command_payload(parsed))
     if request.type == "balance":
@@ -674,9 +777,7 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
         try:
             symbols = SymbolsPayload(**request.payload)
         except ValidationError as exc:
-            raise HTTPException(
-                status_code=422, detail=json_safe_errors(exc)
-            ) from exc
+            raise HTTPException(status_code=422, detail=json_safe_errors(exc)) from exc
         return await _apply_command("symbols", symbols.model_dump())
     if request.type == "prices":
         return await _apply_command("prices", {})

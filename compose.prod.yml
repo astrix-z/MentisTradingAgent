@@ -1,0 +1,46 @@
+# Live-test / boевой стенд на выделенном хосте (192.168.55.40, "docker-host"),
+# рядом с контейнерами других проектов (plan-oplat, n8n, nginx-proxy-manager,
+# postgres-shared). Тот же паттерн, что у plan-oplat на этом хосте:
+#
+#   - никакого Traefik и никакой публикации наружу: backend слушает только
+#     ${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8010} на хосте — доступ через
+#     SSH-туннель (`ssh -L 8010:localhost:8010 jb@192.168.55.40`) или, если
+#     решите расширить, из локальной сети (WEB_BIND=0.0.0.0 в .env.prod);
+#   - `proxy` (Traefik) и `adminer` остаются в профиле `extras` из compose.yml
+#     и не поднимаются по умолчанию — adminer доступен через тот же профиль,
+#     но тоже только на loopback;
+#   - db/redis без опубликованных портов — доступны только внутри стека
+#     (5432 на хосте и так занят чужим postgres-shared);
+#   - миграции и создание agent-БД выполняются автоматически при старте
+#     контейнеров (prestart.sh / ensure_settings_database), отдельный шаг не
+#     нужен.
+#
+# Запуск (на сервере, из ~/apps/mentis-trading-agent):
+#   docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d
+#
+# Обычный деплой с машины разработки: ./scripts/deploy.sh
+# Секреты — в .env.prod рядом с этим файлом на сервере (в git не попадает).
+
+services:
+
+  db:
+    restart: always
+
+  redis:
+    restart: always
+
+  backend:
+    restart: always
+    environment:
+      FRONTEND_HOST: http://${WEB_HOST:-192.168.55.40}:${WEB_PORT:-8010}
+    ports:
+      # loopback по умолчанию: снаружи ничего не публикуем, доступ по SSH-туннелю.
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8010}:8000"
+
+  agent:
+    restart: always
+
+  adminer:
+    restart: always
+    ports:
+      - "127.0.0.1:${ADMINER_PORT:-8011}:8080"

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -17,7 +18,7 @@ from agent.strategies import Signal
 
 def setup_engine(monkeypatch: pytest.MonkeyPatch) -> tuple[Engine, Any, Any, Any]:
     redis = Mock(set=AsyncMock(), publish=AsyncMock())
-    strategy = Mock(on_start=AsyncMock(), on_stop=AsyncMock())
+    strategy = Mock(on_start=AsyncMock(), on_stop=AsyncMock(), active_symbols=None)
     streams = Mock(start=AsyncMock(), stop=AsyncMock())
     monkeypatch.setattr("agent.engine.build_strategy", Mock(return_value=strategy))
     monkeypatch.setattr("agent.engine.ExchangeRest.connect", Mock(return_value=Mock()))
@@ -243,6 +244,39 @@ def test_full_signal_event_and_redis_failure() -> None:
         assert payload["entry_ref"] == "123.000000000000000001"
         assert payload["provenance"]["nested"][0] == "0.100"
         assert payload["signal_id"] == signal.signal_id
+
+    asyncio.run(scenario())
+
+
+def test_signal_log_records_entry_and_exit_but_not_hold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ENTRY/EXIT are rare and must land in the dedicated signal log even
+    when nothing is watching the console; HOLD (near-constant) must not."""
+
+    async def scenario() -> None:
+        engine = Engine(Mock(publish=AsyncMock()))
+        now = datetime.now(UTC)
+
+        def make(kind: str) -> Signal:
+            return Signal(
+                type=cast(Any, kind),
+                symbol="BTCUSDT",
+                emitted_at=now,
+                reason="entry" if kind == "ENTRY" else "no_pullback",
+                exit_reason="tp" if kind == "EXIT" else None,
+                epoch_id="epoch",
+            )
+
+        with caplog.at_level(logging.INFO, logger="agent.signals"):
+            await engine._on_signal(make("ENTRY"))
+            await engine._on_signal(make("HOLD"))
+            await engine._on_signal(make("EXIT"))
+
+        records = [r for r in caplog.records if r.name == "agent.signals"]
+        assert len(records) == 2
+        assert records[0].getMessage().startswith("ENTRY BTCUSDT ")
+        assert records[1].getMessage().startswith("EXIT BTCUSDT ")
 
     asyncio.run(scenario())
 

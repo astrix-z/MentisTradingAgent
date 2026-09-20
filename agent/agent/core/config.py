@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     ENVIRONMENT: Literal["development", "production"] = "development"
 
+    # Dedicated, durable record of ENTRY/EXIT signals only (not HOLD) — signals
+    # can be rare, so this stays on disk (mount it to a host volume) rather
+    # than depending on the main log stream's retention/rotation.
+    SIGNAL_LOG_PATH: str = "logs/signals.log"
+
     # Control/status plane between backend and agent (commands + liveness).
     REDIS_URL: str = "redis://localhost:6379/0"
 
