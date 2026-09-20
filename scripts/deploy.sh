@@ -82,6 +82,9 @@ fi
 echo "==> Копирование кода (${REVISION}) в ${APP_DIR}"
 run_remote "mkdir -p ${APP_DIR}"
 git archive HEAD | run_remote "tar -x -C ${APP_DIR}"
+# uv.lock не в git (.gitignore) — но нужен сборке (`uv sync --frozen`), копируем отдельно.
+# Путь без ведущего "/" — scp резолвит его от домашней директории на сервере.
+scp -q -p uv.lock "${SSH_TARGET}:apps/mentis-trading-agent/uv.lock"
 
 if [[ "$NO_BUILD" -ne 1 ]]; then
   echo "==> Сборка образов (это может занять несколько минут)"
