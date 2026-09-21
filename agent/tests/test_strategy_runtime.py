@@ -935,6 +935,61 @@ def test_rescreen_adds_and_removes_symbols() -> None:
     asyncio.run(run())
 
 
+def test_rescreen_loop_recovers_from_failed_cycle() -> None:
+    """A transient exception in one rescreen cycle (e.g. a WS-subscribe race)
+    must not kill `_rescreen_loop` permanently: the background task should
+    stay alive and pick up screening again on the next cycle."""
+
+    async def run() -> None:
+        windows = {"BTCUSDT": fixture(), "ETHUSDT": falling_4h(fixture())}
+        rest = MultiRest(windows)
+        streams, sink = MultiStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        await strategy.on_start(
+            multi_services(rest, streams, sink, ["BTCUSDT", "ETHUSDT"])
+        )
+        try:
+            assert strategy._active_symbols == {"BTCUSDT"}
+            assert len(strategy._tasks) == 2  # _run() + _rescreen_loop()
+
+            # Fire the next two rescreen cycles immediately instead of waiting
+            # for real tide boundaries, then park the loop far in the future.
+            boundaries = iter([0, 0])
+            strategy._next_rescreen_ms = (  # type: ignore[method-assign]
+                lambda now_ms: now_ms + next(boundaries, 10**9)
+            )
+
+            real_screen = strategy._screen_universe
+            calls = {"n": 0}
+
+            async def flaky_screen() -> set[str]:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise ValueError("No WebSocket connections available.")
+                return await real_screen()
+
+            strategy._screen_universe = flaky_screen  # type: ignore[method-assign]
+
+            # Flip so the recovered cycle picks ETHUSDT instead of BTCUSDT.
+            rest.windows["BTCUSDT"] = falling_4h(fixture())
+            rest.windows["ETHUSDT"] = fixture()
+
+            for _ in range(200):
+                if calls["n"] >= 2 and strategy._active_symbols == {"ETHUSDT"}:
+                    break
+                await asyncio.sleep(0)
+            else:
+                pytest.fail("rescreen loop did not recover from the failed cycle")
+
+            # The loop's own task is still tracked/alive, not dropped by
+            # `_task_done` the way an unhandled exception used to drop it.
+            assert len(strategy._tasks) == 2
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
 def test_next_rescreen_ms_is_tide_boundary_plus_buffer() -> None:
     strategy = TripleScreenStrategy(PARAMS)
     step = interval_ms("4h")

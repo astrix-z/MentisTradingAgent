@@ -245,13 +245,22 @@ class TripleScreenStrategy(Strategy):
         return (now_ms // step + 1) * step + _RESCREEN_BUFFER_MS
 
     async def _rescreen_loop(self) -> None:
-        """Re-run stage 1 over the full universe at every tide-interval close."""
+        """Re-run stage 1 over the full universe at every tide-interval close.
+
+        A failed cycle (e.g. a transient WS-subscribe race) must not kill the
+        loop permanently: without this, `_task_done` only logs the exception
+        and the task dies, silently freezing `_active_symbols` on a stale set
+        while the heartbeat keeps reporting state=running.
+        """
         while True:
             now_ms = int(datetime.now(UTC).timestamp() * 1000)
             next_ms = self._next_rescreen_ms(now_ms)
             await asyncio.sleep(max(0.0, (next_ms - now_ms) / 1000))
-            selected = await self._screen_universe()
-            await self._apply_selection(selected)
+            try:
+                selected = await self._screen_universe()
+                await self._apply_selection(selected)
+            except Exception:
+                logger.exception("tripple_screen rescreen cycle failed")
 
     async def _load_window(
         self, symbol: str, interval: str, cutoff: int
