@@ -524,7 +524,14 @@ function Strategy() {
               <p>
                 Strategy: {activeStrategy?.label ?? pendingLiveStart.strategy}
               </p>
-              <p>Symbols: {pendingLiveStart.symbols.join(", ")}</p>
+              <div className="space-y-1">
+                <p className="font-medium">
+                  Symbols ({pendingLiveStart.symbols.length})
+                </p>
+                <p className="max-h-32 overflow-y-auto rounded border p-2 text-xs">
+                  {pendingLiveStart.symbols.join(", ")}
+                </p>
+              </div>
               <div className="space-y-1">
                 <p className="font-medium">Key params</p>
                 <ul className="grid max-h-64 grid-cols-2 gap-x-4 gap-y-1 overflow-y-auto text-xs">
@@ -538,7 +545,7 @@ function Strategy() {
               </div>
             </div>
           )}
-          <DialogFooter>
+          <DialogFooter className="sticky bottom-0 -mx-6 -mb-6 border-t bg-background px-6 py-4">
             <Button variant="outline" onClick={() => setPendingLiveStart(null)}>
               Cancel
             </Button>
