@@ -22,6 +22,7 @@ from typing import Any
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlmodel import Session, col, select
 
 from app.core.db import engine
@@ -71,36 +72,42 @@ def _record_entry(payload: dict[str, Any], network: str) -> None:
             signal_id,
         )
         return
+    position = SignalPosition(
+        signal_id=signal_id,
+        symbol=payload["symbol"],
+        network=network,
+        epoch_id=payload.get("epoch_id") or "",
+        entry_ref=entry_ref,
+        swing_low_ref=payload.get("swing_low_ref") or "0",
+        tp_rule=payload.get("tp_rule") or "",
+        take_ref=take_ref,
+        emitted_at=datetime.fromisoformat(payload["emitted_at"]),
+        valid_until=(
+            datetime.fromisoformat(payload["valid_until"])
+            if payload.get("valid_until")
+            else None
+        ),
+    )
+    # Every uvicorn worker runs its own listener, so the same signal arrives
+    # once per worker at the same instant. A select-then-insert races (the
+    # losers hit the unique index and logged an IntegrityError per signal);
+    # ON CONFLICT makes "first writer wins, the rest are no-ops" atomic.
+    statement = (
+        pg_insert(SignalPosition)
+        .values(**position.model_dump())
+        .on_conflict_do_nothing(index_elements=["signal_id"])
+        .returning(col(SignalPosition.id))
+    )
     with Session(engine) as session:
-        existing = session.exec(
-            select(SignalPosition).where(SignalPosition.signal_id == signal_id)
-        ).first()
-        if existing is not None:
-            return  # already recorded (e.g. a redelivered pub/sub reconnect)
-        session.add(
-            SignalPosition(
-                signal_id=signal_id,
-                symbol=payload["symbol"],
-                network=network,
-                epoch_id=payload.get("epoch_id") or "",
-                entry_ref=entry_ref,
-                swing_low_ref=payload.get("swing_low_ref") or "0",
-                tp_rule=payload.get("tp_rule") or "",
-                take_ref=take_ref,
-                emitted_at=datetime.fromisoformat(payload["emitted_at"]),
-                valid_until=(
-                    datetime.fromisoformat(payload["valid_until"])
-                    if payload.get("valid_until")
-                    else None
-                ),
-            )
-        )
+        inserted = session.execute(statement).first() is not None
         session.commit()
-        logger.info(
-            "recorded ENTRY position symbol=%s signal_id=%s",
-            payload["symbol"],
-            signal_id,
-        )
+    if not inserted:
+        return  # already recorded by another worker or a redelivered message
+    logger.info(
+        "recorded ENTRY position symbol=%s signal_id=%s",
+        payload["symbol"],
+        signal_id,
+    )
 
 
 def _record_exit(payload: dict[str, Any]) -> None:

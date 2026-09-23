@@ -8,6 +8,8 @@ last known price has crossed the stop/take level.
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock
@@ -59,6 +61,25 @@ def test_record_entry_is_idempotent_on_signal_id(db: Session) -> None:
     assert rows[0].symbol == "BTCUSDT"
     assert rows[0].take_ref == "110.0"
     assert rows[0].status == "open"
+
+
+def test_record_entry_tolerates_concurrent_workers(db: Session) -> None:
+    # Prod runs `fastapi run --workers 4`, each worker with its own listener,
+    # so one signal is recorded by four callers at once; none may raise.
+    payload = entry_payload(signal_id="sig-race")
+    barrier = threading.Barrier(4)
+
+    def record() -> None:
+        barrier.wait()
+        _record_entry(payload, "live")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for future in [pool.submit(record) for _ in range(4)]:
+            future.result()
+    rows = db.exec(
+        select(SignalPosition).where(SignalPosition.signal_id == "sig-race")
+    ).all()
+    assert len(rows) == 1
 
 
 def test_record_entry_rejects_unparseable_tp_rule(db: Session) -> None:
