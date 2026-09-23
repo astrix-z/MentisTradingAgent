@@ -896,6 +896,30 @@ def test_screening_admits_by_cap_and_trend_strength() -> None:
     asyncio.run(run())
 
 
+def test_screening_skips_listing_younger_than_kline_window() -> None:
+    """Live run 2026-09-23: MARSCOINUSDT (114 4h bars vs kline_window=1000)
+    passed screening but every evaluation hit 'history not ready'."""
+
+    async def run() -> None:
+        young = sloped_4h(fixture(), 5)
+        young["4h"] = young["4h"][-(PARAMS["kline_window"] - 1) :]
+        windows = {"YOUNG": young, "BTCUSDT": sloped_4h(fixture(), 1)}
+        rest = MultiRest(windows)
+        streams, sink = MultiStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        await strategy.on_start(
+            multi_services(rest, streams, sink, ["YOUNG", "BTCUSDT"])
+        )
+        try:
+            # YOUNG rises harder but cannot be evaluated: not admitted.
+            assert strategy._active_symbols == {"BTCUSDT"}
+            assert not any(sym == "YOUNG" for sym, _ in streams.subscribed)
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
 def test_open_position_retained_past_failed_rescreen() -> None:
     async def run() -> None:
         windows = {"BTCUSDT": fixture(), "ETHUSDT": falling_4h(fixture())}

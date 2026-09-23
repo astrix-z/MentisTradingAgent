@@ -170,9 +170,19 @@ class TripleScreenStrategy(Strategy):
                 candles = await self._load_window(
                     symbol, settings.tide_interval, cutoff
                 )
-            if len(candles) < slow_period + 1:
+            # Evaluation needs the same full closed tide window (_snapshot ->
+            # _slice); a younger listing would take a slot yet never be
+            # evaluable, re-fetching its window over REST on every trigger.
+            window = self._slice(candles, settings.tide_interval, cutoff)
+            if window is None:
+                logger.debug(
+                    "tripple_screen screen symbol=%s skipped: tide history %s < %s",
+                    symbol,
+                    len(candles),
+                    settings.kline_window,
+                )
                 return None
-            closes = [c.close for c in candles]
+            closes = [c.close for c in window]
             ema_mid = ema_series(closes, mid_period)
             ema_slow = ema_series(closes, slow_period)
             mid_prev, mid_now = ema_mid[-2], ema_mid[-1]
