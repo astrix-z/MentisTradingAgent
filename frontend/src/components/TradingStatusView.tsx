@@ -1,4 +1,12 @@
 import type { TradingStatus } from "@/client"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
 
 export function TradingStatusView({
   status,
@@ -56,8 +64,7 @@ export function TradingStatusView({
         <div>
           <p>
             Screened symbols ({actual.active_symbols.length} of{" "}
-            {desired.symbols?.length ?? 0})
-            {stale ? " (stale)" : ""}:
+            {desired.symbols?.length ?? 0}){stale ? " (stale)" : ""}:
           </p>
           <p className="font-mono text-xs">
             {actual.active_symbols.join(", ") || "none"}
@@ -72,14 +79,32 @@ export function TradingStatusView({
         </p>
       )}
       {balances && actual?.balances && (
-        <div>
-          <h2 className="font-semibold">
+        // Collapsed by default: amounts are shown only on an explicit click.
+        <details>
+          <summary className="cursor-pointer select-none font-semibold">
             Heartbeat balances —{" "}
             {actual.network?.toUpperCase() ?? "UNKNOWN NETWORK"}
-            {stale ? " (stale)" : ""}
-          </h2>
-          <pre>{JSON.stringify(actual.balances, null, 2)}</pre>
-        </div>
+            {stale ? " (stale)" : ""} ({Object.keys(actual.balances).length})
+          </summary>
+          <Table aria-label="Heartbeat balances" className="mt-2">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Asset</TableHead>
+                <TableHead className="text-right">Amount</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {Object.entries(actual.balances).map(([asset, amount]) => (
+                <TableRow key={asset}>
+                  <TableCell className="font-medium">{asset}</TableCell>
+                  <TableCell className="text-right font-mono">
+                    {amount}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </details>
       )}
     </section>
   )

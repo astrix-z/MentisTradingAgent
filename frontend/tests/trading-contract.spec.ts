@@ -220,6 +220,15 @@ test("balance page is observation-only and separates desired, actual and balance
   await expect(
     page.getByText("Heartbeat balances — LIVE (stale)"),
   ).toBeVisible()
+  // Collapsed until asked for; expanding shows the amounts as a table.
+  const heartbeatBalances = page.getByRole("table", {
+    name: "Heartbeat balances",
+  })
+  await expect(heartbeatBalances).toBeHidden()
+  await page.getByText("Heartbeat balances — LIVE (stale)").click()
+  await expect(heartbeatBalances.getByRole("row").nth(1)).toHaveText(
+    /USDT\s*123/,
+  )
   await expect(
     page.getByRole("button", { name: "Start", exact: true }),
   ).toHaveCount(0)
@@ -613,12 +622,20 @@ test("only the latest balance request is shown, and results stay correlated", as
     command_id: secondId,
     type: "balance",
     ok: true,
-    data: { USDT: 2 },
+    data: {
+      network: "testnet",
+      fetched_at: at,
+      assets: [{ asset: "USDT", free: "2", locked: "0.5" }],
+    },
     at,
   })
   await page.clock.runFor(2000)
   await expect(section).toContainText("succeeded")
-  await expect(section).toContainText('"USDT": 2')
+  // Rendered as a table under the command header, not as raw JSON.
+  const row = section.getByRole("table", { name: "Balance" }).getByRole("row")
+  await expect(row.nth(0)).toHaveText(/Asset\s*Free\s*Locked/)
+  await expect(row.nth(1)).toHaveText(/USDT\s*2\s*0\.5/)
+  await expect(section.locator("pre")).toHaveCount(0)
   // The superseded request is still polled; the swap dropped nothing.
   expect(api.reads).toContain(firstId)
   expect(api.reads).toContain(secondId)
@@ -707,6 +724,39 @@ test("missing heartbeat and transient result errors never imply success", async 
   await expect(
     page.getByText("Result temporarily unavailable; retrying"),
   ).toHaveCount(0)
+})
+
+test("a succeeded start shows a summary with the symbol count, not the list", async ({
+  page,
+}) => {
+  const api = await mock(page)
+  await page.goto("/strategy")
+  await page.clock.install()
+  await page.getByRole("button", { name: "TESTNET", exact: true }).click()
+  await page.getByRole("button", { name: "Start", exact: true }).click()
+  await expect(page.getByText("start — accepted")).toBeVisible()
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "start",
+    ok: true,
+    data: {
+      running: true,
+      network: "testnet",
+      strategy: "tripple_screen",
+      symbols: ["AAVEUSDT", "ACEUSDT", "ZROUSDT"],
+    },
+    at,
+  })
+  await page.clock.runFor(2000)
+  const section = page.getByTestId("command")
+  await expect(section).toContainText("start — succeeded")
+  await expect(section).toContainText(`Command ID: ${firstId}`)
+  await expect(section).toContainText(/Running\s*yes/)
+  await expect(section).toContainText(/Network\s*TESTNET/)
+  await expect(section).toContainText(/Strategy\s*tripple_screen/)
+  await expect(section).toContainText(/Symbols\s*3/)
+  await expect(section).not.toContainText("AAVEUSDT")
+  await expect(section.locator("pre")).toHaveCount(0)
 })
 
 test("a command started on /strategy keeps polling and resolves after navigating to /balance", async ({
