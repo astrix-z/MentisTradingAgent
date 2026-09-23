@@ -59,6 +59,10 @@ class TripleScreenStrategy(Strategy):
         # tide-interval boundary. Stage 2: the subset currently wired/bootstrapped.
         self._universe: list[str] = []
         self._active_symbols: set[str] = set()
+        # Consecutive failed rescreen cycles, surfaced via health_warning.
+        self._rescreen_failures = 0
+        self._rescreen_failing_since: datetime | None = None
+        self._rescreen_error = ""
 
     @property
     def settings(self) -> TripleScreenSettings:
@@ -68,6 +72,16 @@ class TripleScreenStrategy(Strategy):
     def active_symbols(self) -> list[str] | None:
         """Symbols that passed stage-1 screening and are stage-2 WS-wired."""
         return sorted(self._active_symbols)
+
+    @property
+    def health_warning(self) -> str | None:
+        since = self._rescreen_failing_since
+        if not self._rescreen_failures or since is None:
+            return None
+        return (
+            f"rescreen failing since {since:%Y-%m-%d %H:%M:%S} UTC "
+            f"({self._rescreen_failures} cycles in a row): {self._rescreen_error}"
+        )
 
     def _intervals(self) -> tuple[str, str, str]:
         return (
@@ -278,8 +292,15 @@ class TripleScreenStrategy(Strategy):
             try:
                 selected = await self._screen_universe()
                 await self._apply_selection(selected)
-            except Exception:
+            except Exception as exc:
                 logger.exception("tripple_screen rescreen cycle failed")
+                if not self._rescreen_failures:
+                    self._rescreen_failing_since = datetime.now(UTC)
+                self._rescreen_failures += 1
+                self._rescreen_error = f"{type(exc).__name__}: {exc}"[:200]
+            else:
+                self._rescreen_failures = 0
+                self._rescreen_failing_since = None
 
     async def _load_window(
         self, symbol: str, interval: str, cutoff: int

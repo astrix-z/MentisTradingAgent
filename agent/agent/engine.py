@@ -89,6 +89,7 @@ class Engine:
         self._strategy_name: str = ""
         self._state: AgentState = "idle"
         self._message: str | None = None
+        self._health_warning: str | None = None
         self._balances: dict[str, float] = {}
 
         # SDK-backed services for the current run.
@@ -342,12 +343,34 @@ class Engine:
 
     # --- heartbeat ---------------------------------------------------------
 
+    def _current_health_warning(self) -> str | None:
+        """Degraded-but-running conditions: ``state=running`` alone does not
+        mean the strategy is actually seeing the market."""
+        warning = None
+        if self._state == "running":
+            parts = [
+                part
+                for part in (
+                    self._streams.health_warning() if self._streams else None,
+                    self._strategy.health_warning if self._strategy else None,
+                )
+                if part
+            ]
+            warning = "; ".join(parts) or None
+        if warning != self._health_warning:
+            if warning:
+                logger.warning("run degraded: %s", warning)
+            elif self._health_warning:
+                logger.info("run recovered: %s", self._health_warning)
+            self._health_warning = warning
+        return warning
+
     async def publish_heartbeat(self) -> None:
         """Publish current state so the backend can report liveness."""
         payload = json.dumps(
             {
                 "state": self._state,
-                "message": self._message,
+                "message": self._message or self._current_health_warning(),
                 "network": self._network,
                 "strategy": self._strategy_name,
                 "balances": self._balances,

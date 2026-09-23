@@ -18,8 +18,15 @@ from agent.strategies import Signal
 
 def setup_engine(monkeypatch: pytest.MonkeyPatch) -> tuple[Engine, Any, Any, Any]:
     redis = Mock(set=AsyncMock(), publish=AsyncMock())
-    strategy = Mock(on_start=AsyncMock(), on_stop=AsyncMock(), active_symbols=None)
-    streams = Mock(start=AsyncMock(), stop=AsyncMock())
+    strategy = Mock(
+        on_start=AsyncMock(),
+        on_stop=AsyncMock(),
+        active_symbols=None,
+        health_warning=None,
+    )
+    streams = Mock(
+        start=AsyncMock(), stop=AsyncMock(), health_warning=Mock(return_value=None)
+    )
     monkeypatch.setattr("agent.engine.build_strategy", Mock(return_value=strategy))
     monkeypatch.setattr("agent.engine.ExchangeRest.connect", Mock(return_value=Mock()))
     monkeypatch.setattr("agent.engine.MarketDataStreams", Mock(return_value=streams))
@@ -321,6 +328,28 @@ def test_repeated_cancel_finishes_cleanup(
         assert engine._task is None
         assert engine._startup is None
         streams.stop.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_heartbeat_reports_degraded_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        engine, redis, strategy, streams = setup_engine(monkeypatch)
+        await start(engine)
+        streams.health_warning.return_value = "no market data since X"
+        strategy.health_warning = "rescreen failing since Y"
+        await engine.publish_heartbeat()
+        heartbeat = json.loads(redis.set.await_args.args[1])
+        assert heartbeat["state"] == "running"
+        assert heartbeat["message"] == (
+            "no market data since X; rescreen failing since Y"
+        )
+
+        streams.health_warning.return_value = None
+        strategy.health_warning = None
+        await engine.publish_heartbeat()
+        assert json.loads(redis.set.await_args.args[1])["message"] is None
+        await engine.stop()
 
     asyncio.run(scenario())
 

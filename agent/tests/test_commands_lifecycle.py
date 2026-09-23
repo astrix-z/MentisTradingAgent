@@ -117,7 +117,7 @@ def test_stop_barrier_and_new_start(monkeypatch: pytest.MonkeyPatch) -> None:
         engine = Engine(redis)
         entered = asyncio.Event()
         count = 0
-        strategy = Mock(on_stop=AsyncMock(), active_symbols=None)
+        strategy = Mock(on_stop=AsyncMock(), active_symbols=None, health_warning=None)
 
         async def bootstrap(*_: Any) -> None:
             nonlocal count
@@ -127,7 +127,9 @@ def test_stop_barrier_and_new_start(monkeypatch: pytest.MonkeyPatch) -> None:
                 await asyncio.Event().wait()
 
         strategy.on_start = AsyncMock(side_effect=bootstrap)
-        streams = Mock(start=AsyncMock(), stop=AsyncMock())
+        streams = Mock(
+            start=AsyncMock(), stop=AsyncMock(), health_warning=Mock(return_value=None)
+        )
         monkeypatch.setattr("agent.engine.build_strategy", Mock(return_value=strategy))
         monkeypatch.setattr(
             "agent.engine.ExchangeRest.connect", Mock(return_value=Mock())
@@ -210,7 +212,7 @@ def test_listener_and_heartbeat_during_resume(
             {"running": True, "strategy": "test", "symbols": ["BTCUSDT"]}
         )
         monkeypatch.setitem(STRATEGIES, "test", Mock())
-        strategy = Mock(on_stop=AsyncMock(), active_symbols=None)
+        strategy = Mock(on_stop=AsyncMock(), active_symbols=None, health_warning=None)
 
         async def bootstrap(*_: Any) -> None:
             assert subscribed.is_set()
@@ -226,7 +228,13 @@ def test_listener_and_heartbeat_during_resume(
         )
         monkeypatch.setattr(
             "agent.engine.MarketDataStreams",
-            Mock(return_value=Mock(start=AsyncMock(), stop=AsyncMock())),
+            Mock(
+                return_value=Mock(
+                    start=AsyncMock(),
+                    stop=AsyncMock(),
+                    health_warning=Mock(return_value=None),
+                )
+            ),
         )
 
         async def observed(
@@ -311,6 +319,7 @@ def test_start_failure_result(monkeypatch: pytest.MonkeyPatch) -> None:
             on_start=AsyncMock(side_effect=RuntimeError("subscription failed")),
             on_stop=AsyncMock(),
             active_symbols=None,
+            health_warning=None,
         )
         monkeypatch.setattr("agent.engine.build_strategy", Mock(return_value=strategy))
         monkeypatch.setattr(
@@ -318,7 +327,13 @@ def test_start_failure_result(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         monkeypatch.setattr(
             "agent.engine.MarketDataStreams",
-            Mock(return_value=Mock(start=AsyncMock(), stop=AsyncMock())),
+            Mock(
+                return_value=Mock(
+                    start=AsyncMock(),
+                    stop=AsyncMock(),
+                    health_warning=Mock(return_value=None),
+                )
+            ),
         )
         await commands.dispatch(
             engine,

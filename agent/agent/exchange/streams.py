@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
 
 from binance_common.configuration import ConfigurationWebSocketStreams
 from binance_common.websocket import RequestStreamHandle, global_stream_connections
@@ -45,6 +46,10 @@ _STREAM_URL: dict[str, str] = {
 
 # Delay before each reconnect attempt after a drop; the last one repeats.
 _RECONNECT_BACKOFF_S: tuple[float, ...] = (1, 2, 5, 10, 30, 60)
+
+# With any kline stream subscribed, Binance pushes an update every ~1-2s; this
+# long without one means the data path is dead even if the socket looks open.
+_STALE_AFTER = timedelta(minutes=2)
 
 KlineCallback = Callable[[KlineResponse], None]
 KlineKey = tuple[str, str]
@@ -72,6 +77,7 @@ class MarketDataStreams:
         self._kline_callbacks: dict[KlineKey, KlineCallback] = {}
         self._reconnect_listeners: list[Callable[[], None]] = []
         self._recovery: asyncio.Task[None] | None = None
+        self._last_message_at: datetime | None = None
 
     @property
     def network(self) -> Network:
@@ -88,6 +94,17 @@ class MarketDataStreams:
         await self._open()
         self._started = True
         logger.info("market streams connected network=%s", self._network)
+
+    def health_warning(self) -> str | None:
+        """Why market data is not flowing, or ``None`` while it is (or while
+        nothing is subscribed, so nothing is expected)."""
+        last = self._last_message_at
+        if self._stopping or not self._kline_callbacks or last is None:
+            return None
+        if datetime.now(UTC) - last <= _STALE_AFTER:
+            return None
+        link = "connected" if self._client.connections else "disconnected, reconnecting"
+        return f"no market data since {last:%Y-%m-%d %H:%M:%S} UTC (stream {link})"
 
     def on_reconnect(self, listener: Callable[[], None]) -> None:
         """Call ``listener`` after a dropped connection has been restored and
@@ -205,9 +222,18 @@ class MarketDataStreams:
                 raise ConnectionError(f"kline subscribe not applied streams={missing}")
             for stream in fresh:
                 handle = RequestStreamHandle(self._client, stream, KlineResponse)
-                handle.on("message", streams[stream][1])
+                handle.on("message", self._track(streams[stream][1]))
+            # New streams get a full staleness window before they count as silent.
+            self._last_message_at = datetime.now(UTC)
         for key, callback in streams.values():
             self._kline_callbacks[key] = callback
+
+    def _track(self, callback: KlineCallback) -> KlineCallback:
+        def tracked(data: KlineResponse) -> None:
+            self._last_message_at = datetime.now(UTC)
+            callback(data)
+
+        return tracked
 
     async def _ensure_connected(self) -> None:
         if not self._started:

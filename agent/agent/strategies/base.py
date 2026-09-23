@@ -171,5 +171,11 @@ class Strategy(abc.ABC):
         concept (every requested symbol is processed as given)."""
         return None
 
+    @property
+    def health_warning(self) -> str | None:
+        """A degraded-but-running condition to surface in the heartbeat
+        (e.g. a background cycle that keeps failing), or ``None``."""
+        return None
+
 
 __all__ = ["Signal", "SignalSink", "SignalType", "Strategy", "StrategyServices"]

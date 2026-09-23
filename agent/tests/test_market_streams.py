@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -213,5 +214,32 @@ def test_subscribe_ignores_streams_mapped_to_a_dead_connection() -> None:
 
         assert sdk.subscribe_messages == [["btcusdt@kline_4h"]]
         assert len(sdk.callbacks["btcusdt@kline_4h"]) == 1
+
+    asyncio.run(scenario())
+
+
+def test_health_warning_reports_silent_or_dropped_stream() -> None:
+    async def scenario() -> None:
+        sdk = FakeSdk(failed_connects=0)
+        streams = make_streams(sdk)
+        assert streams.health_warning() is None  # nothing subscribed yet
+        await streams.subscribe_klines_batch([("BTCUSDT", "4h", noop)])
+        assert streams.health_warning() is None  # fresh subscription
+
+        streams._last_message_at = datetime.now(UTC) - timedelta(minutes=3)
+        warning = streams.health_warning()
+        assert warning is not None and "(stream connected)" in warning
+
+        sdk.failed_connects = 10**6
+        sdk.drop()
+        warning = streams.health_warning()
+        assert warning is not None and "disconnected, reconnecting" in warning
+
+        # Any delivered message clears it.
+        sdk.failed_connects = 0
+        await wait_recovered(streams)
+        sdk.callbacks["btcusdt@kline_4h"][0](None)
+        assert streams.health_warning() is None
+        await streams.stop()
 
     asyncio.run(scenario())

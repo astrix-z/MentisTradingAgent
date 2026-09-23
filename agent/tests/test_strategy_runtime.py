@@ -146,6 +146,9 @@ class Streams:
     def on_reconnect(self, listener: Callable[[], None]) -> None:
         self.reconnect_listeners.append(listener)
 
+    def health_warning(self) -> str | None:
+        return None
+
 
 class RedisSink:
     def __init__(self) -> None:
@@ -1056,11 +1059,25 @@ def test_rescreen_loop_recovers_from_failed_cycle() -> None:
             rest.windows["ETHUSDT"] = fixture()
 
             for _ in range(200):
+                if calls["n"] >= 1 and strategy.health_warning:
+                    break
+                await asyncio.sleep(0)
+            # A failing cycle is surfaced, not only logged.
+            assert strategy.health_warning is not None
+            assert "1 cycles in a row" in strategy.health_warning
+            assert "No WebSocket connections available." in strategy.health_warning
+
+            for _ in range(200):
                 if calls["n"] >= 2 and strategy._active_symbols == {"ETHUSDT"}:
                     break
                 await asyncio.sleep(0)
             else:
                 pytest.fail("rescreen loop did not recover from the failed cycle")
+            for _ in range(200):
+                if strategy.health_warning is None:
+                    break
+                await asyncio.sleep(0)
+            assert strategy.health_warning is None
 
             # The loop's own task is still tracked/alive, not dropped by
             # `_task_done` the way an unhandled exception used to drop it.
