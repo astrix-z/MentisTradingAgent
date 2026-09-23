@@ -177,5 +177,27 @@ class Strategy(abc.ABC):
         (e.g. a background cycle that keeps failing), or ``None``."""
         return None
 
+    def indicator_snapshot(self) -> dict[str, Any] | None:
+        """Indicator values on the last closed bar of each indicator's own
+        interval, per symbol the strategy currently processes — for the
+        Strategy Indicators Monitor page. ``None`` if the strategy has none.
+
+        JSON-ready (decimals as strings, see :func:`transport_value`)::
+
+            {
+              "groups": [{"key", "label", "interval",
+                          "indicators": [{"key", "label"}]}],
+              "rows": [{"symbol",
+                        "groups": {<group key>: {
+                          "bar_open_time": ISO-8601 UTC | None,
+                          "values": {<indicator key>: {"current", "previous"}},
+                        }}}],
+            }
+
+        Declaring the groups here keeps the UI generic: it renders whatever
+        columns the running strategy lists, like the settings form does.
+        """
+        return None
+
 
 __all__ = ["Signal", "SignalSink", "SignalType", "Strategy", "StrategyServices"]

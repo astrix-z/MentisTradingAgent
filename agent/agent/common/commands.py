@@ -461,6 +461,18 @@ async def _balance(ctx: CommandContext, payload: dict[str, Any]) -> None:
     )
 
 
+@command("indicators")
+async def _indicators(ctx: CommandContext, payload: dict[str, Any]) -> None:
+    # Computed from the candles the strategy already holds: no exchange I/O.
+    snapshot = ctx.engine.indicator_snapshot()
+    if snapshot is None:
+        await ctx.report(
+            ok=False, message="no running strategy is publishing indicators"
+        )
+        return
+    await ctx.report(ok=True, data=snapshot)
+
+
 # --- Boot-time resume -------------------------------------------------------
 
 

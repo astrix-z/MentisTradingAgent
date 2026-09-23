@@ -83,6 +83,87 @@ class TripleScreenStrategy(Strategy):
             f"({self._rescreen_failures} cycles in a row): {self._rescreen_error}"
         )
 
+    def indicator_snapshot(self) -> dict[str, Any] | None:
+        s = self.settings
+        tide_keys = ("ema_fast", "ema_mid", "ema_slow")
+        groups = [
+            {
+                "key": "tide",
+                "label": "Tide",
+                "interval": s.tide_interval,
+                "indicators": [
+                    {"key": key, "label": f"EMA {period}"}
+                    for key, period in zip(tide_keys, s.ema_tide_periods, strict=True)
+                ],
+            },
+            {
+                "key": "wave",
+                "label": "Wave",
+                "interval": s.wave_interval,
+                "indicators": [
+                    {"key": "stoch_k", "label": f"%K {s.stochastic_k_period}"},
+                    {"key": "stoch_d", "label": f"%D {s.stochastic_d_period}"},
+                    {
+                        "key": "stoch_slow_d",
+                        "label": f"Slow %D {s.stochastic_slow_period}",
+                    },
+                    {"key": "force_index", "label": f"FI {s.fi_ema_period}"},
+                ],
+            },
+            {
+                "key": "ripple",
+                "label": "Ripple",
+                "interval": s.ripple_interval,
+                # Not indicators: the breakout trigger is close > previous high.
+                "indicators": [
+                    {"key": "close", "label": "Close"},
+                    {"key": "high", "label": "High"},
+                ],
+            },
+        ]
+        rows = []
+        for symbol in sorted(self._active_symbols):
+            windows = self._candles.get(symbol, {})
+            tide = windows.get(s.tide_interval, [])
+            wave = windows.get(s.wave_interval, [])
+            ripple = windows.get(s.ripple_interval, [])
+            tide_values: dict[str, Any] = {}
+            if len(tide) > max(s.ema_tide_periods):
+                emas = self._tide(tide)["ema"]
+                tide_values = {
+                    key: emas[str(period)]
+                    for key, period in zip(tide_keys, s.ema_tide_periods, strict=True)
+                }
+            wave_values: dict[str, Any] = {}
+            if len(wave) >= 2:
+                computed = self._wave(wave)
+                wave_values = {
+                    "stoch_k": computed["k"],
+                    "stoch_d": computed["d"],
+                    "stoch_slow_d": computed["slow_d"],
+                    "force_index": computed["fi"],
+                }
+            ripple_values: dict[str, Any] = {}
+            if len(ripple) >= 2:
+                ripple_values = {
+                    field: {
+                        "previous": getattr(ripple[-2], field),
+                        "current": getattr(ripple[-1], field),
+                    }
+                    for field in ("close", "high")
+                }
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "groups": {
+                        "tide": _indicator_group(tide, tide_values),
+                        "wave": _indicator_group(wave, wave_values),
+                        "ripple": _indicator_group(ripple, ripple_values),
+                    },
+                }
+            )
+        return {"groups": groups, "rows": transport_value(rows)}
+
     def _intervals(self) -> tuple[str, str, str]:
         return (
             self.settings.tide_interval,
@@ -767,3 +848,13 @@ class TripleScreenStrategy(Strategy):
             "conditions": flags,
             "pullback_up": all(flags.values()),
         }
+
+
+def _indicator_group(candles: list[Candle], values: dict[str, Any]) -> dict[str, Any]:
+    """One group cell: values on the last closed bar, stamped with its open."""
+    return {
+        "bar_open_time": datetime.fromtimestamp(candles[-1].open_time / 1000, UTC)
+        if values
+        else None,
+        "values": values,
+    }

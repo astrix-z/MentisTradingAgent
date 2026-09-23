@@ -1,4 +1,5 @@
 import {
+  Activity,
   Briefcase,
   Crosshair,
   Home,
@@ -34,6 +35,11 @@ export function AppSidebar() {
           icon: Crosshair,
           title: "Strategy",
           path: "/strategy",
+        },
+        {
+          icon: Activity,
+          title: "Indicators Monitor",
+          path: "/indicators",
         },
         {
           icon: ListChecks,

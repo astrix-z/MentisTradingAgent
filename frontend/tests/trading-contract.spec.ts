@@ -886,3 +886,121 @@ test("unpublished catalog shows a message and blocks Start instead of an empty f
   await expect(page.getByLabel("Take profit %")).toHaveCount(0)
   expect(api.posts).toEqual([])
 })
+
+test("indicators monitor reads on request and renders the strategy's own groups", async ({
+  page,
+}) => {
+  const api = await mock(page)
+  await page.goto("/indicators")
+  await page.clock.install()
+  await expect(
+    page.getByRole("heading", { name: "Strategy Indicators Monitor" }),
+  ).toBeVisible()
+  // Nothing is requested until the user asks.
+  expect(api.posts).toHaveLength(0)
+  await page.getByRole("button", { name: "Refresh", exact: true }).click()
+  await expect(page.getByRole("button", { name: "Refreshing…" })).toBeVisible()
+  expect(api.posts).toEqual([
+    { path: "/api/v1/trading/indicators/", body: null },
+  ])
+
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "indicators",
+    ok: true,
+    at,
+    data: {
+      strategy: "tripple_screen",
+      network: "live",
+      computed_at: "2026-09-23T08:31:00+00:00",
+      groups: [
+        {
+          key: "tide",
+          label: "Tide",
+          interval: "4h",
+          indicators: [{ key: "ema_fast", label: "EMA 5" }],
+        },
+        {
+          key: "wave",
+          label: "Wave",
+          interval: "1h",
+          indicators: [{ key: "force_index", label: "FI 2" }],
+        },
+      ],
+      rows: [
+        {
+          symbol: "PEPEUSDT",
+          groups: {
+            tide: {
+              bar_open_time: "2026-09-23T04:00:00+00:00",
+              values: {
+                ema_fast: { current: "0.0000123456789", previous: "0.0000120" },
+              },
+            },
+            wave: {
+              bar_open_time: "2026-09-23T07:00:00+00:00",
+              values: {
+                force_index: { current: "123456789.5", previous: "-2500.25" },
+              },
+            },
+          },
+        },
+        {
+          symbol: "BTCUSDT",
+          groups: {
+            tide: {
+              bar_open_time: "2026-09-23T04:00:00+00:00",
+              values: {
+                ema_fast: { current: "64210.53219", previous: "64100" },
+              },
+            },
+            // A lagging symbol: its own bar is stamped in the cell.
+            wave: {
+              bar_open_time: "2026-09-23T06:00:00+00:00",
+              values: { force_index: { current: "0", previous: null } },
+            },
+          },
+        },
+      ],
+    },
+  })
+  await page.clock.runFor(2000)
+
+  const table = page.getByRole("table")
+  await expect(table).toContainText("Tide 4h")
+  await expect(table).toContainText("bar 2026-09-23 04:00 UTC")
+  await expect(table).toContainText("EMA 5")
+  await expect(table).toContainText("FI 2")
+  const pepe = page.getByRole("row", { name: /PEPEUSDT/ })
+  await expect(pepe).toContainText("1.23457e-5")
+  await expect(pepe).toContainText("1.23457e+8")
+  await expect(pepe).toContainText("prev -2500.25")
+  const btc = page.getByRole("row", { name: /BTCUSDT/ })
+  await expect(btc).toContainText("64210.5")
+  await expect(btc).toContainText("bar 2026-09-23 06:00 UTC")
+  await expect(btc).toContainText("prev —")
+  await expect(page.getByTestId("computed-at")).toContainText(
+    "2026-09-23 08:31 UTC",
+  )
+})
+
+test("indicators monitor explains a failed read instead of an empty table", async ({
+  page,
+}) => {
+  const api = await mock(page)
+  await page.goto("/indicators")
+  await page.clock.install()
+  await page.getByRole("button", { name: "Refresh", exact: true }).click()
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "indicators",
+    ok: false,
+    message: "no running strategy is publishing indicators",
+    at,
+  })
+  await page.clock.runFor(2000)
+  await expect(page.getByRole("alert")).toContainText(
+    "no running strategy is publishing indicators",
+  )
+  await expect(page.getByRole("table")).toHaveCount(0)
+})

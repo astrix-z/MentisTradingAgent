@@ -114,10 +114,11 @@ SuperUserDep = Annotated[User, Depends(get_current_active_superuser)]
 
 # Trading network the agent should run against (must match agent key selection).
 Network = Literal["testnet", "live"]
-CommandType = Literal["start", "stop", "balance", "symbols", "prices"]
+CommandType = Literal["start", "stop", "balance", "symbols", "prices", "indicators"]
 
 # Commands that describe the running intent and therefore rewrite the runtime
-# snapshot. Everything else is observation-only (balance, symbols) and goes
+# snapshot. Everything else is observation-only (balance, symbols, prices,
+# indicators) and goes
 # straight to the stream — an accidental snapshot write there would mean
 # silently stopping the strategy.
 _SNAPSHOT_COMMANDS: tuple[CommandType, ...] = ("start", "stop")
@@ -364,6 +365,57 @@ class BalanceSnapshot(BaseModel):
     network: Network
     fetched_at: datetime
     assets: list[BalanceAsset]
+
+
+class IndicatorDeclaration(BaseModel):
+    key: str
+    label: str
+
+
+class IndicatorGroupDeclaration(BaseModel):
+    """A column group: indicators sharing one interval (e.g. Tide 4h)."""
+
+    key: str
+    label: str
+    interval: str
+    indicators: list[IndicatorDeclaration]
+
+
+class IndicatorValue(BaseModel):
+    """Values on the last closed bar and the bar before it, as Decimal-precise
+    strings; ``None`` while the history is too short to compute one."""
+
+    current: str | None
+    previous: str | None
+
+
+class IndicatorGroupValues(BaseModel):
+    """``bar_open_time`` is the open of the bar the values were computed on;
+    ``None`` (with empty ``values``) when the symbol has too little history."""
+
+    bar_open_time: datetime | None
+    values: dict[str, IndicatorValue]
+
+
+class IndicatorRow(BaseModel):
+    symbol: str
+    groups: dict[str, IndicatorGroupValues]
+
+
+class IndicatorSnapshot(BaseModel):
+    """Documented shape of ``CommandResult.data`` for a succeeded
+    ``indicators`` command, as produced by ``Strategy.indicator_snapshot`` in
+    ``agent/agent/strategies/base.py`` (plus the run stamp added by the
+    engine). The strategy declares its own ``groups``, so the UI renders any
+    strategy's indicators without backend changes. ``rows`` holds only the
+    symbols the strategy is processing, not its whole universe.
+    """
+
+    strategy: str
+    network: Network
+    computed_at: datetime
+    groups: list[IndicatorGroupDeclaration]
+    rows: list[IndicatorRow]
 
 
 class SignalPositionPublic(BaseModel):
@@ -781,6 +833,8 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
         return await _apply_command("symbols", symbols.model_dump())
     if request.type == "prices":
         return await _apply_command("prices", {})
+    if request.type == "indicators":
+        return await _apply_command("indicators", {})
     if request.type == "stop":
         return await _apply_command("stop", {})
     # Unreachable while CommandType lists every type: the branches above are
@@ -823,6 +877,18 @@ async def refresh_prices(_: SuperUserDep) -> CommandEnvelope:
     command.
     """
     return await _apply_command("prices", {})
+
+
+@router.post("/indicators/", status_code=202, response_model=CommandEnvelope)
+async def fetch_indicators(_: SuperUserDep) -> CommandEnvelope:
+    """Ask the running strategy for its indicator values on the last closed
+    bar of each indicator's interval (Strategy Indicators Monitor).
+
+    Observation-only: computed by the agent from candles it already holds, it
+    never changes the runtime snapshot. The values arrive through
+    ``/result/`` in the :class:`IndicatorSnapshot` shape.
+    """
+    return await _apply_command("indicators", {})
 
 
 @router.get("/result/", response_model=CommandResult | None)

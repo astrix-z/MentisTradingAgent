@@ -116,6 +116,21 @@ class Engine:
     def balances(self) -> dict[str, float]:
         return dict(self._balances)
 
+    def indicator_snapshot(self) -> dict[str, Any] | None:
+        """The running strategy's indicator snapshot, stamped with the run it
+        came from; ``None`` when nothing runs or the strategy has none."""
+        if self._strategy is None or self._state != "running":
+            return None
+        snapshot = self._strategy.indicator_snapshot()
+        if snapshot is None:
+            return None
+        return {
+            "strategy": self._strategy_name,
+            "network": self._network,
+            "computed_at": _now().isoformat(),
+            **snapshot,
+        }
+
     # --- SDK services ------------------------------------------------------
 
     def _ensure_rest(self, network: str) -> ExchangeRest:

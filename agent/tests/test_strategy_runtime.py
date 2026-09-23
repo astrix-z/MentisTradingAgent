@@ -1043,6 +1043,59 @@ def test_streams_reconnect_backfills_gapped_windows() -> None:
     asyncio.run(run())
 
 
+def test_indicator_snapshot_reports_last_closed_bar_per_interval() -> None:
+    async def run() -> None:
+        windows = {"BTCUSDT": fixture(), "ETHUSDT": falling_4h(fixture())}
+        rest = MultiRest(windows)
+        streams, sink = MultiStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        await strategy.on_start(
+            multi_services(rest, streams, sink, ["BTCUSDT", "ETHUSDT"])
+        )
+        try:
+            snapshot = strategy.indicator_snapshot()
+            assert snapshot is not None
+            json.dumps(snapshot)  # JSON-ready as the command result
+            assert [g["key"] for g in snapshot["groups"]] == ["tide", "wave", "ripple"]
+            tide_group = snapshot["groups"][0]
+            assert tide_group["interval"] == "4h"
+            assert [i["label"] for i in tide_group["indicators"]] == [
+                "EMA 2",
+                "EMA 3",
+                "EMA 4",
+            ]
+            # Only symbols selected for work, not the whole universe.
+            (row,) = snapshot["rows"]
+            assert row["symbol"] == "BTCUSDT"
+
+            candles = strategy._candles["BTCUSDT"]
+            tide = row["groups"]["tide"]
+            last_4h = candles["4h"][-1]
+            assert (
+                tide["bar_open_time"]
+                == datetime.fromtimestamp(last_4h.open_time / 1000, UTC).isoformat()
+            )
+            expected = strategy._tide(candles["4h"])["ema"]
+            assert tide["values"]["ema_slow"] == {
+                "previous": str(expected["4"]["previous"]),
+                "current": str(expected["4"]["current"]),
+            }
+            wave = row["groups"]["wave"]
+            assert set(wave["values"]) == {
+                "stoch_k",
+                "stoch_d",
+                "stoch_slow_d",
+                "force_index",
+            }
+            ripple = row["groups"]["ripple"]
+            assert ripple["values"]["close"]["current"] == str(candles["15m"][-1].close)
+            assert ripple["values"]["high"]["previous"] == str(candles["15m"][-2].high)
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
 def test_rescreen_loop_recovers_from_failed_cycle() -> None:
     """A transient exception in one rescreen cycle (e.g. a WS-subscribe race)
     must not kill `_rescreen_loop` permanently: the background task should

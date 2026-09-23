@@ -527,7 +527,9 @@ def test_read_redis_failure(client: TestClient, redis: MemoryRedis, path: str) -
     )
 
 
-@pytest.mark.parametrize("command", ["start", "stop", "balance", "symbols", "prices"])
+@pytest.mark.parametrize(
+    "command", ["start", "stop", "balance", "symbols", "prices", "indicators"]
+)
 def test_generic_commands_share_the_same_commit_path(
     client: TestClient,
     redis: MemoryRedis,
@@ -541,7 +543,7 @@ def test_generic_commands_share_the_same_commit_path(
     assert response.status_code == 202
     assert len(redis.publications) == 1
     assert redis.publications[0][1] == response.json()
-    if command in ("balance", "symbols", "prices"):
+    if command in ("balance", "symbols", "prices", "indicators"):
         assert trading.REDIS_RUNTIME_KEY not in redis.values
     else:
         snapshot = json.loads(redis.values[trading.REDIS_RUNTIME_KEY])
@@ -905,9 +907,7 @@ def test_working_symbols_are_superuser_only(
     assert response.status_code == expected
 
 
-def test_set_symbols_enqueues_a_command(
-    client: TestClient, redis: MemoryRedis
-) -> None:
+def test_set_symbols_enqueues_a_command(client: TestClient, redis: MemoryRedis) -> None:
     response = client.post(
         "/api/v1/trading/symbols/",
         json={"symbols": ["btcusdt", " ethusdt "]},
@@ -1013,19 +1013,73 @@ def test_openapi_exposes_typed_working_symbols(client: TestClient) -> None:
         "monitoring_updated_at",
     } <= set(models["WorkingSymbols"]["properties"])
     paths = schema["paths"]["/api/v1/trading/symbols/"]
-    assert (
-        paths["get"]["responses"]["200"]["content"]["application/json"]["schema"][
-            "$ref"
-        ].endswith("/WorkingSymbols")
-    )
-    assert (
-        paths["post"]["responses"]["202"]["content"]["application/json"]["schema"][
-            "$ref"
-        ].endswith("/CommandEnvelope")
-    )
+    assert paths["get"]["responses"]["200"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("/WorkingSymbols")
+    assert paths["post"]["responses"]["202"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("/CommandEnvelope")
     prices = schema["paths"]["/api/v1/trading/prices/"]["post"]
-    assert (
-        prices["responses"]["202"]["content"]["application/json"]["schema"][
-            "$ref"
-        ].endswith("/CommandEnvelope")
+    assert prices["responses"]["202"]["content"]["application/json"]["schema"][
+        "$ref"
+    ].endswith("/CommandEnvelope")
+
+
+def test_fetch_indicators_enqueues_an_observation_only_command(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    response = client.post("/api/v1/trading/indicators/", headers=headers(client))
+    assert response.status_code == 202
+    stream, envelope, _ = redis.publications[0]
+    assert stream == trading.REDIS_COMMAND_STREAM
+    assert envelope["type"] == "indicators"
+    assert envelope["payload"] == {}
+    # Reading indicators must never rewrite (and so never stop) the run.
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+@pytest.mark.parametrize("role,expected", [(None, 401), ("user", 403)])
+def test_fetch_indicators_is_superuser_only(
+    client: TestClient, redis: MemoryRedis, role: str | None, expected: int
+) -> None:
+    redis.fail = "get"
+    response = client.post(
+        "/api/v1/trading/indicators/",
+        headers=headers(client, role) if role else {},
     )
+    assert response.status_code == expected
+    assert not redis.publications
+
+
+def test_indicator_snapshot_documents_the_agent_result_shape() -> None:
+    """The shape Strategy.indicator_snapshot + Engine produce (agent side)."""
+    snapshot = trading.IndicatorSnapshot.model_validate(
+        {
+            "strategy": "tripple_screen",
+            "network": "live",
+            "computed_at": "2026-09-23T08:30:00+00:00",
+            "groups": [
+                {
+                    "key": "tide",
+                    "label": "Tide",
+                    "interval": "4h",
+                    "indicators": [{"key": "ema_fast", "label": "EMA 5"}],
+                }
+            ],
+            "rows": [
+                {
+                    "symbol": "BTCUSDT",
+                    "groups": {
+                        "tide": {
+                            "bar_open_time": "2026-09-23T04:00:00+00:00",
+                            "values": {
+                                "ema_fast": {"current": "64210.5", "previous": None}
+                            },
+                        },
+                        "wave": {"bar_open_time": None, "values": {}},
+                    },
+                }
+            ],
+        }
+    )
+    assert snapshot.rows[0].groups["tide"].values["ema_fast"].current == "64210.5"

@@ -107,7 +107,7 @@ export type CommandRequest = {
     /**
      * Type
      */
-    type: 'start' | 'stop' | 'balance' | 'symbols' | 'prices';
+    type: 'start' | 'stop' | 'balance' | 'symbols' | 'prices' | 'indicators';
     /**
      * Payload
      */
@@ -1623,6 +1623,22 @@ export type tradingRefreshPricesResponses = {
 };
 
 export type tradingRefreshPricesResponse = tradingRefreshPricesResponses[keyof tradingRefreshPricesResponses];
+
+export type tradingFetchIndicatorsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/indicators/';
+};
+
+export type tradingFetchIndicatorsResponses = {
+    /**
+     * Successful Response
+     */
+    202: CommandEnvelope;
+};
+
+export type tradingFetchIndicatorsResponse = tradingFetchIndicatorsResponses[keyof tradingFetchIndicatorsResponses];
 
 export type tradingGetCommandResultData = {
     body?: never;

@@ -311,6 +311,38 @@ def test_balance_command_returns_typed_snapshot(
     asyncio.run(scenario())
 
 
+def test_indicators_without_a_running_strategy_reports_failure() -> None:
+    async def scenario() -> None:
+        redis = redis_mock()
+        await commands.dispatch(Engine(redis), redis, envelope("indicators", "ind-0"))
+        result = results(redis)["agent:result:ind-0"]
+        assert result["ok"] is False
+        assert "no running strategy" in result["message"]
+
+    asyncio.run(scenario())
+
+
+def test_indicators_returns_the_running_strategy_snapshot() -> None:
+    async def scenario() -> None:
+        redis = redis_mock()
+        engine = Engine(redis)
+        engine._state = "running"
+        engine._network = "live"
+        engine._strategy_name = "tripple_screen"
+        engine._strategy = Mock(
+            indicator_snapshot=Mock(return_value={"groups": [], "rows": []})
+        )
+        await commands.dispatch(engine, redis, envelope("indicators", "ind-1"))
+        result = results(redis)["agent:result:ind-1"]
+        assert result["ok"] is True
+        assert result["data"]["strategy"] == "tripple_screen"
+        assert result["data"]["network"] == "live"
+        assert "computed_at" in result["data"]
+        assert result["data"]["groups"] == [] and result["data"]["rows"] == []
+
+    asyncio.run(scenario())
+
+
 def test_start_failure_result(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         redis = redis_mock()
