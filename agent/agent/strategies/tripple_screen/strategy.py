@@ -202,8 +202,8 @@ class TripleScreenStrategy(Strategy):
             # Subscribe first: callbacks buffer closes while REST is in flight.
             await self._wire_streams(to_add)
             await self._bootstrap(to_add)
-        for symbol in to_remove:
-            await self._unwire_symbol(symbol)
+        if to_remove:
+            await self._unwire_symbols(to_remove)
         self._active_symbols = selected
         if to_add or to_remove:
             logger.info(
@@ -213,19 +213,25 @@ class TripleScreenStrategy(Strategy):
                 len(selected),
             )
 
-    async def _unwire_symbol(self, symbol: str) -> None:
-        for interval in self._intervals():
-            try:
-                await self.services.streams.unsubscribe_kline(
-                    symbol=symbol, interval=interval
-                )
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                logger.debug(
-                    "tripple_screen unsubscribe failed symbol=%s interval=%s",
-                    symbol,
-                    interval,
-                    exc_info=True,
-                )
+    async def _unwire_symbols(self, symbols: list[str]) -> None:
+        # One batched UNSUBSCRIBE: per-stream messages exceed Binance's
+        # 5 msg/s per-connection limit and get the whole connection dropped.
+        try:
+            await self.services.streams.unsubscribe_klines_batch(
+                [
+                    (symbol, interval)
+                    for symbol in symbols
+                    for interval in self._intervals()
+                ]
+            )
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            logger.debug(
+                "tripple_screen unsubscribe failed symbols=%s", symbols, exc_info=True
+            )
+        for symbol in symbols:
+            self._forget_symbol(symbol)
+
+    def _forget_symbol(self, symbol: str) -> None:
         self._candles.pop(symbol, None)
         self._last_price.pop(symbol, None)
         self._pending.pop(symbol, None)

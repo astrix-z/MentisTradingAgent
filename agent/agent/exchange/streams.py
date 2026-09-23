@@ -100,8 +100,7 @@ class MarketDataStreams:
             return
         await self._ensure_started()
         streams = [
-            f"{symbol.lower()}@kline_{KlineIntervalEnum(interval).value}"
-            for symbol, interval, _ in subscriptions
+            _kline_stream(symbol, interval) for symbol, interval, _ in subscriptions
         ]
         await self._client.subscribe(
             streams=streams,
@@ -112,28 +111,29 @@ class MarketDataStreams:
         ):
             handle = RequestStreamHandle(self._client, stream, KlineResponse)
             handle.on("message", callback)
-            self._handles.append(handle)
             self._kline_handles[(symbol.upper(), interval)] = handle
 
-    async def unsubscribe_kline(self, *, symbol: str, interval: str) -> None:
-        """Drop one symbol/interval kline subscription, leaving the rest of
-        the connection (and its other subscriptions) untouched."""
-        handle = self._kline_handles.pop((symbol.upper(), interval), None)
-        if handle is None:
+    async def unsubscribe_klines_batch(self, pairs: Sequence[tuple[str, str]]) -> None:
+        """Drop many symbol/interval kline subscriptions in one message.
+
+        Binance allows at most 5 incoming messages per second per connection
+        and drops the connection when a client exceeds it. One ``UNSUBSCRIBE``
+        per stream (what ``RequestStreamHandle.unsubscribe()`` sends) blows
+        through that as soon as a rescreen removes two symbols, so all streams
+        go into a single ``UNSUBSCRIBE``, mirroring ``subscribe_klines_batch``.
+        The rest of the connection and its other subscriptions stay untouched.
+        """
+        streams = [
+            _kline_stream(symbol, interval)
+            for symbol, interval in pairs
+            if self._kline_handles.pop((symbol.upper(), interval), None) is not None
+        ]
+        if not streams:
             return
         try:
-            self._handles.remove(handle)
-        except ValueError:
-            pass
-        try:
-            await handle.unsubscribe()
+            await self._client.unsubscribe(streams=streams)  # type: ignore[no-untyped-call]
         except Exception:  # noqa: BLE001 - best-effort teardown
-            logger.debug(
-                "kline unsubscribe failed symbol=%s interval=%s",
-                symbol,
-                interval,
-                exc_info=True,
-            )
+            logger.debug("kline unsubscribe failed streams=%s", streams, exc_info=True)
 
     async def subscribe_ticker(self, *, symbol: str, callback: TickerCallback) -> None:
         """Subscribe to the rolling 24h ticker (last price in ``.c``)."""
@@ -157,8 +157,8 @@ class MarketDataStreams:
 
     async def stop(self) -> None:
         """Unsubscribe every stream and close the connection (best effort)."""
+        await self.unsubscribe_klines_batch(list(self._kline_handles))
         handles, self._handles = self._handles, []
-        self._kline_handles.clear()
         for handle in handles:
             try:
                 await handle.unsubscribe()
@@ -174,6 +174,10 @@ class MarketDataStreams:
         except Exception:  # noqa: BLE001 - best-effort teardown
             logger.debug("websocket close failed", exc_info=True)
         logger.info("market streams stopped network=%s", self._network)
+
+
+def _kline_stream(symbol: str, interval: str) -> str:
+    return f"{symbol.lower()}@kline_{KlineIntervalEnum(interval).value}"
 
 
 __all__ = [

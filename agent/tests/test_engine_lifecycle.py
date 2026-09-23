@@ -325,6 +325,38 @@ def test_repeated_cancel_finishes_cleanup(
     asyncio.run(scenario())
 
 
+def test_streams_unsubscribe_klines_in_one_message() -> None:
+    async def scenario() -> None:
+        streams = MarketDataStreams.__new__(MarketDataStreams)
+        streams._network = "live"
+        streams._connection = object()
+        streams._handles = []
+        streams._kline_handles = {
+            ("UNIUSDT", "4h"): Mock(),
+            ("UNIUSDT", "15m"): Mock(),
+            ("ZILUSDT", "1h"): Mock(),
+            ("BTCUSDT", "1h"): Mock(),
+        }
+        streams._client = Mock(unsubscribe=AsyncMock())
+        await streams.unsubscribe_klines_batch(
+            [
+                ("UNIUSDT", "4h"),
+                ("uniusdt", "15m"),
+                ("ZILUSDT", "1h"),
+                ("ETHUSDT", "1h"),
+            ]
+        )
+        streams._client.unsubscribe.assert_awaited_once_with(
+            streams=["uniusdt@kline_4h", "uniusdt@kline_15m", "zilusdt@kline_1h"]
+        )
+        assert list(streams._kline_handles) == [("BTCUSDT", "1h")]
+        # Nothing tracked left to drop -> no message at all.
+        await streams.unsubscribe_klines_batch([("ETHUSDT", "1h")])
+        assert streams._client.unsubscribe.await_count == 1
+
+    asyncio.run(scenario())
+
+
 def test_streams_close_partial_sdk_connection() -> None:
     async def scenario() -> None:
         streams = MarketDataStreams.__new__(MarketDataStreams)

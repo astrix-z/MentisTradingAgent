@@ -831,6 +831,7 @@ class MultiStreams:
     def __init__(self) -> None:
         self.subscribed: set[tuple[str, str]] = set()
         self.unsubscribed: list[tuple[str, str]] = []
+        self.unsubscribe_calls: list[list[tuple[str, str]]] = []
 
     async def subscribe_klines_batch(
         self,
@@ -839,9 +840,11 @@ class MultiStreams:
         for symbol, interval, _callback in subscriptions:
             self.subscribed.add((symbol, interval))
 
-    async def unsubscribe_kline(self, *, symbol: str, interval: str) -> None:
-        self.subscribed.discard((symbol, interval))
-        self.unsubscribed.append((symbol, interval))
+    async def unsubscribe_klines_batch(self, pairs: list[tuple[str, str]]) -> None:
+        self.unsubscribe_calls.append(list(pairs))
+        for pair in pairs:
+            self.subscribed.discard(pair)
+            self.unsubscribed.append(pair)
 
 
 def multi_services(
@@ -929,6 +932,44 @@ def test_rescreen_adds_and_removes_symbols() -> None:
             assert "BTCUSDT" not in strategy._candles
             assert ("BTCUSDT", "4h") in streams.unsubscribed
             assert ("ETHUSDT", "4h") in streams.subscribed
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
+def test_rescreen_unsubscribes_removed_symbols_in_one_batch() -> None:
+    """Binance drops a connection that receives more than 5 messages per
+    second, so dropping several symbols must cost one UNSUBSCRIBE, not one
+    per stream (live run 2026-09-21: 6 per-stream UNSUBSCRIBEs killed the WS).
+    """
+
+    async def run() -> None:
+        windows = {
+            "BTCUSDT": fixture(),
+            "ETHUSDT": fixture(),
+            "SOLUSDT": falling_4h(fixture()),
+        }
+        rest = MultiRest(windows)
+        streams, sink = MultiStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        await strategy.on_start(
+            multi_services(rest, streams, sink, ["BTCUSDT", "ETHUSDT", "SOLUSDT"])
+        )
+        try:
+            assert strategy._active_symbols == {"BTCUSDT", "ETHUSDT"}
+            rest.windows["BTCUSDT"] = falling_4h(fixture())
+            rest.windows["ETHUSDT"] = falling_4h(fixture())
+            rest.windows["SOLUSDT"] = fixture()
+            await strategy._apply_selection(await strategy._screen_universe())
+            assert strategy._active_symbols == {"SOLUSDT"}
+            assert len(streams.unsubscribe_calls) == 1
+            intervals = strategy._intervals()
+            assert sorted(streams.unsubscribe_calls[0]) == sorted(
+                (symbol, interval)
+                for symbol in ("BTCUSDT", "ETHUSDT")
+                for interval in intervals
+            )
         finally:
             await strategy.on_stop()
 
