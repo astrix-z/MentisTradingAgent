@@ -134,6 +134,7 @@ class Rest:
 class Streams:
     def __init__(self) -> None:
         self.callbacks: dict[str, Callable[[KlineResponse], None]] = {}
+        self.reconnect_listeners: list[Callable[[], None]] = []
 
     async def subscribe_klines_batch(
         self,
@@ -141,6 +142,9 @@ class Streams:
     ) -> None:
         for _symbol, interval, callback in subscriptions:
             self.callbacks[interval] = callback
+
+    def on_reconnect(self, listener: Callable[[], None]) -> None:
+        self.reconnect_listeners.append(listener)
 
 
 class RedisSink:
@@ -832,6 +836,7 @@ class MultiStreams:
         self.subscribed: set[tuple[str, str]] = set()
         self.unsubscribed: list[tuple[str, str]] = []
         self.unsubscribe_calls: list[list[tuple[str, str]]] = []
+        self.reconnect_listeners: list[Callable[[], None]] = []
 
     async def subscribe_klines_batch(
         self,
@@ -839,6 +844,9 @@ class MultiStreams:
     ) -> None:
         for symbol, interval, _callback in subscriptions:
             self.subscribed.add((symbol, interval))
+
+    def on_reconnect(self, listener: Callable[[], None]) -> None:
+        self.reconnect_listeners.append(listener)
 
     async def unsubscribe_klines_batch(self, pairs: list[tuple[str, str]]) -> None:
         self.unsubscribe_calls.append(list(pairs))
@@ -970,6 +978,38 @@ def test_rescreen_unsubscribes_removed_symbols_in_one_batch() -> None:
                 for symbol in ("BTCUSDT", "ETHUSDT")
                 for interval in intervals
             )
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
+def test_streams_reconnect_backfills_gapped_windows() -> None:
+    """Bars that closed while the WS was down are reloaded over REST."""
+
+    async def run() -> None:
+        windows = {"BTCUSDT": fixture(), "ETHUSDT": falling_4h(fixture())}
+        rest = MultiRest(windows)
+        streams, sink = MultiStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        await strategy.on_start(
+            multi_services(rest, streams, sink, ["BTCUSDT", "ETHUSDT"])
+        )
+        try:
+            full = {k: list(v) for k, v in strategy._candles["BTCUSDT"].items()}
+            # Simulate the outage gap: the latest closed bars never arrived.
+            for interval, candles in strategy._candles["BTCUSDT"].items():
+                strategy._candles["BTCUSDT"][interval] = candles[:-3]
+            calls_before = len(rest.calls)
+
+            (listener,) = streams.reconnect_listeners
+            running = set(strategy._tasks)
+            listener()
+            (backfill,) = strategy._tasks - running
+            await backfill
+
+            assert strategy._candles["BTCUSDT"] == full
+            assert {c["symbol"] for c in rest.calls[calls_before:]} == {"BTCUSDT"}
         finally:
             await strategy.on_stop()
 

@@ -91,6 +91,7 @@ class TripleScreenStrategy(Strategy):
                 sorted(selected),
             )
             # Stage 2: only the screened subset gets wired/bootstrapped.
+            services.streams.on_reconnect(self._on_streams_reconnect)
             await self._apply_selection(selected)
             self._spawn(self._run())
             self._spawn(self._rescreen_loop())
@@ -105,6 +106,18 @@ class TripleScreenStrategy(Strategy):
             for interval in self._intervals()
         ]
         await self.services.streams.subscribe_klines_batch(subscriptions)
+
+    def _on_streams_reconnect(self) -> None:
+        # Bars that closed while the WS was down were never delivered; reload
+        # the closed windows so indicators do not run on a gapped series.
+        if self._active and self._active_symbols:
+            self._spawn(self._backfill(sorted(self._active_symbols)))
+
+    async def _backfill(self, symbols: list[str]) -> None:
+        await self._bootstrap(symbols)
+        logger.info(
+            "tripple_screen backfilled after reconnect symbols=%s", len(symbols)
+        )
 
     async def _bootstrap(self, symbols: list[str]) -> None:
         cutoff = int(datetime.now(UTC).timestamp() * 1000) - 1
