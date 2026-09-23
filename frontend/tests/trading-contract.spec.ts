@@ -2,6 +2,7 @@ import { expect, type Page, test } from "@playwright/test"
 import type {
   CommandEnvelope,
   CommandResult,
+  PositionsList,
   StrategyCatalog,
   SymbolEntry,
   TradingStatus,
@@ -124,6 +125,13 @@ function manySymbols(count: number): WorkingSymbols {
   }
 }
 
+// A just-issued command, before its result arrives. The tracker polls every
+// 1.5 s on a timer the test clock cannot hold back, so "accepted" can already
+// read "pending" when a slow run asserts; both mean "accepted and tracked".
+function accepted(type: string): RegExp {
+  return new RegExp(`^${type} — (accepted|pending)$`)
+}
+
 async function mock(
   page: Page,
   status = snapshot(),
@@ -156,6 +164,9 @@ async function mock(
       body = results.get(id) ?? null
     } else if (url.pathname.endsWith("/trading/strategies/")) {
       body = published
+    } else if (url.pathname.endsWith("/trading/positions/")) {
+      // The dashboard at "/" reads positions; none have been recorded here.
+      body = { positions: [] } satisfies PositionsList
     } else if (
       request.method() === "GET" &&
       url.pathname.endsWith("/trading/symbols/")
@@ -243,7 +254,7 @@ test("balance page is observation-only and separates desired, actual and balance
   await page.getByRole("button", { name: "LIVE", exact: true }).click()
   expect(api.posts).toEqual([])
   await page.getByRole("button", { name: "Check balance", exact: true }).click()
-  await expect(page.getByText("balance — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("balance"))).toBeVisible()
   expect(api.posts[0].body).toEqual({ network: "live" })
 })
 
@@ -279,7 +290,7 @@ test("strategy seeds desired config, preserves dirty draft and reports rejected 
   await page
     .getByRole("button", { name: "Confirm live Start", exact: true })
     .click()
-  await expect(page.getByText("start — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("start"))).toBeVisible()
   // Decimals are sent as strings so precision survives the round-trip.
   expect(api.posts[0].body).toMatchObject({
     network: "live",
@@ -329,7 +340,7 @@ test("a monitored symbol is labelled, never filtered", async ({ page }) => {
   await page.clock.install()
   await monitored.click()
   await page.getByRole("button", { name: "Save", exact: true }).click()
-  await expect(page.getByText("symbols — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("symbols"))).toBeVisible()
   expect(api.posts[0].path).toContain("/trading/symbols/")
   expect(api.posts[0].body).toEqual({ symbols: [] })
 })
@@ -377,7 +388,7 @@ test("working symbols: filter, sort on every column and save the whole set", asy
   await expect(page.getByText("Unsaved changes")).toBeVisible()
   expect(api.posts).toEqual([])
   await page.getByRole("button", { name: "Save", exact: true }).click()
-  await expect(page.getByText("symbols — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("symbols"))).toBeVisible()
   expect(api.posts[0].path).toContain("/trading/symbols/")
   expect(api.posts[0].body).toEqual({ symbols: ["BTCUSDT", "ETHUSDT"] })
 
@@ -512,7 +523,7 @@ test("Monitoring selection and inversion can be saved as the whole set", async (
 
   // The actions only changed the normal draft; Save still sends its complete set.
   await page.getByRole("button", { name: "Save", exact: true }).click()
-  await expect(page.getByText("symbols — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("symbols"))).toBeVisible()
   expect(api.posts[0].path).toContain("/trading/symbols/")
   expect(api.posts[0].body).toEqual({ symbols: ["BTCUSDT"] })
 })
@@ -534,7 +545,7 @@ test("prices are read on request and land in the price column", async ({
 
   await page.clock.install()
   await page.getByRole("button", { name: "Request prices" }).click()
-  await expect(page.getByText("prices — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("prices"))).toBeVisible()
   expect(api.posts[0].path).toContain("/trading/prices/")
   expect(api.posts[0].body).toBeFalsy()
 
@@ -569,7 +580,7 @@ test("a price refresh keeps the reader on the same page", async ({ page }) => {
 
   await page.clock.install()
   await page.getByRole("button", { name: "Request prices" }).click()
-  await expect(page.getByText("prices — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("prices"))).toBeVisible()
   api.results.set(firstId, {
     command_id: firstId,
     type: "prices",
@@ -597,7 +608,7 @@ test("only the latest balance request is shown, and results stay correlated", as
   await page.clock.install()
   await page.getByRole("button", { name: "LIVE", exact: true }).click()
   await page.getByRole("button", { name: "Check balance", exact: true }).click()
-  await expect(page.getByText("balance — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("balance"))).toBeVisible()
   await page.getByRole("button", { name: "TESTNET", exact: true }).click()
   await page.getByRole("button", { name: "Check balance", exact: true }).click()
   // The newer request replaces the older section instead of adding one.
@@ -677,7 +688,7 @@ test("offline stop remains pending then times out without success", async ({
   await page.goto("/strategy")
   await page.clock.install()
   await page.getByRole("button", { name: "Stop", exact: true }).click()
-  await expect(page.getByText("stop — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("stop"))).toBeVisible()
   await page.clock.runFor(2000)
   await expect(page.getByText("stop — pending")).toBeVisible()
   await page.clock.runFor(121000)
@@ -711,7 +722,7 @@ test("missing heartbeat and transient result errors never imply success", async 
   // Testnet Start skips the live-only confirmation dialog.
   await page.getByRole("button", { name: "TESTNET", exact: true }).click()
   await page.getByRole("button", { name: "Start", exact: true }).click()
-  await expect(page.getByText("start — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("start"))).toBeVisible()
   await page.clock.runFor(2000)
   await expect(
     page.getByText("Result temporarily unavailable; retrying"),
@@ -734,7 +745,7 @@ test("a succeeded start shows a summary with the symbol count, not the list", as
   await page.clock.install()
   await page.getByRole("button", { name: "TESTNET", exact: true }).click()
   await page.getByRole("button", { name: "Start", exact: true }).click()
-  await expect(page.getByText("start — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("start"))).toBeVisible()
   api.results.set(firstId, {
     command_id: firstId,
     type: "start",
@@ -766,7 +777,7 @@ test("a command started on /strategy keeps polling and resolves after navigating
   await page.goto("/strategy")
   await page.clock.install()
   await page.getByRole("button", { name: "Stop", exact: true }).click()
-  await expect(page.getByText("stop — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("stop"))).toBeVisible()
   await page.clock.runFor(2000)
   await expect(page.getByText("stop — pending")).toBeVisible()
   const pollsBefore = api.reads.filter((id) => id === firstId).length
@@ -849,7 +860,7 @@ test("Stop sends an empty payload and never carries strategy settings", async ({
   const api = await mock(page)
   await page.goto("/strategy")
   await page.getByRole("button", { name: "Stop", exact: true }).click()
-  await expect(page.getByText("stop — accepted")).toBeVisible()
+  await expect(page.getByText(accepted("stop"))).toBeVisible()
   expect(api.posts[0].path).toContain("/stop/")
   expect(api.posts[0].body).toBeFalsy()
 })
