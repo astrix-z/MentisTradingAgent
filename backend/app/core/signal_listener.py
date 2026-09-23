@@ -4,10 +4,15 @@ The strategy never places real orders (D-SIGNAL-ONLY) — it only emits
 ``Signal`` events, published as JSON on the Redis pub/sub channel
 ``agent:events`` (see ``Engine._publish_event`` in ``agent/agent/engine.py``).
 Pub/sub has no history: a message is lost forever if nothing is subscribed
-when it fires. This module is the (only) subscriber, turning ENTRY signals
-into durable ``SignalPosition`` rows the backend's own DB owns, so
+when it fires. This module is the subscriber, turning ENTRY signals into
+durable ``SignalPosition`` rows the backend's own DB owns, so
 ``GET /trading/positions/`` has something to read regardless of when a signal
 happened to fire relative to who was watching.
+
+The backend runs several uvicorn workers, each with this module's lifespan
+task, but only one of them listens at a time (``run_signal_listener``): a
+Redis lock elects the leader, which renews it while alive and releases it on
+shutdown, so another worker takes over within ``_LEADER_TTL_MS`` if it dies.
 """
 
 from __future__ import annotations
@@ -16,6 +21,8 @@ import asyncio
 import json
 import logging
 import re
+import uuid
+from contextlib import suppress
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -37,6 +44,25 @@ REDIS_EVENTS_CHANNEL = "agent:events"
 # duplicate these key names across the two codebases.
 REDIS_RUNTIME_KEY = "agent:runtime"
 _RECONNECT_DELAY_SECONDS = 2.0
+# Leader election across uvicorn workers: the lock outlives a renew interval
+# comfortably, so a slow tick never hands leadership over by accident.
+REDIS_LISTENER_LOCK_KEY = "backend:signal-listener:leader"
+_LEADER_TTL_MS = 15_000
+_LEADER_RENEW_SECONDS = 5.0
+# Renew/release only if the lock is still ours: another worker may have taken
+# it after ours expired, and that one must not be extended or deleted.
+_RENEW_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('pexpire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+_RELEASE_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
 _TP_RULE_RE = re.compile(r"fill x ([\d.]+)")
 
 
@@ -88,10 +114,10 @@ def _record_entry(payload: dict[str, Any], network: str) -> None:
             else None
         ),
     )
-    # Every uvicorn worker runs its own listener, so the same signal arrives
-    # once per worker at the same instant. A select-then-insert races (the
-    # losers hit the unique index and logged an IntegrityError per signal);
-    # ON CONFLICT makes "first writer wins, the rest are no-ops" atomic.
+    # Only the elected worker listens, but a leadership handover can briefly
+    # overlap and pub/sub can redeliver after a reconnect, so the same signal
+    # may still be recorded twice. ON CONFLICT makes "first writer wins, the
+    # rest are no-ops" atomic, where a select-then-insert would race.
     statement = (
         pg_insert(SignalPosition)
         .values(**position.model_dump())
@@ -171,8 +197,8 @@ async def _handle_message(redis: Redis, raw: str) -> None:
 async def listen_for_signals(redis: Redis) -> None:
     """Run forever, turning ENTRY/EXIT signals into DB rows as they arrive."""
     while True:
+        pubsub = redis.pubsub()
         try:
-            pubsub = redis.pubsub()
             await pubsub.subscribe(REDIS_EVENTS_CHANNEL)
             logger.info("subscribed to %s for strategy signals", REDIS_EVENTS_CHANNEL)
             async for message in pubsub.listen():
@@ -186,4 +212,67 @@ async def listen_for_signals(redis: Redis) -> None:
                 "signal listener lost Redis connection; retrying in %ss",
                 _RECONNECT_DELAY_SECONDS,
             )
+            await asyncio.sleep(_RECONNECT_DELAY_SECONDS)
+        finally:
+            # A worker that stops listening (lost leadership, shutdown) must
+            # unsubscribe, or Redis keeps buffering messages nobody reads.
+            with suppress(RedisError):
+                await pubsub.aclose()  # type: ignore[no-untyped-call]
+
+
+async def _hold_leadership(
+    redis: Redis, token: str, listener: asyncio.Task[None]
+) -> None:
+    """Renew the lock until it is lost or the listener ends."""
+    while not listener.done():
+        await asyncio.wait({listener}, timeout=_LEADER_RENEW_SECONDS)
+        if listener.done():
+            return
+        try:
+            renewed = await redis.eval(  # type: ignore[misc]
+                _RENEW_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token, str(_LEADER_TTL_MS)
+            )
+        except RedisError:
+            renewed = 0
+        if not renewed:
+            logger.warning("signal listener lost leadership; stepping down")
+            return
+
+
+async def run_signal_listener(redis: Redis) -> None:
+    """Run ``listen_for_signals`` in exactly one worker at a time.
+
+    Every worker calls this; the one holding the Redis lock listens, the rest
+    retry every renew interval so one of them takes over if the leader dies.
+    """
+    token = uuid.uuid4().hex
+    while True:
+        try:
+            acquired = await redis.set(
+                REDIS_LISTENER_LOCK_KEY, token, nx=True, px=_LEADER_TTL_MS
+            )
+        except RedisError:
+            acquired = False
+        if not acquired:
+            await asyncio.sleep(_LEADER_RENEW_SECONDS)
+            continue
+        logger.info("signal listener leadership acquired")
+        listener = asyncio.create_task(listen_for_signals(redis))
+        try:
+            await _hold_leadership(redis, token, listener)
+        finally:
+            listener.cancel()
+            crashed = False
+            try:
+                await listener
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 - keep electing after a crash
+                logger.exception("signal listener crashed; re-electing")
+                crashed = True
+            with suppress(RedisError):
+                await redis.eval(  # type: ignore[misc]
+                    _RELEASE_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token
+                )
+        if crashed:
             await asyncio.sleep(_RECONNECT_DELAY_SECONDS)

@@ -12,7 +12,7 @@ from starlette.middleware.cors import CORSMiddleware
 from app.api.main import api_router
 from app.core.config import settings
 from app.core.redis_client import close_redis, get_redis
-from app.core.signal_listener import listen_for_signals
+from app.core.signal_listener import run_signal_listener
 
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 
@@ -25,8 +25,9 @@ def custom_generate_unique_id(route: APIRoute) -> str:
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Durably records ENTRY/EXIT signals as they arrive (Redis pub/sub has no
     # history, so nothing else ever sees a signal that fires while this task
-    # isn't running) — see app.core.signal_listener for why.
-    listener = asyncio.create_task(listen_for_signals(get_redis()))
+    # isn't running) — see app.core.signal_listener for why. Every worker
+    # starts it; a Redis lock lets only one of them actually listen.
+    listener = asyncio.create_task(run_signal_listener(get_redis()))
     yield
     listener.cancel()
     with contextlib.suppress(asyncio.CancelledError):
