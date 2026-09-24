@@ -60,7 +60,9 @@ logger = logging.getLogger(__name__)
 POLL_SECONDS = 5.0
 
 #: Position states in which protection is not confirmed; entries stay closed.
+#: ``protecting`` counts too: the first seconds after a fill are unprotected.
 UNSAFE_STATES = (
+    PositionStatus.PROTECTING,
     PositionStatus.UNPROTECTED,
     PositionStatus.PROTECTION_OVERDUE,
     PositionStatus.UNKNOWN,

@@ -37,6 +37,7 @@ from agent.execution.models import (
     SignalInbox,
 )
 from agent.execution.orders import OrderManager
+from agent.execution.protection import Protector
 from agent.execution.quotes import QuoteProvider
 from agent.execution.runtime import ExecutionContext, ExecutionRuntime
 from agent.execution.settings import ExecutionSettings
@@ -81,6 +82,7 @@ class Stack:
     finalizer: Finalizer
     orders: OrderManager
     rest: ExchangeRest
+    protector: Protector
 
 
 @dataclass
@@ -136,7 +138,15 @@ class World:
             network="live", settings=self.settings, params={"quote_asset": "USDT"}
         )
         runtime.open_admission("tripple_screen")
-        stack = Stack(runtime, admission, applier, finalizer, orders, rest)
+        stack = Stack(
+            runtime,
+            admission,
+            applier,
+            finalizer,
+            orders,
+            rest,
+            Protector(orders, finalizer),
+        )
         self.stacks.append(stack)
         return stack
 
@@ -181,6 +191,19 @@ class World:
         return signal.identified(
             account_uid="1001", network="live", strategy="tripple_screen"
         )
+
+    async def filled(self, stack: Stack, symbol: str = "BTCUSDT") -> uuid.UUID:
+        """Reserve and fill an entry; return the new position's id."""
+        signal_id = await self.reserve(stack, symbol)
+        result = await stack.orders.execute_entry(signal_id)
+        assert result.position_id is not None, result
+        return result.position_id
+
+    async def position(self, stack: Stack, position_id: uuid.UUID) -> Position:
+        async with stack.runtime.session() as session:
+            row = await session.get(Position, position_id)
+            assert row is not None
+            return row
 
     async def reserve(
         self, stack: Stack, symbol: str = "BTCUSDT", **options: Any
