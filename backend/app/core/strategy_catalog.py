@@ -501,6 +501,15 @@ class CompiledCatalog:
                 raise CatalogError(f"malformed strategy entry {entry!r}")
             strategy = CompiledStrategy(entry, self.lookups)
             self.strategies[strategy.name] = strategy
+        # Execution settings travel next to the strategies in the same entry
+        # shape and are enforced the same way. An agent that does not publish
+        # them yet simply has none; a malformed section is a contract error.
+        execution = payload.get("execution")
+        self.execution: CompiledStrategy | None = None
+        if execution is not None:
+            if not isinstance(execution, dict):
+                raise CatalogError("catalog execution section must be an object")
+            self.execution = CompiledStrategy(execution, self.lookups)
 
     def strategy(self, name: str) -> CompiledStrategy | None:
         return self.strategies.get(name)

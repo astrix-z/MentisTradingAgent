@@ -131,6 +131,39 @@ def catalog_payload() -> dict[str, Any]:
                 ],
             }
         ],
+        "execution": {
+            "name": "execution",
+            "label": "Execution",
+            "description": "Test execution settings.",
+            "settings_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "title": "ExecutionSettings",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "title": "Real execution",
+                        "default": False,
+                    },
+                    "max_slippage_pct": {
+                        "anyOf": [
+                            {
+                                "type": "number",
+                                "exclusiveMinimum": 0.0,
+                                "maximum": 5.0,
+                            },
+                            {
+                                "type": "string",
+                                "pattern": "[+-]?0*\\d*\\.?\\d*",
+                            },
+                        ],
+                        "title": "Max entry slippage %",
+                        "default": "0.3",
+                    },
+                },
+            },
+            "constraints": [],
+        },
     }
 
 
@@ -366,6 +399,7 @@ def test_start_stop_preserves_form_and_increments_revision(
     assert status["desired"] == {
         **START,
         "symbols": ["BTCUSDT"],
+        "execution": {},
         "running": False,
         "last_command": "stop",
         "updated_at": "2026-09-12T00:00:00Z",
@@ -1083,3 +1117,73 @@ def test_indicator_snapshot_documents_the_agent_result_shape() -> None:
         }
     )
     assert snapshot.rows[0].groups["tide"].values["ema_fast"].current == "64210.5"
+
+
+def test_start_carries_validated_execution_settings(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "execution": {"enabled": True, "max_slippage_pct": "0.5"}},
+        headers=headers(client),
+    )
+    assert response.status_code == 202
+    assert response.json()["payload"]["execution"] == {
+        "enabled": True,
+        "max_slippage_pct": "0.5",
+    }
+    snapshot = json.loads(redis.values[trading.REDIS_RUNTIME_KEY])
+    assert snapshot["execution"] == {"enabled": True, "max_slippage_pct": "0.5"}
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        {"max_slippage_pct": 50},
+        {"enabled": "sometimes"},
+        {"no_such_setting": 1},
+    ],
+)
+def test_invalid_execution_settings_are_rejected_before_redis(
+    client: TestClient, redis: MemoryRedis, execution: dict[str, Any]
+) -> None:
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "execution": execution},
+        headers=headers(client),
+    )
+    assert response.status_code == 422
+    assert all(
+        error["loc"][:2] == ["body", "execution"] for error in response.json()["detail"]
+    )
+    assert not redis.publications
+
+
+def test_execution_settings_need_a_published_execution_section(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    catalog = catalog_payload()
+    del catalog["execution"]
+    redis.values[REDIS_STRATEGIES_KEY] = json.dumps(catalog)
+    refused = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "execution": {"enabled": True}},
+        headers=headers(client),
+    )
+    assert refused.status_code == 503
+    plain = client.post("/api/v1/trading/start/", json=START, headers=headers(client))
+    assert plain.status_code == 202
+
+
+@pytest.mark.parametrize("command", ["execution_pause", "execution_resume"])
+def test_execution_pause_and_resume_do_not_touch_the_running_intent(
+    client: TestClient, redis: MemoryRedis, command: str
+) -> None:
+    response = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": command, "payload": {}},
+        headers=headers(client),
+    )
+    assert response.status_code == 202
+    assert redis.publications[0][1]["type"] == command
+    assert trading.REDIS_RUNTIME_KEY not in redis.values

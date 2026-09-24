@@ -114,7 +114,16 @@ SuperUserDep = Annotated[User, Depends(get_current_active_superuser)]
 
 # Trading network the agent should run against (must match agent key selection).
 Network = Literal["testnet", "live"]
-CommandType = Literal["start", "stop", "balance", "symbols", "prices", "indicators"]
+CommandType = Literal[
+    "start",
+    "stop",
+    "balance",
+    "symbols",
+    "prices",
+    "indicators",
+    "execution_pause",
+    "execution_resume",
+]
 
 # Commands that describe the running intent and therefore rewrite the runtime
 # snapshot. Everything else is observation-only (balance, symbols, prices,
@@ -152,6 +161,10 @@ class StartPayload(BaseModel):
     strategy: str
     symbols: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
+    #: Real-execution settings, enforced against the catalog's ``execution``
+    #: section like ``params`` against the strategy's. Empty means defaults,
+    #: which keep real execution off.
+    execution: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate_symbols(self) -> Self:
@@ -201,6 +214,7 @@ class RuntimeSnapshot(BaseModel):
     strategy: str | None = None
     symbols: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
+    execution: dict[str, Any] = Field(default_factory=dict)
     last_command: str | None = None
     updated_at: datetime
     revision: int = Field(default=0, ge=0)
@@ -554,6 +568,7 @@ async def _apply_command(
                     snapshot.strategy = payload["strategy"]
                     snapshot.symbols = list(payload["symbols"])
                     snapshot.params = dict(payload["params"])
+                    snapshot.execution = dict(payload.get("execution") or {})
                 else:
                     # Stopping changes intent, not the saved configuration for the UI.
                     snapshot.running = False
@@ -586,7 +601,33 @@ def _start_command_payload(parsed: StartPayload) -> dict[str, Any]:
         "strategy": parsed.strategy,
         "symbols": [str(s).upper() for s in parsed.symbols],
         "params": dict(parsed.params),
+        "execution": dict(parsed.execution),
     }
+
+
+def _execution_loc(loc: list[Any]) -> list[Any]:
+    """Point an error of the execution section at ``body.execution``.
+
+    The compiled section reports rule failures under ``body.params`` (its
+    strategy-shaped origin) and field errors by field name alone.
+    """
+    rest = loc[2:] if loc[:2] == ["body", "params"] else loc
+    return ["body", "execution", *rest]
+
+
+async def _compiled_execution() -> CompiledStrategy:
+    """The catalog's execution section; ``503`` when the agent has none."""
+    redis = get_redis()
+    try:
+        catalog = await read_catalog(redis)
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    if catalog is None or catalog.execution is None:
+        raise HTTPException(
+            status_code=503,
+            detail="the agent has not published execution settings",
+        )
+    return catalog.execution
 
 
 async def _compiled_strategy(name: str) -> CompiledStrategy:
@@ -628,7 +669,9 @@ async def _compiled_strategy(name: str) -> CompiledStrategy:
     return compiled
 
 
-async def _enforce_strategy_params(strategy: str, params: dict[str, Any]) -> None:
+async def _enforce_strategy_params(
+    strategy: str, params: dict[str, Any], execution: dict[str, Any] | None = None
+) -> None:
     """Reject an invalid Start here, so nothing invalid reaches Redis.
 
     The rules enforced are the agent's own published ones (schema + cross-field
@@ -637,6 +680,12 @@ async def _enforce_strategy_params(strategy: str, params: dict[str, Any]) -> Non
     compiled = await _compiled_strategy(strategy)
     try:
         errors = compiled.validate(params)
+        if execution:
+            section = await _compiled_execution()
+            errors += [
+                {**error, "loc": _execution_loc(error.get("loc") or [])}
+                for error in section.validate(execution)
+            ]
     except CatalogError as exc:
         logger.error("strategy catalog not evaluable: %s", exc)
         raise HTTPException(
@@ -821,7 +870,7 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
             parsed = StartPayload(**request.payload)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=json_safe_errors(exc)) from exc
-        await _enforce_strategy_params(parsed.strategy, parsed.params)
+        await _enforce_strategy_params(parsed.strategy, parsed.params, parsed.execution)
         return await _apply_command("start", _start_command_payload(parsed))
     if request.type == "balance":
         return await _apply_command("balance", request.payload)
@@ -837,6 +886,9 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
         return await _apply_command("indicators", {})
     if request.type == "stop":
         return await _apply_command("stop", {})
+    if request.type in ("execution_pause", "execution_resume"):
+        # Entries only; positions, protection and exits are not affected.
+        return await _apply_command(request.type, {})
     # Unreachable while CommandType lists every type: the branches above are
     # exhaustive on purpose, so a new type cannot silently become a stop.
     raise HTTPException(  # pragma: no cover
@@ -847,7 +899,7 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
 @router.post("/start/", status_code=202, response_model=CommandEnvelope)
 async def start_trading(payload: StartPayload, _: SuperUserDep) -> CommandEnvelope:
     """Convenience alias: start trading on a network with a strategy."""
-    await _enforce_strategy_params(payload.strategy, payload.params)
+    await _enforce_strategy_params(payload.strategy, payload.params, payload.execution)
     return await _apply_command("start", _start_command_payload(payload))
 
 

@@ -107,7 +107,7 @@ export type CommandRequest = {
     /**
      * Type
      */
-    type: 'start' | 'stop' | 'balance' | 'symbols' | 'prices' | 'indicators';
+    type: 'start' | 'stop' | 'balance' | 'symbols' | 'prices' | 'indicators' | 'execution_pause' | 'execution_resume';
     /**
      * Payload
      */
@@ -363,6 +363,12 @@ export type RuntimeSnapshot = {
         [key: string]: unknown;
     };
     /**
+     * Execution
+     */
+    execution?: {
+        [key: string]: unknown;
+    };
+    /**
      * Last Command
      */
     last_command?: string | null;
@@ -461,6 +467,12 @@ export type StartPayload = {
      * Params
      */
     params?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Execution
+     */
+    execution?: {
         [key: string]: unknown;
     };
 };

@@ -198,3 +198,54 @@ def test_the_published_bytes_are_what_the_backend_compiles() -> None:
         assert json.loads(raw)["published_at"] == compiled.published_at
 
     asyncio.run(scenario())
+
+
+agent_execution = pytest.importorskip("agent.execution.settings")
+EXECUTION = COMPILED.execution
+
+
+def agent_rejects_execution(values: dict[str, Any]) -> bool:
+    try:
+        agent_execution.ExecutionSettings.from_payload(values)
+    except ValueError:
+        return True
+    return False
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {},
+        {"enabled": True},
+        {"enabled": True, "max_slippage_pct": "0.5", "max_symbols": 2},
+        {"slot_quote": "10", "position_share": "0.8"},
+    ],
+)
+def test_execution_settings_accepted_by_both(values: dict[str, Any]) -> None:
+    assert EXECUTION is not None
+    assert agent_rejects_execution(values) is False
+    assert EXECUTION.validate(values) == []
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_slippage_pct": 0},
+        {"max_slippage_pct": 6},
+        {"position_share": "1.5"},
+        {"unprotected_deadline_s": 1},
+        {"max_symbols": 0},
+        {"enabled": "maybe"},
+        {"unknown_setting": 1},
+    ],
+)
+def test_execution_settings_rejected_by_both(values: dict[str, Any]) -> None:
+    assert EXECUTION is not None
+    assert agent_rejects_execution(values) is True
+    assert EXECUTION.validate(values)
+
+
+def test_execution_defaults_keep_real_execution_off() -> None:
+    assert EXECUTION is not None
+    props = EXECUTION.settings_schema["properties"]  # type: ignore[index]
+    assert props["enabled"]["default"] is False

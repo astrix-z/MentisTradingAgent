@@ -19,6 +19,7 @@ Redis restart cannot leave the backend without it::
       "schema_hash": "<sha256 over `strategies`>",
       "published_at": "<ISO 8601>",
       "lookups": {"intervals_ms": {"1m": 60000, ...}},
+      "execution": {...},             # execution settings, same entry shape
       "strategies": [
         {
           "name": "tripple_screen",
@@ -87,6 +88,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from agent.engine import REDIS_STRATEGIES_KEY
+from agent.execution.settings import ExecutionSettings
 from agent.strategies import STRATEGIES
 from agent.strategies.base import Strategy
 
@@ -326,13 +328,35 @@ def _merge_lookups() -> dict[str, dict[str, int]]:
     return merged
 
 
+def describe_execution() -> dict[str, Any]:
+    """The execution settings section, in the same shape as a strategy entry.
+
+    One section for every strategy: sizing, slippage and the protection
+    deadline belong to the account, not to a strategy. A Start carries these
+    values as ``execution`` next to ``params``.
+    """
+    return {
+        "name": "execution",
+        "label": "Execution",
+        "description": "Real order execution settings (plan §4.3, §7).",
+        "settings_schema": _settings_schema(
+            ExecutionSettings, where="execution", lookups={}
+        ),
+        "constraints": [],
+    }
+
+
 def describe_catalog() -> dict[str, Any]:
     """Build the published document for every registered strategy."""
     strategies = [
         describe_strategy(name, cls) for name, cls in sorted(STRATEGIES.items())
     ]
+    execution = describe_execution()
     canonical = json.dumps(
-        strategies, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        {"strategies": strategies, "execution": execution},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
     )
     return {
         "version": CATALOG_VERSION,
@@ -340,6 +364,7 @@ def describe_catalog() -> dict[str, Any]:
         "published_at": datetime.now(UTC).isoformat(),
         "lookups": _merge_lookups(),
         "strategies": strategies,
+        "execution": execution,
     }
 
 
@@ -376,6 +401,7 @@ __all__ = [
     "INTERVAL_WIDGET",
     "CatalogError",
     "describe_catalog",
+    "describe_execution",
     "describe_strategy",
     "publish_catalog",
 ]

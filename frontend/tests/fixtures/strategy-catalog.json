@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "schema_hash": "40c0d6f2167568ea2776ccfc14ffe6b117f79cb3d8c4ea121f593597af9362ed",
-  "published_at": "2026-09-24T16:59:34.796043+00:00",
+  "schema_hash": "5fb148004f859916bff2c8a461c28d6efd81b1182f4b0d0e80717f9f5652b5a2",
+  "published_at": "2026-09-24T17:20:51.663314+00:00",
   "lookups": {
     "intervals_ms": {
       "1s": 1000,
@@ -458,5 +458,153 @@
         }
       ]
     }
-  ]
+  ],
+  "execution": {
+    "name": "execution",
+    "label": "Execution",
+    "description": "Real order execution settings (plan \u00a74.3, \u00a77).",
+    "settings_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Place real orders on ENTRY. Off: signals are only recorded.",
+          "title": "Real execution",
+          "type": "boolean"
+        },
+        "max_slippage_pct": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "maximum": 5.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "0.3",
+          "title": "Max entry slippage %"
+        },
+        "unprotected_deadline_s": {
+          "default": 30,
+          "maximum": 300,
+          "minimum": 5,
+          "title": "Protection deadline (s)",
+          "type": "integer"
+        },
+        "daily_losing_trades_limit": {
+          "default": 5,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Losing trades per UTC day",
+          "type": "integer"
+        },
+        "max_symbols": {
+          "default": 3,
+          "maximum": 10,
+          "minimum": 1,
+          "title": "Max symbols",
+          "type": "integer"
+        },
+        "slot_quote": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "7",
+          "title": "Minimum per slot (USDT)"
+        },
+        "position_share": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "maximum": 1.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "0.9",
+          "title": "Deposit share in positions"
+        },
+        "stop_limit_gap_pct": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 10.0,
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "0.5",
+          "title": "Stop-limit gap %"
+        },
+        "quote_max_fetch_age_s": {
+          "default": 5,
+          "maximum": 60,
+          "minimum": 1,
+          "title": "Max quote fetch age (s)",
+          "type": "integer"
+        },
+        "quote_max_trade_age_s": {
+          "default": 60,
+          "maximum": 900,
+          "minimum": 1,
+          "title": "Max last-trade age (s)",
+          "type": "integer"
+        },
+        "unknown_escalate_s": {
+          "default": 120,
+          "maximum": 3600,
+          "minimum": 10,
+          "title": "Escalate unresolved UNKNOWN after (s)",
+          "type": "integer"
+        },
+        "reconcile_interval_s": {
+          "default": 60,
+          "maximum": 3600,
+          "minimum": 10,
+          "title": "Reconcile interval (s)",
+          "type": "integer"
+        },
+        "guard_grace_s": {
+          "default": 5,
+          "maximum": 120,
+          "minimum": 1,
+          "title": "Guard grace (s)",
+          "type": "integer"
+        },
+        "bnb_low_threshold": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "0.001",
+          "title": "BNB low warning below"
+        }
+      },
+      "title": "ExecutionSettings",
+      "type": "object"
+    },
+    "constraints": []
+  }
 }

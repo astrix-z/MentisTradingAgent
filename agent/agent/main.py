@@ -32,6 +32,7 @@ from agent.engine import (
     REDIS_COMMAND_STREAM,
     Engine,
 )
+from agent.execution.runtime import ExecutionRuntime
 from agent.monitoring import MONITORING_REFRESH_SECONDS, refresh_monitoring
 from agent.protocol import publish_catalog
 from agent.symbols import latest_universe, publish_universe
@@ -165,7 +166,7 @@ async def _handle_independent(
 
 #: Command types that read the outside world and change nothing about the
 #: running intent. They must not queue behind (or in front of) Start/Stop.
-_INDEPENDENT_COMMANDS = ("balance", "prices")
+_INDEPENDENT_COMMANDS = ("balance", "prices", "execution_pause", "execution_resume")
 
 
 async def _route(
@@ -358,6 +359,15 @@ async def run() -> None:
             "cannot prepare the agent database; real execution stays closed"
         )
     engine.schema_ready = schema_ready
+    runtime = ExecutionRuntime(
+        db=db.settings_engine(),
+        db_url=str(settings.AGENT_DB_URL) if settings.AGENT_DB_URL else None,
+        schema_ready=schema_ready,
+    )
+    engine.execution = runtime
+    # Independent of Start/Stop and of the saved running flag: unfinished
+    # positions are followed from boot, even when the strategy stays off.
+    await runtime.boot()
 
     try:
         async with asyncio.TaskGroup() as tg:
@@ -368,6 +378,7 @@ async def run() -> None:
             tg.create_task(_monitoring_loop(redis, stop))
     finally:
         await engine.shutdown()
+        await runtime.shutdown()
         await redis.aclose()
         await db.dispose_engines()
         logger.info("agent stopped")

@@ -105,7 +105,11 @@ def test_saved_running_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
         engine = Mock(start_run=AsyncMock())
         await commands.resume_from_runtime(engine, redis)
         engine.start_run.assert_awaited_once_with(
-            network="live", strategy="test", symbols=["BTCUSDT"], params={"window": 10}
+            network="live",
+            strategy="test",
+            symbols=["BTCUSDT"],
+            params={"window": 10},
+            execution=None,
         )
 
     asyncio.run(scenario())

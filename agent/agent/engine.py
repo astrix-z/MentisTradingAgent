@@ -29,6 +29,8 @@ from agent.exchange import (
     balance_map,
     balance_snapshot,
 )
+from agent.execution.runtime import ExecutionRuntime
+from agent.execution.settings import ExecutionSettings
 from agent.strategies import Signal, Strategy, StrategyServices, build_strategy
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,8 @@ class Engine:
         #: Whether the agent database migrated cleanly at boot. Real execution
         #: is fail-closed without it (plan §8.1).
         self.schema_ready = False
+        #: Agent-level execution; lives across runs (set by ``agent.main``).
+        self.execution: ExecutionRuntime | None = None
 
         # SDK-backed services for the current run.
         self._rest: ExchangeRest | None = None
@@ -177,8 +181,14 @@ class Engine:
         strategy: str,
         symbols: list[str],
         params: dict[str, Any],
+        execution: dict[str, Any] | None = None,
     ) -> None:
-        """Start a strategy with the UI settings; raises ValueError if invalid."""
+        """Start a strategy with the UI settings; raises ValueError if invalid.
+
+        Execution is checked first, before the current run is torn down: a
+        Start that would move execution away from unfinished work (another
+        network or account) is refused and leaves the current run alone.
+        """
         if network not in ("testnet", "live"):
             raise ValueError(f"unknown network: {network!r}")
         if (
@@ -193,8 +203,13 @@ class Engine:
             raise ValueError("symbols must be non-empty alphanumeric strings")
         normalized = list(dict.fromkeys(symbol.upper() for symbol in symbols))
         strategy_obj = build_strategy(strategy, params)
+        execution_settings = ExecutionSettings.from_payload(execution)
 
         async with self._lifecycle_lock:
+            if self.execution is not None:
+                await self.execution.prepare_start(
+                    network=network, settings=execution_settings, params=params
+                )
             self._startup = asyncio.create_task(
                 self._start_run(network, strategy, normalized, strategy_obj)
             )
@@ -202,6 +217,8 @@ class Engine:
                 await self._startup
             finally:
                 self._startup = None
+            if self.execution is not None:
+                self.execution.open_admission(strategy)
 
     async def _start_run(
         self, network: str, strategy: str, symbols: list[str], strategy_obj: Strategy
@@ -310,6 +327,9 @@ class Engine:
         """Cancel bootstrap before waiting for the serialized lifecycle lock."""
         if self._startup is not None and not self._startup.done():
             self._startup.cancel()
+        if self.execution is not None:
+            # Only admission: positions, protection and monitoring go on.
+            self.execution.close_admission()
         async with self._lifecycle_lock:
             await self._stop_run()
 
@@ -388,7 +408,10 @@ class Engine:
         payload = json.dumps(
             {
                 "state": self._state,
-                "message": self._message or self._current_health_warning(),
+                "message": self._message
+                or self._current_health_warning()
+                or (self.execution.message() if self.execution else None),
+                "execution": self.execution.heartbeat() if self.execution else None,
                 "network": self._network,
                 "strategy": self._strategy_name,
                 "balances": self._balances,

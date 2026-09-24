@@ -293,6 +293,7 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
     strategy = str(payload.get("strategy") or "")
     symbols = _as_symbols(payload.get("symbols"))
     params = _as_params(payload.get("params"))
+    execution = payload.get("execution")
     logger.info(
         "command start: network=%s strategy=%s symbols=%s params=%s",
         network,
@@ -308,6 +309,7 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
                 strategy=strategy,
                 symbols=symbols,
                 params=params,
+                execution=execution if isinstance(execution, dict) else None,
             ),
             timeout=timeout,
         )
@@ -336,6 +338,29 @@ async def _stop(ctx: CommandContext, _payload: dict[str, Any]) -> None:
     logger.info("command stop")
     await ctx.engine.stop()
     await ctx.report(ok=True, data={"running": False})
+
+
+@command("execution_pause")
+async def _execution_pause(ctx: CommandContext, _payload: dict[str, Any]) -> None:
+    """Stop taking new entries; positions, protection and exits continue."""
+    runtime = ctx.engine.execution
+    if runtime is None:
+        await ctx.report(ok=False, message="execution is not available")
+        return
+    runtime.pause()
+    await ctx.engine.publish_heartbeat()
+    await ctx.report(ok=True, data=runtime.heartbeat())
+
+
+@command("execution_resume")
+async def _execution_resume(ctx: CommandContext, _payload: dict[str, Any]) -> None:
+    runtime = ctx.engine.execution
+    if runtime is None:
+        await ctx.report(ok=False, message="execution is not available")
+        return
+    runtime.resume()
+    await ctx.engine.publish_heartbeat()
+    await ctx.report(ok=True, data=runtime.heartbeat())
 
 
 @command("symbols")
@@ -511,8 +536,13 @@ async def resume_from_runtime(engine: Engine, redis: Redis) -> None:
         symbols,
     )
     try:
+        execution = data.get("execution")
         await engine.start_run(
-            network=network, strategy=strategy, symbols=symbols, params=params
+            network=network,
+            strategy=strategy,
+            symbols=symbols,
+            params=params,
+            execution=execution if isinstance(execution, dict) else None,
         )
     except Exception as exc:
         logger.exception("resume failed: %s", exc)
