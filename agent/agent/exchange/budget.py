@@ -146,11 +146,15 @@ class RequestBudget:
                     self._reported = (self._clock(), limit.count)
 
     def on_rate_limited(self, retry_after: int | None) -> None:
-        seconds = float(retry_after) if retry_after else _DEFAULT_PAUSE_SECONDS
+        seconds = (
+            float(retry_after) if retry_after is not None else _DEFAULT_PAUSE_SECONDS
+        )
         self.paused_until = max(self.paused_until, self._clock() + seconds)
 
     def on_banned(self, retry_after: int | None) -> None:
-        seconds = float(retry_after) if retry_after else _DEFAULT_BAN_SECONDS
+        seconds = (
+            float(retry_after) if retry_after is not None else _DEFAULT_BAN_SECONDS
+        )
         self.banned_until = max(self.banned_until, self._clock() + seconds)
 
 

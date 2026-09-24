@@ -60,6 +60,7 @@ from binance_sdk_spot.rest_api.models import (
     OrderListOcoResponse,
     ReferencePriceResponse,
     TickerBookTickerResponse,
+    TickerPriceResponse,
     TimeResponse,
 )
 from binance_sdk_spot.spot import Spot
@@ -282,7 +283,9 @@ class FakeExchange:
         self.free: dict[str, Decimal] = dict(balances or {"USDT": Decimal(100)})
         self.locked: dict[str, Decimal] = {}
         self.commission_rate = commission_rate
-        self.commission_asset = commission_asset  # "BNB", "base" or "quote"
+        #: "BNB", "base" (the asset received: base on BUY, quote on SELL) or
+        #: "quote".
+        self.commission_asset = commission_asset
         self.bnb_price = bnb_price
         self._clock = clock or (lambda: 1_800_000_000_000)
         self.rules: dict[str, SymbolRules] = {}
@@ -441,8 +444,14 @@ class FakeExchange:
             commission = (quote * self.commission_rate / self.bnb_price).quantize(EIGHT)
             commission_asset = "BNB"
         elif self.commission_asset == "base":
-            commission = (qty * self.commission_rate).quantize(EIGHT)
-            commission_asset = rules.base
+            # "In the asset received", as Binance charges without BNB: the base
+            # asset on a BUY, the quote asset on a SELL.
+            if order.side == "BUY":
+                commission = (qty * self.commission_rate).quantize(EIGHT)
+                commission_asset = rules.base
+            else:
+                commission = (quote * self.commission_rate).quantize(EIGHT)
+                commission_asset = rules.quote
         else:
             commission = (quote * self.commission_rate).quantize(EIGHT)
             commission_asset = rules.quote
@@ -900,6 +909,13 @@ class FakeExchange:
                 "askQty": "1.00000000",
             }
         return response(TickerBookTickerResponse, payload)
+
+    def ticker_price(self, **kwargs: Any) -> ApiResponse[TickerPriceResponse]:
+        with self._lock:
+            self._before("ticker_price", kwargs)
+            symbol = kwargs["symbol"]
+            payload = {"symbol": symbol, "price": fmt(self.last[symbol])}
+        return response(TickerPriceResponse, payload)
 
     def klines(self, **kwargs: Any) -> ApiResponse[list[list[Any]]]:
         with self._lock:

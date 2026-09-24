@@ -524,3 +524,12 @@ def test_market_data_reads_feed_the_shared_budget() -> None:
     rest = ExchangeRest("live", spot, budget)
     asyncio.run(rest.symbols())
     assert budget.used() >= 777
+
+
+def test_retry_after_zero_is_zero_not_the_default_pause() -> None:
+    clock = FakeClock()
+    budget = RequestBudget(clock=clock, sleep=clock.sleep)
+    budget.on_rate_limited(0)
+    assert not budget.paused()
+    budget.on_rate_limited(None)
+    assert budget.paused()
