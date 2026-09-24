@@ -128,6 +128,8 @@ class ExecutionRuntime:
         self.feedback: Callable[[PositionEvent, bool], Awaitable[None]] | None = None
         #: Wakes the admission worker when a new ENTRY is in the inbox.
         self._admission_wake: Callable[[], None] | None = None
+        #: Sells a symbol's open position at market (``close_position``).
+        self.close_position: Callable[[str], Awaitable[Any]] | None = None
 
     # --- wiring ------------------------------------------------------------
 

@@ -363,6 +363,32 @@ async def _execution_resume(ctx: CommandContext, _payload: dict[str, Any]) -> No
     await ctx.report(ok=True, data=runtime.heartbeat())
 
 
+@command("close_position")
+async def _close_position(ctx: CommandContext, payload: dict[str, Any]) -> None:
+    """Sell one open position at market, through the position protocol."""
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    runtime = ctx.engine.execution
+    if not symbol:
+        await ctx.report(ok=False, message="symbol is required")
+        return
+    if runtime is None or runtime.close_position is None:
+        await ctx.report(ok=False, message="execution is not available")
+        return
+    try:
+        result = await runtime.close_position(symbol)
+    except LookupError as exc:
+        await ctx.report(ok=False, message=str(exc))
+        return
+    await ctx.report(
+        ok=True,
+        data={
+            "symbol": symbol,
+            "step": getattr(getattr(result, "step", None), "value", None),
+            "reason": getattr(result, "reason", None),
+        },
+    )
+
+
 @command("symbols")
 async def _symbols(ctx: CommandContext, payload: dict[str, Any]) -> None:
     """Replace the marked working symbols.

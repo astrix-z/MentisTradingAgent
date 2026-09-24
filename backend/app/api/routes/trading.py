@@ -123,6 +123,7 @@ CommandType = Literal[
     "indicators",
     "execution_pause",
     "execution_resume",
+    "close_position",
 ]
 
 # Commands that describe the running intent and therefore rewrite the runtime
@@ -886,6 +887,20 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
         return await _apply_command("indicators", {})
     if request.type == "stop":
         return await _apply_command("stop", {})
+    if request.type == "close_position":
+        symbol = str(request.payload.get("symbol") or "").strip().upper()
+        if _SYMBOL_RE.fullmatch(symbol) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "loc": ["body", "payload", "symbol"],
+                        "msg": "a valid symbol is required",
+                        "type": "value_error",
+                    }
+                ],
+            )
+        return await _apply_command("close_position", {"symbol": symbol})
     if request.type in ("execution_pause", "execution_resume"):
         # Entries only; positions, protection and exits are not affected.
         return await _apply_command(request.type, {})

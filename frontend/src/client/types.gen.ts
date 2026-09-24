@@ -107,7 +107,7 @@ export type CommandRequest = {
     /**
      * Type
      */
-    type: 'start' | 'stop' | 'balance' | 'symbols' | 'prices' | 'indicators' | 'execution_pause' | 'execution_resume';
+    type: 'start' | 'stop' | 'balance' | 'symbols' | 'prices' | 'indicators' | 'execution_pause' | 'execution_resume' | 'close_position';
     /**
      * Payload
      */

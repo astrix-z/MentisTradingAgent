@@ -167,7 +167,13 @@ async def _handle_independent(
 
 #: Command types that read the outside world and change nothing about the
 #: running intent. They must not queue behind (or in front of) Start/Stop.
-_INDEPENDENT_COMMANDS = ("balance", "prices", "execution_pause", "execution_resume")
+_INDEPENDENT_COMMANDS = (
+    "balance",
+    "prices",
+    "execution_pause",
+    "execution_resume",
+    "close_position",
+)
 
 
 async def _route(

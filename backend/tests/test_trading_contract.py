@@ -1187,3 +1187,22 @@ def test_execution_pause_and_resume_do_not_touch_the_running_intent(
     assert response.status_code == 202
     assert redis.publications[0][1]["type"] == command
     assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+def test_close_position_needs_a_valid_symbol(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    refused = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": "close_position", "payload": {"symbol": "not a symbol"}},
+        headers=headers(client),
+    )
+    assert refused.status_code == 422 and not redis.publications
+    accepted = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": "close_position", "payload": {"symbol": "btcusdt"}},
+        headers=headers(client),
+    )
+    assert accepted.status_code == 202
+    assert redis.publications[0][1]["payload"] == {"symbol": "BTCUSDT"}
+    assert trading.REDIS_RUNTIME_KEY not in redis.values

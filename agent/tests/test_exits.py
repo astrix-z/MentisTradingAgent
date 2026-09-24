@@ -1,0 +1,166 @@
+"""EXEC-09c: time exit, guard and close_position — with or without the strategy."""
+
+from __future__ import annotations
+
+import uuid
+from decimal import Decimal
+from typing import Any
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from execution_world import Stack, World, run
+from fake_exchange import SymbolRules
+
+from agent.common.commands import HANDLERS, AgentCommand, CommandContext
+from agent.exchange.hub import StreamHub
+from agent.execution.exits import Exits, NoSuchPosition
+from agent.execution.models import PositionStatus
+from agent.execution.monitor import MonitorFeed
+from agent.execution.protection import Step
+from agent.execution.quotes import LastTrade
+
+
+def feed(state: World) -> MonitorFeed:
+    async def no_rest(*_: Any) -> list[list[Any]]:
+        return []
+
+    return MonitorFeed(StreamHub(), no_rest, clock=state.clock.now)
+
+
+def outcome(position: Any) -> tuple[str, str]:
+    assert position.outcome is not None
+    return position.outcome["reason"], position.outcome["mechanism"]
+
+
+def test_time_exit_after_the_hold_even_after_downtime() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        exits = Exits(first.worker, feed(state))
+        assert await exits.check_time(position_id) is None
+        await state.kill(first)  # the agent is down past the 8 hours
+        state.clock.advance(8 * 3600 + 60)
+        state.fake.set_price("BTCUSDT", Decimal(101))
+        second = await state.stack()
+        second.runtime.close_admission()  # strategy stopped: exits still run
+        result = await Exits(second.worker, feed(state)).check_time(position_id)
+        assert result is not None and result.step is Step.CLOSED
+        assert outcome(await state.position(second, position_id)) == (
+            "time",
+            "market_time",
+        )
+
+    run(scenario)
+
+
+async def limit_protected(state: World) -> tuple[Stack, uuid.UUID]:
+    rules = SymbolRules(
+        symbol="ETHUSDT",
+        base="ETH",
+        order_types=("LIMIT", "LIMIT_MAKER", "MARKET", "STOP_LOSS_LIMIT"),
+    )
+    state.fake.list_symbol(rules, Decimal(100))
+    stack = await state.stack()
+    return stack, await state.protected(stack, "ETHUSDT")
+
+
+def test_guard_sells_a_skipped_stop_limit_after_the_grace() -> None:
+    async def scenario(state: World) -> None:
+        stack, position_id = await limit_protected(state)
+        watch = feed(state)
+        exits = Exits(stack.worker, watch)
+        state.fake.set_price("ETHUSDT", Decimal(97))  # gapped through 98 and 97.51
+        watch._trades["ETHUSDT"] = LastTrade(Decimal(97), state.clock.now())
+        assert await exits.check_guard(position_id) is None  # grace starts
+        state.clock.advance(6)
+        watch._trades["ETHUSDT"] = LastTrade(Decimal(97), state.clock.now())
+        result = await exits.check_guard(position_id)
+        assert result is not None and result.step is Step.CLOSED
+        assert outcome(await state.position(stack, position_id)) == ("stop", "guard")
+
+    run(scenario)
+
+
+def test_guard_never_acts_on_a_stale_price() -> None:
+    async def scenario(state: World) -> None:
+        stack, position_id = await limit_protected(state)
+        watch = feed(state)
+        exits = Exits(stack.worker, watch)
+        watch._trades["ETHUSDT"] = LastTrade(Decimal(90), state.clock.now())
+        state.clock.advance(120)  # no trades since
+        assert await exits.check_guard(position_id) is None
+        assert await exits.check_guard(position_id) is None
+        assert "guard:ETHUSDT" in stack.runtime.alerts
+        assert (
+            await state.position(stack, position_id)
+        ).status == PositionStatus.PROTECTED
+
+    run(scenario)
+
+
+def test_guard_is_off_for_market_stops() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        watch = feed(state)
+        watch._trades["BTCUSDT"] = LastTrade(Decimal(90), state.clock.now())
+        exits = Exits(stack.worker, watch)
+        state.clock.advance(60)
+        watch._trades["BTCUSDT"] = LastTrade(Decimal(90), state.clock.now())
+        assert await exits.check_guard(position_id) is None
+
+    run(scenario)
+
+
+def test_close_during_a_reprice_takes_over_the_operation() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        state.fake.fault("delete_order_list", "timeout_before")
+        waiting = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert waiting.reason == "cancel outcome unknown"
+        result = await Exits(stack.worker, feed(state)).close_symbol("btcusdt")
+        assert result.step is Step.CLOSED
+        assert outcome(await state.position(stack, position_id)) == (
+            "manual",
+            "manual_close",
+        )
+        assert [
+            o.type
+            for o in state.fake.orders_of("BTCUSDT", "SELL")
+            if o.type == "MARKET"
+        ] == ["MARKET"]
+
+    run(scenario)
+
+
+def test_close_position_command_reports_the_outcome() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        stack.runtime.close_position = exits.close_symbol
+        engine = Mock(execution=stack.runtime)
+        redis = Mock(pipeline=Mock())
+        reports: list[dict[str, Any]] = []
+
+        async def run_command(payload: dict[str, Any]) -> None:
+            ctx = CommandContext(
+                engine,
+                redis,
+                AgentCommand("c", "close_position", payload, state.clock.now()),
+            )
+            ctx.report = AsyncMock(side_effect=lambda **kw: reports.append(kw))  # type: ignore[method-assign]
+            await HANDLERS["close_position"](ctx, payload)
+
+        await run_command({"symbol": "ETHUSDT"})
+        assert (
+            reports[-1]["ok"] is False and "no open position" in reports[-1]["message"]
+        )
+        await run_command({"symbol": "btcusdt"})
+        assert reports[-1]["ok"] is True
+        assert reports[-1]["data"]["step"] == "closed"
+        with pytest.raises(NoSuchPosition):
+            await exits.close_symbol("BTCUSDT")  # nothing left to close
+
+    run(scenario)
