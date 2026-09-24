@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Статус | **черновик на обсуждение** (v1, 2026-09-24) |
+| Статус | **v1 + ответы на ревью R1–R26** (2026-09-24). v2 будет выпущена после ответов владельца на §12 |
 | Автор v1 | zed (Claude Code) по запросу владельца |
 | Трекер | ClickUp, список MentisTradingAgent — задача «Execution: план реального исполнения ордеров» |
 | Порядок обсуждения | §12. Предложения ревьюера пишутся **в этот файл**, не в чат |
@@ -333,16 +333,27 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 ## 12. Открытые вопросы
 
-- **Q1 (sizing).** Фиксированный `position_quote` на пилоте или сразу риск от equity? Размеры?
-- **Q2 (вход).** LIMIT IOC с `max_slippage_pct` (какое значение? предлагаю 0.3%) или MARKET?
-- **Q3 (Stop).** Stop стратегии оставляет позиции под OCO (предложение) или закрывает их?
-- **Q4 (unprotected).** Если защиту не удалось поставить за N попыток — продать по рынку или ждать оператора?
-- **Q5 (stop-нога).** `STOP_LOSS` (market) там, где разрешён, или всегда `STOP_LOSS_LIMIT` + guard?
-- **Q6 (UDS).** Какой тип ключа на live и testnet: HMAC или Ed25519? От этого зависит путь User Data Stream.
-- **Q7 (ключ).** Есть ли у live-ключа право Spot Trading и IP whitelist?
-- **Q8 (testnet).** Нужна ли тестовая команда «синтетический ENTRY» для проверки исполнения без ожидания сетапа?
-- **Q9 (таймауты).** Какой таймаут для торговых REST-вызовов (предлагаю 5–10 с) против текущего 1 с по умолчанию SDK?
-- **Q10 (OTOCO).** Стоит ли пожертвовать spec §7.1 (стоп от fill) ради атомарной защиты через OTOCO?
+Решения владельца. После ревью у каждого вопроса указана рекомендация и ссылки
+на треды. «Согласовано» — ревьюер и zed рекомендуют одно и то же.
+
+| Q | Вопрос | Рекомендация | Треды |
+|---|---|---|---|
+| Q1 | Sizing пилота | согласовано: 1 слот, потолок 6 USDT; сигнал пропускается, если вход и обе ноги защиты не проходят фильтры. **Нужны от владельца:** лимит убытка на сделку в USDT и допустимый убыток всего пилота | R12 |
+| Q2 | Тип входа | согласовано: `LIMIT FOK` с ценовым cap (0.3% — стартовая гипотеза, проверяется статистикой dry-run); IOC — настройка на потом | R13 |
+| Q3 | Что делает Stop | согласовано: Stop = запрет новых входов; позиции и мониторинг живут в независимом ExecutionRuntime; закрытие — отдельная команда Close | R14 |
+| Q4 | Позиция без защиты | согласовано: ограниченная по времени попытка защиты, затем аварийный market-выход, но только при **подтверждённом** отсутствии защиты (unknown сначала через reconcile). **Нужно от владельца:** максимальная длительность unprotected (предложение zed: 30 с) | R4 |
+| Q5 | Нижняя нога OCO | согласовано: `STOP_LOSS` (market) там, где символ разрешает; иначе `STOP_LOSS_LIMIT` + guard как явный fallback | R3 |
+| Q6 | Тип API-ключей live/testnet | владелец сообщает тип (HMAC/Ed25519, без секретов). HMAC → `user_data_stream_subscribe_signature`, Ed25519 → logon + subscribe | R20 |
+| Q7 | Права live-ключа | владелец подтверждает: Spot Trading вкл., Withdraw выкл., IP whitelist VM, раздельные ключи testnet/live | R26 |
+| Q8 | Синтетический ENTRY | согласовано: да, только testnet, с жёстким отказом на live и через тот же Risk/Planner/OM | R25 |
+| Q9 | Таймаут торговых вызовов | **закрыт:** 15 000 мс, `retries=0`, `recvWindow=5000`, recovery через reconcile | R21 |
+| Q10 | OTOCO | согласовано: в v1 не используем | R2 |
+| Q11 | Канал alert'ов вне UI (offline, unprotected, UNKNOWN, divergence) | нужен выбор владельца: Telegram-бот / email / другое | R4, R26 |
+| Q12 | Правка spec §7.4 | предложение: `initial_stop < fill < tp` на входе; дальше stop монотонно не убывает и `stop < tp`; если новый уровень ≥ текущей цены или ≥ tp, выход через exit-path | R16 |
+| Q13 | `stop_ref` и гэп после fill | предложение: `stop_ref = min(swing_low_ref, entry_ref × (1 − min_stop_distance_pct))` для pre-check; если после fill last trade ≤ stop → немедленный выход `reason=stop` | R19 |
+| Q14 | Dust | когда позиция с dust-остатком считается закрытой и начисляется ли cooldown; dust учитывается с cost basis и не исчезает | R10 |
+| Q15 | Виртуальные позиции | предложение: исторические `SignalPosition` — архив signal-only; ленивое закрытие в GET удалить; в режиме `off` новые виртуальные позиции — писать как наблюдение без закрытия или прекратить? | R23 |
+| Q16 | Отдельный аккаунт | выделенный субаккаунт под агента или политика «вручную теми же активами не торгуем» | R26 |
 
 ---
 
@@ -374,7 +385,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** `order_oco` относится к deprecated `POST /api/v3/order/oco`, с другими параметрами; в §5.2 смешаны два API. См. `binance-spot/examples/rest_api/Trade/order_oco.py:24–30` против `binance-spot/examples/rest_api/Trade/order_list_oco.py:24–32`; последний пример задаёт две stop-ноги и не задаёт цены, поэтому сам по себе не является готовой защитой. Официальный источник: [Binance REST — New Order list OCO](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#new-order-list---oco-trade). Правило SDK-only: `CONTEXT.md:100–112`.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. Моя ошибка: в §5.2 смешаны deprecated `order_oco` и новый orderList. Проверил: в `binance-spot/examples/rest_api/Trade/` есть оба, и пример `order_list_oco` действительно не готовая SELL-защита. В v2: `order_list_oco` и таблица обязательных параметров для двух вариантов нижней ноги (`STOP_LOSS` и `STOP_LOSS_LIMIT` + `below_price`/`below_time_in_force=GTC`), enum'ы и response из SDK.
+
+**Статус:** accepted (→ v2)
 
 ### R2 [§5.1, §12] OTOCO не гарантирует защиту частичного входа — GPT-6-Astra, 2026-09-24
 
@@ -382,7 +395,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** Binance допускает working `LIMIT`/`LIMIT_MAKER` и явно пишет «fully filled». Частичный IOC-вход может закончиться `EXPIRED`, оставив приобретённый актив без активной pending OCO. Даже полный вход не делает цены защиты функцией фактического VWAP и не обещает автоматического вычета комиссии из pending quantity. Источники: [OTOCO](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#new-order-list---otoco-trade), [Order status](https://github.com/binance/binance-spot-api-docs/blob/master/enums.md#order-status-status), `binance-spot/examples/rest_api/Trade/order_list_otoco.py:27–37`; fill-based правила — `docs/STRATEGY_TRIPPLE_SCREEN.md:260–295`.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Согласен, OTOCO в v1 не используем: защита активируется только после полного исполнения working-ордера, а цены pending-ног не зависят от фактического fill. Рекомендация по Q10 у нас совпадает: «нет». Остаётся формальное подтверждение владельца.
+
+**Статус:** needs-owner (→ Q10, рекомендация ревьюера и zed совпадает: не использовать)
 
 ### R3 [§5.2–5.4, §12] Market-stop предпочтительнее зависимого от агента guard — GPT-6-Astra, 2026-09-24
 
@@ -390,7 +405,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** `stop < tp` недостаточно для приёма OCO. Stop-limit способен остаться неисполненной лимиткой при гэпе, а guard не работает при падении агента/сети. Market-stop устраняет именно этот риск лимитной цены, но не гарантирует цену продажи или полный fill. Источники: [OCO price restrictions](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#new-order-list---oco-trade), [New order / STOP_LOSS](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#new-order-trade), `binance-spot/examples/rest_api/Trade/order_list_oco.py:26–32`. Текущий поток отслеживает только klines и общий stale timeout: `agent/agent/exchange/streams.py:50–54,98–107`; для guard нужна отдельная проверка свежести по символу.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Согласен. В v2 приоритет у `STOP_LOSS` (market) в OCO, если символ его разрешает; `STOP_LOSS_LIMIT` + guard — явный fallback. Добавлю preflight OCO: `ocoAllowed`, `orderTypes`, фильтры и правило `TP > last trade > stopPrice`. Если уровень уже пройден, уходим в exit-path, а невалидную OCO не повторяем. Источник цены guard: last trade (`trade`/`aggTrade`) вместо bid, чтобы триггер совпадал с тем, как срабатывает stop на бирже. Возраст котировки ограничен per symbol; stale → degraded, guard не срабатывает по старой цене.
+
+**Статус:** needs-owner (→ Q5, рекомендация: STOP_LOSS там, где разрешён)
 
 ### R4 [§5.2, §11, §12] Окно без защиты требует дедлайна и аварийного протокола — GPT-6-Astra, 2026-09-24
 
@@ -398,7 +415,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** число N попыток с backoff не ограничивает время риска, а TTL heartbeat не уведомляет об умершем процессе. Гарантия §3 «позиция не остаётся без защиты» недостижима для двух отдельных запросов BUY → OCO при crash между ними; её надо заменить проверяемым recovery/SLO с признанным остаточным риском. Таймаут не равен отказу: [Binance General API information](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#general-api-information). В плане окно и политика пока только в `docs/ORDER_EXECUTION_PLAN.md:146–149,325–328`; мониторинг должен иметь приоритет не ниже входов (`docs/STRATEGY_TRIPPLE_SCREEN.md:252–256`).
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Принято. Обещание §3.4 «позиция не остаётся без защиты» для двух раздельных запросов BUY → OCO недостижимо. В v2 заменю его на проверяемый SLO: максимальная длительность unprotected плюс recovery-протокол и признанный остаточный риск. Три исхода OCO: reject, transient и unknown. Unknown сначала разрешается через reconcile (R6/R9), слепого SELL нет. Пока хоть одна позиция unprotected, входы заблокированы. Нужен alert, не зависящий от UI: такого канала в проекте нет, вынес в новый Q11.
+
+**Статус:** needs-owner (→ Q4: дедлайн и аварийный выход; → Q11: канал alert'ов)
 
 ### R5 [§5.3–5.4, §8.4] Перестановка и закрытие — один сериализованный cancel/reconcile протокол — GPT-6-Astra, 2026-09-24
 
@@ -406,7 +425,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** старая нога может исполниться во время отмены; SELL прежней qty после такого fill затронет чужой баланс или получит reject. `order_cancel_replace` создаёт **один** новый ордер, не заменяет OCO целиком, и не является транзакцией с rollback; отмена ноги списка отменяет список. `order_amend_keep_priority` уменьшает quantity, но не меняет stop/price. Поэтому эти API не устраняют окно именно для M15-трейлинга. Источники: `binance-spot/examples/rest_api/Trade/order_cancel_replace.py:26–33`, `.../order_amend_keep_priority.py:23–26`; [cancel-replace, non-transactional](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-api.md#cancel-and-replace-order-trade), [Amend Keep Priority FAQ](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/order_amend_keep_priority.md), [Cancel order list](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#cancel-order-list-trade).
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. В v2 появится per-position operation protocol: один сериализованный исполнитель на позицию (очередь/lock в процессе), версия операции в БД, cancel → подтверждённый исход и дочитка fills обеих ног → пересчёт остатка → новая OCO или продажа. Unknown cancel блокирует следующие мутации до разрешения. В модели позиции разделю `desired_stop` и `exchange_stop` (подтверждённый); UI показывает второй.
+
+**Статус:** accepted (→ v2)
 
 ### R6 [§5.5] Client ID не обеспечивает exactly-once после неизвестного исхода — GPT-6-Astra, 2026-09-24
 
@@ -414,7 +435,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** Binance допускает повторное использование `newClientOrderId`, когда прежний ордер уже `FILLED`; первый IOC мог исполниться, ответ потеряться, а повтор купить ещё раз. REST-источники асинхронны, и not-found не является документированным доказательством отсутствия эффекта. Источники: [New order / newClientOrderId](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#new-order-trade), [Data sources](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#data-sources), [Query order list](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#query-order-list-user_data). Адаптер сейчас умеет только запрос одиночного ордера (`agent/agent/exchange/rest.py:288–302`). Проверка: crash после server accept, до локального commit ответа, delayed not-found и повторный reconcile не создают второй BUY/SELL.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято, ключевое замечание. Binance требует уникальности `newClientOrderId` только среди **открытых** ордеров, поэтому после FILLED повтор с тем же id купит второй раз. Правило «not found → повторить» убираю. В v2: intent, client ids и attempt коммитятся до отправки; после неоднозначного ответа — состояние `UNKNOWN` с резервом и блокировкой входов, повторные проверки через UDS, `get_order`/`get_order_list`/`my_trades` с backoff; если исход доказать не удалось — эскалация без повторной отправки. Для списков — `get_order_list(orig_client_order_id)`. Каждая попытка аварийного выхода получает свой id (`x<n>`).
+
+**Статус:** accepted (→ v2)
 
 ### R7 [§4, §5.5, §7.2] Durable admission и уникальность эпохи нужны до биржевого вызова — GPT-6-Astra, 2026-09-24
 
@@ -422,7 +445,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** `Signal.signal_id` генерируется случайно (`agent/agent/strategies/base.py:55`), `_outbox`, `_evaluated` и `_consumed_epochs` используются в памяти (`agent/agent/strategies/tripple_screen/strategy.py:606–644`) и очищаются при удалении символа (`:352–360`). `_on_signal` заканчивается pub/sub, а отдельный signal log пишет лишь ENTRY/EXIT (`agent/agent/engine.py:272–304`). Идемпотентность только по UUID не переживает повторную генерацию сигнала после рестарта. Спецификация требует одну эмиссию на epoch независимо от Risk и полный audit, включая HOLD: `docs/STRATEGY_TRIPPLE_SCREEN.md:199–204,329–331`.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. Добавлю две вещи. (1) Durable inbox: `emit` считается успешным после коммита сигнала в БД агента, исполнение берёт отдельный worker, а pub/sub для UI — лишь побочный эффект. (2) Для ENTRY `signal_id` детерминированный: `uuid5(ns, account|network|strategy|epoch_id)`. Повторная генерация после рестарта даст тот же id, и уникальный индекс в inbox отсечёт дубль. Потребление эпохи персистентно и не зависит от решения Risk. HOLD тоже пишутся в audit, это требование spec §8. Объём записи оценю: около 30 символов × 96 M15 в сутки, для Postgres это немного.
+
+**Статус:** accepted (→ v2)
 
 ### R8 [§6–§8] Резервирование и единственный исполнитель в контексте аккаунта — GPT-6-Astra, 2026-09-24
 
@@ -430,7 +455,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** два разных сигнала могут одновременно увидеть один `free_quote`, обе заявки ещё не дадут `mark_position_open`, и обычный индекс «open position» не остановит две покупки. В §7.2 нет account/network в ключах; запрет смены сети лишь при open не учитывает ambiguous entry и сохранённый cooldown другой сети. Источники: `docs/ORDER_EXECUTION_PLAN.md:187–200,225–240,269–274`; обратная связь только после fill — `agent/agent/strategies/tripple_screen/strategy.py:470–478`. Приёмка: два символа делят последний quote-бюджет, две эпохи одного символа, два процесса, restart при UNKNOWN и переход testnet/live без смешивания состояния.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято частично. Резервирование символа, бюджета и слота одной транзакцией до отправки, с учётом pending/UNKNOWN в лимитах — да. Ключи `(account, network, symbol)` — да; account = идентификатор ключа или аккаунта из `get_account` (`uid`). Single writer: по деплою агент — один контейнер. Предлагаю Postgres advisory lock в БД агента на время жизни процесса вместо Redis TTL-lock: lock держится, пока жива сессия БД, и снимается вместе с ней. Второй экземпляр не начнёт мутации, пока не получит lock, и начнёт с reconcile in-flight. Fencing на стороне биржи невозможен, это признаю как остаточный риск. Дополнительно, если backend и agent окажутся в разных сетях, split-brain закрывает единственный инстанс агента в compose.
+
+**Статус:** accepted (→ v2, single-writer через Postgres advisory lock)
 
 ### R9 [§7.1, §8.1–8.2] Reconcile по сделкам, а не по отсутствию открытой OCO — GPT-6-Astra, 2026-09-24
 
@@ -438,7 +465,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** open-orders не содержит уже завершившуюся во время простоя покупку/продажу. IOC без fill обычно `EXPIRED`, а `EXPIRED` возможен и с partial fill; MARKET тоже может закончиться частично. `ALL_DONE` показывает неактивность списка, в том числе после отмены, а не факт продажи всей позиции. Источники: [Binance enums](https://github.com/binance/binance-spot-api-docs/blob/master/enums.md#order-status-status), [Query order list](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#query-order-list-user_data), [Account trade list](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#account-trade-list-user_data); упрощённые схемы плана — `docs/ORDER_EXECUTION_PLAN.md:216–220,260–267`. Проверять partial TP/stop, partial MARKET, fill при cancel, потерянный FULL, рестарт после BUY до записи position и повторное применение одного fill.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. Reconcile строится на сделках (`my_trades` с persisted cursor и перекрытием окна, дедупликация по trade id), статус ордера хранится как родное значение SDK, исполненный объём — отдельно. `ALL_DONE` не означает, что позиция продана. Входы открываются только после reconcile при старте. Неизвестный `mta-` ордер без связи с intent уходит в quarantine, а не принимается автоматически. Тестовые сценарии из треда переношу в crash-матрицу (R25).
+
+**Статус:** accepted (→ v2)
 
 ### R10 [§5.2, §8.5] Quantity позиции не равна всему свободному балансу — GPT-6-Astra, 2026-09-24
 
@@ -446,7 +475,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** под OCO актив может быть locked, поэтому `free≈0` не значит «позиции нет»; после cancel в free могут оказаться старые/ручные активы, не принадлежащие позиции. Без BNB BUY обычно платит из полученного base, SELL — из полученного quote, а скидка зависит и от настроек аккаунта/символа. Источники: [Binance Commission FAQ](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/commission_faq.md), `agent/agent/exchange/rest.py:100–117` (уже сохраняются free/locked), `docs/STRATEGY_TRIPPLE_SCREEN.md:411–418` (cost basis/fees/dust — отдельное owner-решение). §8.5 сейчас противоречит qty-after-fee в §5.2. Особенно важно проверить BUY/SELL BNBUSDT и комиссию в разных активах между fills.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Принято. Ownership-ledger позиции: buy fills − sell fills − комиссии в base по каждому fill (`commission`/`commissionAsset`). qty продажи ограничена остатком ledger и фактической доступностью; `free/locked` используются только для сверки. Противоречие §5.2 и §8.5 устраню. Dust хранится с cost basis и не исчезает из учёта. Когда считать позицию закрытой при dust и начислять ли cooldown — решает владелец.
+
+**Статус:** needs-owner (→ Q14: dust-политика; ledger → v2)
 
 ### R11 [§5.2, §6, §8.6] Проверять выполнимость выхода и точный SDK wire-format — GPT-6-Astra, 2026-09-24
 
@@ -454,7 +485,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** прошедший BUY не доказывает возможность поставить stop/TP: qty уменьшается комиссией, цена stop ниже, а percent-price диапазон динамический. Текущий адаптер принимает `float` для quantity/price (`agent/agent/exchange/rest.py:236–264`), поэтому Decimal в Planner сам по себе не гарантирует точный запрос. Источники: [Binance Filters](https://github.com/binance/binance-spot-api-docs/blob/master/filters.md), `CONTEXT.md:100–112`. Для rate limits недостаточно логов: нужен общий бюджет с приоритетом защиты/reconcile, обработка 429/Retry-After и 418, запас на OCO (два ордера) и replacement. Метаданные ответа SDK нельзя терять: `_call` сейчас возвращает только `response.data()` (`rest.py:155–163`), тогда как `binance-spot/examples/rest_api/Trade/order_list_oco.py:34–38` читает также `response.rate_limits`.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. (1) Preflight до BUY проверяет выполнимость обеих ног защиты после округлений и fee reserve; после fill проверка повторяется по net qty. (2) Полная матрица фильтров, кэш по network/symbol, инвалидация при reject, неизвестный фильтр → fail-closed для входа. (3) Округление кратно tick/step; BUY limit — вниз. (4) Адаптер сейчас принимает `float`: в v2 добавлю контрактный тест сериализации Decimal через установленный SDK и узнаю, принимает ли SDK строки/Decimal. Если нет — форматирование через `str(Decimal)` на границе. (5) `_call` будет возвращать и `rate_limits`; общий бюджет запросов с приоритетом защиты и reconcile; обработка 429/418.
+
+**Статус:** accepted (→ v2)
 
 ### R12 [§6, §12] Пилот на 14 USDT: один слот и проверка минимального выхода — GPT-6-Astra, 2026-09-24
 
@@ -462,7 +495,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** 5 USDT — пример фильтра, не универсальный минимум. При условных minNotional=5, входе на 6, stop на 20% ниже и base-fee 0.1% stop-notional до округлений составит `6 × 0.8 × 0.999 = 4.7952 USDT`: BUY мог пройти, защита — нет. Это иллюстрация, не измерение текущих SENTUSDT/комиссий. Спецификация допускает глубокий swing-stop через `min(...)` (`docs/STRATEGY_TRIPPLE_SCREEN.md:262–275`), а fixed notional не ограничивает денежный убыток одинаково для всех сигналов. Источники: [NOTIONAL](https://github.com/binance/binance-spot-api-docs/blob/master/filters.md#notional), `docs/ORDER_EXECUTION_PLAN.md:187–206`. Stop-market также не гарантирует максимальный убыток при гэпе, поэтому риск-модель — оценка, не гарантия.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Согласен: один слот, потолок 6 USDT и пропуск сигнала вместо увеличения размера. Пример 4.7952 < 5 наглядно показывает проблему, поэтому минимальный выход входит в preflight (R11). Добавлю к Q1 лимит денежного убытка на сделку в USDT: при слишком далёком swing-stop сигнал пропускается. Определения equity/exposure/daily loss и сохранение baseline через рестарт — в v2.
+
+**Статус:** needs-owner (→ Q1: размер слота и лимит убытка на сделку/пилот)
 
 ### R13 [§5.1, §12] На маленьком пилоте рассмотреть LIMIT FOK вместо IOC — GPT-6-Astra, 2026-09-24
 
@@ -470,7 +505,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** IOC допускает сколь угодно малый partial fill, который нельзя защитить или продать обычным ордером из-за minNotional; назвать его dust не устраняет риск. FOK требует полного исполнения или истечения без fill и сокращает именно этот сценарий, ценой меньшего числа входов. Это не атомарная защита BUY+OCO и не замена R4/R6. Официальная семантика: [Binance timeInForce IOC/FOK](https://github.com/binance/binance-spot-api-docs/blob/master/enums.md#timeinforce). Адаптер уже использует `NewOrderTimeInForceEnum` (`agent/agent/exchange/rest.py:259–261`); sizing/тип ордера находятся вне стратегии (`docs/STRATEGY_TRIPPLE_SCREEN.md:308–311`).
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Согласен с FOK для пилота: частичный IOC на таком счёте почти гарантированно даёт незащищаемый остаток. Меняю рекомендацию Q2 на LIMIT FOK с ценовым cap; IOC остаётся настройкой на потом. 0.3% — гипотеза, её проверим на статистике dry-run: спред bookTicker в момент сигнала будет в audit. Повторного входа в той же эпохе нет.
+
+**Статус:** needs-owner (→ Q2, рекомендация ревьюера и zed совпадает: FOK)
 
 ### R14 [§8.3, §12] Сопровождение должно переживать Stop и boot-off — GPT-6-Astra, 2026-09-24
 
@@ -478,7 +515,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** сейчас `_start_run` сначала вызывает `_stop_run`, а `_release_run` уничтожает стратегию и streams (`agent/agent/engine.py:203–224,326–357`). Поэтому предложенный хук через стратегию после Stop работать не будет; ошибка нового Start тоже может выключить сопровождение старой позиции. Resume зависит от `running` (`agent/agent/common/commands.py:479–500`), а spec требует независимый monitoring (`docs/STRATEGY_TRIPPLE_SCREEN.md:252–256`). Обязательные тесты: Stop во время BUY, Stop → restart, boot-off с позицией, неудачный Start и смена сети при неизвестном исходе входа.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Принято, это архитектурная правка моего плана. Проверил: `_start_run` начинает с `_stop_run` (`engine.py:207`), так что сопровождение через экземпляр стратегии Stop не переживёт. В v2 ExecutionRuntime принадлежит агенту (`main.py`), а не run'у: запускается при boot всегда, даже при `running=false`, восстанавливает позиции, pending/UNKNOWN и мониторинг. Stop стратегии закрывает только admission. Смена сети или аккаунта проверяется до teardown с учётом pending/UNKNOWN. Close — отдельная команда. Рекомендация по Q3 у нас совпадает.
+
+**Статус:** needs-owner (→ Q3, рекомендация совпадает: Stop = запрет входов; архитектура → v2)
 
 ### R15 [§4, §7.3] Общий feedback-контракт и сохранённая policy сопровождения — GPT-6-Astra, 2026-09-24
 
@@ -486,7 +525,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** `mark_position_*` существуют у Triple Screen (`agent/agent/strategies/tripple_screen/strategy.py:470–478`), но отсутствуют в базовом интерфейсе (`agent/agent/strategies/base.py:90–102,153–165`). Signal содержит `config_version` и текст TP, но не полную восстанавливаемую policy (`:41–58`); provenance несёт лишь часть настроек (`tripple_screen/strategy.py:720–723`). У backend уже есть хрупкий regex TP (`backend/app/core/signal_listener.py:66–80`) — не стоит переносить его в execution. Основание: `CONTEXT.md:45–53,100–112`, `DESIGN.md:166–179`, `docs/STRATEGY_TRIPPLE_SCREEN.md:349–350,409–420`.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. В базовый `Strategy` — generic `on_position_opened/closed(event)` и `restore_positions(snapshot)`; Triple Screen реализует их через текущие `mark_position_*`. ENTRY несёт структурированную `exit_policy` (версия, `tp_pct`, `initial_stop` — правило и параметры, `trail_interval`, `trail_n`, `stop_buffer_pct`, `cooldown_minutes`) вместо текстового `tp_rule`. Policy фиксируется в позиции при открытии, новый Start её не меняет. Regex в backend уйдёт вместе с виртуальными позициями (R23).
+
+**Статус:** accepted (→ v2)
 
 ### R16 [§5.3] Разрешить противоречие trailing и инварианта `stop < fill` — GPT-6-Astra, 2026-09-24
 
@@ -494,7 +535,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** при fill=100, TP=110 и trailing=104 защита прибыли корректна, но нарушает требование «stop < fill в любой момент» (`docs/STRATEGY_TRIPPLE_SCREEN.md:279–303`, `DESIGN.md:168–169`). Прохождение ценой TP не доказывает полного исполнения лимитной заявки. Нативный Binance trailing для SELL отслеживает процентное падение от максимума сделок после начала tracking, а не минимум последних N закрытых M15; он уменьшает потребность в cancel/new, но меняет алгоритм. Источник: [Spot Trailing Stop FAQ](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/trailing-stop-faq.md). В текущем плане проверяется только `stop < tp` (`docs/ORDER_EXECUTION_PLAN.md:153–159`), расхождение со spec не признано.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Согласен, противоречие реальное: трейлинг выше fill нарушает «stop < fill в любой момент» (spec §7.4). Предлагаю формулировку для spec: на входе `initial_stop < fill < tp`; дальше stop монотонно не убывает и всегда `stop < tp`; если новый уровень ≥ текущей цены или ≥ tp, выход идёт по exit-path, а не перестановкой. Частичный TP не считается полным закрытием, остаток идёт по R5. Нативный `trailingDelta` не используем: это другой алгоритм. Правка spec — решение владельца.
+
+**Статус:** needs-owner (→ Q12: правка spec §7.4)
 
 ### R17 [§5.3, §7.3] Независимый feed позиций и восстановление ratchet — GPT-6-Astra, 2026-09-24
 
@@ -502,7 +545,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** текущий screening сохраняет только позиции, уже входящие в `_active_symbols`, и вычитает их из cap (`agent/agent/strategies/tripple_screen/strategy.py:298–303`); cold-start позиция может исчезнуть из подписок, хотя spec требует её вне cap (`docs/STRATEGY_TRIPPLE_SCREEN.md:339–343`). Stop очищает окна (`tripple_screen/strategy.py:453–467`). Reconnect callbacks лишь предоставляют возможность backfill (`agent/agent/exchange/streams.py:109–113`), не восстанавливают trailing автоматически. Параметризованный interval также нельзя незаметно заменить hardcoded M15. Проверять restart во время replacement, пропуск нескольких баров, duplicate/out-of-order close и позицию, исключённую из новых symbols.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. Monitor-feed отдельный от стратегии: свой набор kline-подписок по authoritative открытым позициям, с интервалом из `exit_policy`, а не hardcoded M15. Позиции вне universe и top-N тоже в нём. Watermark последнего обработанного бара и подтверждённый stop хранятся в БД; при cold start и после реконнекта догружаются пропущенные закрытые бары, ratchet прогоняется по ним по порядку, дубли и out-of-order отбрасываются. Порог перестановки везде `≥ 1 tick` после округления. Инфраструктуру реконнекта и backfill из 37dcaf7 используем повторно.
+
+**Статус:** accepted (→ v2)
 
 ### R18 [§7.3] Cooldown восстанавливать абсолютным сроком, не повторным close — GPT-6-Astra, 2026-09-24
 
@@ -510,7 +555,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** `mark_position_closed` вычисляет срок из текущих settings и допускает fallback на now (`agent/agent/strategies/tripple_screen/strategy.py:473–478`), `_forget_symbol` удаляет cooldown (`:352–357`). Даже при персистентном Risk guard стратегия после re-promotion может снова эмитировать ENTRY вместо `HOLD(cooldown)`. Основание: `docs/STRATEGY_TRIPPLE_SCREEN.md:237–248`, `docs/ORDER_EXECUTION_PLAN.md:229–240`. Тесты: close → demotion → promotion, restart с новым конфигом, повтор одного outcome, partial exit и fill во время простоя.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. `cooldown_until` пишется в той же транзакции, что финальный outcome, и восстанавливается как абсолютный срок до первой оценки. `_forget_symbol` больше не удаляет cooldown (или cooldown живёт вне стратегии, в Risk, а стратегия получает его через `restore_positions`). Feedback идемпотентен по event id. Начало — время последнего закрывающего fill. Partial exit не закрывает позицию; zero-fill и reject cooldown не дают.
+
+**Статус:** accepted (→ v2)
 
 ### R19 [§5.1, §5.5] Определить `stop_ref` и границы действия valid_until — GPT-6-Astra, 2026-09-24
 
@@ -518,7 +565,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** `Signal` несёт `swing_low_ref`, но не `stop_ref` (`agent/agent/strategies/base.py:46–50`), spec использует неопределённый `stop_ref` и требует две проверки TTL (`docs/STRATEGY_TRIPPLE_SCREEN.md:206–214`). Между проверкой ask и исполнением цена меняется. Это требует согласования определения reference и post-fill policy, а не переноса live-цены в аналитическую входную логику стратегии. Тесты: ровно valid_until, expiry в очереди, timeout с обнаруженным после дедлайна fill и гэп между sanity-check и matching.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Принято. В v2: `stop_ref` для pre-check определяется как `min(swing_low_ref, entry_ref × (1 − min_stop_distance_pct))`, ENTRY-поля и UTC валидируются. `valid_until` проверяется при admission и перед каждой новой отправкой; при replay дедлайн сохраняется; expiry запрещает только новый BUY. Post-fill gap: LIMIT BUY ограничивает цену сверху, поэтому fill может оказаться ниже reference. Моё предложение: stop считается от fill по spec; если last trade уже ≤ рассчитанного stop, сразу exit-path (`reason=stop`). Это правило для владельца.
+
+**Статус:** needs-owner (→ Q13: определение stop_ref и post-fill gap-политика)
 
 ### R20 [§8.1, §10, §12] UDS доступен с HMAC; включить его до live pilot — GPT-6-Astra, 2026-09-24
 
@@ -526,7 +575,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** путь signature подписки поддерживает подписанный запрос без аутентифицированной сессии, а logon требует Ed25519. Локальные примеры обоих путей используют Ed25519/logon и потому не демонстрируют HMAC: `binance-spot/docs/websocket_api/user-data.md:15–31`, `binance-spot/examples/websocket_api/UserDataStream/user_data_stream_subscribe_signature.py:12–28`. Официально: [User Data Stream subscription](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-api.md#user-data-stream-subscription), [Session authentication](https://github.com/binance/binance-spot-api-docs/blob/master/web-socket-api.md#session-authentication). UDS не устраняет crash-окно BUY→OCO, но ускоряет обнаружение fills/отказов и снижает зависимость от polling; текущий `MarketDataStreams` обслуживает только market klines (`agent/agent/exchange/streams.py:1–14`).
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Согласен. Проверил: `user_data_stream_subscribe_signature` в установленном SDK есть (`binance_sdk_spot/websocket_api/websocket_api.py:4244`), локальные примеры действительно показывают только Ed25519/logon. HMAC-путь без logon подтвердим на testnet. UDS переношу до live pilot, REST reconcile остаётся обязательным, resubscribe + reconcile после реконнекта. «< 1 с» оформлю как измеряемый SLO (p50/p95/p99 fill → защита).
+
+**Статус:** needs-owner (→ Q6: тип ключей; перенос UDS до live → v2)
 
 ### R21 [§5.5, §12] Таймаут, recvWindow и отмена coroutine — разные вещи — GPT-6-Astra, 2026-09-24
 
@@ -534,7 +585,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** Binance описывает server timeout 10 с как unknown execution status, а recvWindow проверяет своевременность подписанного запроса, не отменяет уже принятый ордер. 15 с — инженерный стартовый запас, не гарантия. Источники: [General API information](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#general-api-information), [Timing security](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#timing-security), `agent/agent/exchange/rest.py:9–10,132–163,250–264`. Для зафиксированных `binance-sdk-spot 11.3.0` / `binance-common 4.4.0` (`uv.lock:410–428`) проверка установленного кода показала timeout в мс с default 1000 и retry helper только для GET/DELETE, не POST; поведение не следует угадывать по названию `retries`. Trade-client с `retries=0` и управляемым reconcile делает в том числе cancel-attempts наблюдаемыми.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято, проверил на установленном `binance-common`: timeout в мс с default 1000, ретраи только для `GET`/`DELETE`. То есть отмена ордера уже может тихо повторяться. В v2 — отдельный trade-клиент: timeout 15000 мс, `retries=0`, recovery через reconcile, `recvWindow=5000` и контроль расхождения часов (`/api/v3/time`). Отмена coroutine не освобождает резерв: `to_thread`-запрос продолжает жить, поэтому исход считается UNKNOWN. Сохраняем тип/код/HTTP-статус ошибки и rate-limit metadata.
+
+**Статус:** accepted (→ v2; Q9 закрыт: 15 с)
 
 ### R22 [§7.2, §9] Redis Stream требует transactional outbox и восстановления проекции — GPT-6-Astra, 2026-09-24
 
@@ -542,7 +595,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** Stream решает отсутствие подписчика, но не crash между DB commit и XADD и не дубликат между DB commit backend и XACK. Pub/sub listener уже вынужден дедуплицировать (`backend/app/core/signal_listener.py:117–129`), а network он сейчас угадывает по desired runtime (`:163–175`), что для реальных fills недопустимо. Раздельные БД и Redis-only связь обязательны (`CONTEXT.md:67–84`, `agent/agent/models.py:1–10`). Событие в `execution_event` (§7.2) удобно использовать как outbox, не вводя общий доступ backend к БД агента.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. `execution_event` работает как transactional outbox: состояние и событие пишутся одной транзакцией, отдельный publisher делает XADD до подтверждения. Envelope: event id, position id, account/network/mode, schema version, aggregate sequence. Backend применяет событие идемпотентно и делает XACK после коммита, забирает зависшие pending (XAUTOCLAIM), ловит пропуски по sequence и при trimming или потере Redis запрашивает snapshot у агента командой. Read-model показывается с watermark и возрастом.
+
+**Статус:** accepted (→ v2)
 
 ### R23 [§9] Не смешивать execution off, paper и исторические виртуальные позиции — GPT-6-Astra, 2026-09-24
 
@@ -550,7 +605,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** сейчас `_record_entry` создаёт SignalPosition без проверки режима (`backend/app/core/signal_listener.py:85–129,179–192`), `_position_public` меняет status/closed_at при чтении (`backend/app/api/routes/trading.py:723–746,776–786`). Такая история не является ни fill history, ни корректным paper execution, и не должна запускать real cooldown/close. §9 связывает virtual с `execution_enabled=false`, смешивая выключатель с режимом. Simulated fills/виртуальный портфель вынесены на owner-решения (`docs/STRATEGY_TRIPPLE_SCREEN.md:416–418`); рекомендую для v1 оставить off как observe-only, paper не расширять без отдельного решения.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Согласен: v1 = `off` (observe-only) или `real`, paper-режим не расширяем. Исторические `SignalPosition` остаются маркированным архивом signal-only. Ленивое закрытие в GET удаляется (оно же причина ClickUp 869f6m7vn). Открытый вопрос к владельцу: оставить ли в режиме `off` запись новых виртуальных позиций как наблюдение (без закрытия в GET) или прекратить совсем.
+
+**Статус:** needs-owner (→ Q15: судьба виртуальных позиций)
 
 ### R24 [§3, §7.1, §7.3] Развести EXIT-решение и подтверждённый execution outcome — GPT-6-Astra, 2026-09-24
 
@@ -558,7 +615,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** `Signal` определён как выход стратегии (`agent/agent/strategies/base.py:31–58`), но §3 и схема execution требуют эмитировать EXIT из PositionMonitor. В spec причины ограничены stop/trail/tp и обязательным provenance (`docs/STRATEGY_TRIPPLE_SCREEN.md:314–326`), а план добавляет manual/guard. Текущий backend EXIT закрывает последнюю позицию только по symbol и всё кроме tp считает stop (`backend/app/core/signal_listener.py:139–160`). Без точного position/context ID возможны закрытие другой позиции и повторное исполнение уведомления. Это доменный event-контракт, не новая модель биржевого ордера.
 
-**Статус:** open
+**zed, 2026-09-24:** Принято. Закрытие позиции — `ExecutionOutcome` (доменное событие execution), а не `Signal(EXIT)` через `_on_signal`. Ссылки: position/order/fill ids, исходный signal и policy, время и объём. Поля `reason ∈ {stop, trail, tp, manual, emergency}` и `mechanism ∈ {exchange_stop, exchange_tp, market_guard, manual_close, …}` раздельно. `Signal(EXIT)` остаётся за стратегией на будущее (spec §8) и сейчас не используется. Backend закрывает позицию по position id, не по symbol. Cooldown и уведомление — один раз после учёта остатка.
+
+**Статус:** accepted (→ v2)
 
 ### R25 [§10, §12] Приёмка по crash-матрице до live, а не только по времени прогона — GPT-6-Astra, 2026-09-24
 
@@ -566,7 +625,9 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** `order_test` проверяет создание одиночного ордера, не посылает его в matching engine и не тестирует OCO/OTOCO, liquidity, fills и cancel-races; `computeCommissionRates` даёт ставки, не реальные комиссии. Источники: [Test new order](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#test-new-order-trade), `binance-spot/examples/rest_api/Trade/order_test.py:25–29`. Testnet не обязан естественно воспроизводить partial fills и редкие crash-окна. В плане UDS отложен после live, решения перечислены только Q1–Q9 (`docs/ORDER_EXECUTION_PLAN.md:309–319`); минимальная наблюдаемость и recovery должны предшествовать реальным деньгам. Синтетическая команда не доказывает правильность Triple Screen и должна жёстко отклоняться на live.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Согласен. Этапы в v2: 0 — решения; 1 — durable admission/reservations/outbox/recovery и независимый runtime; 2 — fake-SDK и fault-injection по crash-матрице из треда (плюс сценарии R5/R6/R9/R17/R18); 3 — dry-run; 4 — testnet с синтетическим ENTRY (только testnet, отказ на live жёсткий, `provenance.synthetic=true`, через тот же Risk/Planner/OM); 5 — UDS; 6 — backend/UI; 7 — live pilot. Критерий допуска к live — из треда: ноль неразрешённых orphan/UNKNOWN/divergence, сверка qty и комиссий с историей биржи, работающие alerts и Close. Время прогона — дополнительный, а не единственный критерий.
+
+**Статус:** needs-owner (→ Q8, рекомендация совпадает: synthetic ENTRY только testnet; этапы → v2)
 
 ### R26 [§11, §12] Предполётные права ключей и аварийные ограничения — GPT-6-Astra, 2026-09-24
 
@@ -574,4 +635,6 @@ Testnet: у spot testnet свои символы и цены (много аль�
 
 **Почему:** ключевые ограничения нельзя установить по наличию credentials в конфиге (`agent/agent/exchange/rest.py:54–68`); в этой проверке ключи и приватный аккаунт не запрашивались. `TRADING` при входе не гарантирует возможность закрыться позже: [Binance symbol statuses](https://github.com/binance/binance-spot-api-docs/blob/master/enums.md#symbol-status-status), [HTTP return codes / limits](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md#http-return-codes). Пункты §11 пока описывают эти классы риска лишь частично. Персистентный учёт, резерв API-capacity для защиты и инструкция ручной сверки нужны даже при правильной OCO; market order не обходит остановку торгов или недоступность биржи.
 
-**Статус:** needs-owner
+**zed, 2026-09-24:** Согласен. Preflight-проверка прав выполняется при старте ExecutionRuntime: `get_account` → `canTrade` и permissions. Отсутствие Withdraw и IP whitelist через API проверить нельзя, это чек-лист владельца. Runbook (БД/Redis/биржа недоступны, HALT/delisting, 429/418, часы, отказ прав) пойдёт отдельным файлом `docs/EXECUTION_RUNBOOK.md` в этап до live. Секреты и подписи маскируются в raw audit и ошибках. Выделенный субаккаунт — решение владельца.
+
+**Статус:** needs-owner (→ Q7 права ключа; → Q16 субаккаунт/ownership; → Q11 alerts)
