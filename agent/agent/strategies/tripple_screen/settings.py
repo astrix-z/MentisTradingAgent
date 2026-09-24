@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PositiveInt = Annotated[int, Field(gt=0)]
 
+TRAIL_CAP_MESSAGE = "trailing stop cap % must be below take profit %"
+
 
 def interval_ms(interval: str) -> int:
     """Fixed UTC intraday SDK intervals; calendar/week alignment is unsupported."""
@@ -68,6 +70,21 @@ class TripleScreenSettings(BaseModel):
         default=Decimal(1), gt=0, lt=100, title="Min stop distance %"
     )
     tp_pct: Decimal = Field(default=Decimal(10), gt=0, title="Take profit %")
+    trail_cap_pct: Decimal = Field(
+        default=Decimal(4),
+        ge=0,
+        title="Trailing stop cap %",
+        description=(
+            "The trailing stop never rises above fill × (1 + cap/100); must be "
+            "below the take-profit %."
+        ),
+    )
+    max_hold_hours: Decimal = Field(
+        default=Decimal(8),
+        gt=0,
+        title="Max hold (hours)",
+        description="A position still open this long after its fill is sold.",
+    )
     cooldown_minutes: int = Field(default=60, ge=0, title="Cooldown (minutes)")
     signal_validity_minutes: PositiveInt = Field(
         default=15, title="Signal validity (minutes)"
@@ -99,6 +116,8 @@ class TripleScreenSettings(BaseModel):
         )
         if tide != 4 * wave or wave != 4 * ripple:
             raise ValueError("timeframes must have tide:wave:ripple ratio 16:4:1")
+        if not self.trail_cap_pct < self.tp_pct:
+            raise ValueError(TRAIL_CAP_MESSAGE)
         needed = max(
             slow + 1,
             self.stochastic_k_period + self.stochastic_d_period,
@@ -123,4 +142,4 @@ class TripleScreenSettings(BaseModel):
         )
 
 
-__all__ = ["TripleScreenSettings"]
+__all__ = ["TRAIL_CAP_MESSAGE", "TripleScreenSettings"]

@@ -14,11 +14,11 @@ from __future__ import annotations
 import abc
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, ClassVar, Literal
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel
 
@@ -26,6 +26,93 @@ from agent.exchange.rest import ExchangeRest
 from agent.exchange.streams import MarketDataStreams
 
 SignalType = Literal["ENTRY", "EXIT", "HOLD"]
+
+#: Namespace of deterministic ENTRY ids. Fixed forever: changing it would give
+#: every past epoch a new id and let a restart re-admit it.
+SIGNAL_ID_NAMESPACE = UUID("09ad640e-37e0-5abd-bdcd-f541859c2909")
+
+
+def entry_signal_id(
+    *, account_uid: str, network: str, strategy: str, symbol: str, epoch_id: str
+) -> str:
+    """The one id an ENTRY epoch has in an execution context (plan §5).
+
+    The same epoch after a restart or a key rotation maps to the same id, so the
+    inbox rejects the replay; another account or network maps elsewhere. The
+    account is the exchange ``uid``, never an API key.
+    """
+    parts = (account_uid, network, strategy, symbol, epoch_id)
+    if not all(parts) or any("|" in part for part in parts):
+        raise ValueError(f"invalid signal identity parts: {parts!r}")
+    return str(uuid5(SIGNAL_ID_NAMESPACE, "|".join(parts)))
+
+
+EXIT_POLICY_VERSION = 1
+_HUNDRED = Decimal(100)
+
+
+@dataclass(frozen=True)
+class ExitPolicy:
+    """How a position opened from this ENTRY is to be exited (plan §5).
+
+    Fixed into the position when it opens; a later Start with other settings
+    does not change it. Every ``*_pct`` is in **percentage points**, exactly as
+    in the strategy settings (``1`` means 1%); the helpers below do the only
+    division by 100.
+    """
+
+    version: int
+    stop_ref: Decimal
+    swing_low_ref: Decimal
+    min_stop_distance_pct: Decimal
+    stop_buffer_pct: Decimal
+    tp_pct: Decimal
+    trail_interval: str
+    trail_n: int
+    trail_cap_pct: Decimal
+    max_hold_hours: Decimal
+    cooldown_minutes: int
+
+    def initial_stop(self, fill: Decimal) -> Decimal:
+        """``min(swing_low_ref, fill × (1 − min_stop_distance_pct/100))`` (spec §7.1)."""
+        return min(
+            self.swing_low_ref, fill * (1 - self.min_stop_distance_pct / _HUNDRED)
+        )
+
+    def take_profit(self, fill: Decimal) -> Decimal:
+        return fill * (1 + self.tp_pct / _HUNDRED)
+
+    def trail_ceiling(self, fill: Decimal) -> Decimal:
+        """The trailing stop never rises above this (spec §7.2)."""
+        return fill * (1 + self.trail_cap_pct / _HUNDRED)
+
+    def trail_candidate(self, lows: list[Decimal]) -> Decimal:
+        """``min(low[1..trail_n]) × (1 − stop_buffer_pct/100)``."""
+        return min(lows) * (1 - self.stop_buffer_pct / _HUNDRED)
+
+    def transport(self) -> dict[str, Any]:
+        return {key: transport_value(value) for key, value in asdict(self).items()}
+
+    @classmethod
+    def from_transport(cls, data: dict[str, Any]) -> ExitPolicy:
+        """Rebuild a policy stored as JSON, without losing Decimal digits."""
+        if data.get("version") != EXIT_POLICY_VERSION:
+            raise ValueError(
+                f"unsupported exit policy version: {data.get('version')!r}"
+            )
+        return cls(
+            version=int(data["version"]),
+            stop_ref=Decimal(data["stop_ref"]),
+            swing_low_ref=Decimal(data["swing_low_ref"]),
+            min_stop_distance_pct=Decimal(data["min_stop_distance_pct"]),
+            stop_buffer_pct=Decimal(data["stop_buffer_pct"]),
+            tp_pct=Decimal(data["tp_pct"]),
+            trail_interval=str(data["trail_interval"]),
+            trail_n=int(data["trail_n"]),
+            trail_cap_pct=Decimal(data["trail_cap_pct"]),
+            max_hold_hours=Decimal(data["max_hold_hours"]),
+            cooldown_minutes=int(data["cooldown_minutes"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -48,6 +135,7 @@ class Signal:
     swing_low_ref: Decimal | None = None
     tp_rule: str | None = None
     valid_until: datetime | None = None
+    exit_policy: ExitPolicy | None = None
     # EXIT
     exit_reason: str | None = None
     # Full per-screen provenance (bools, indicator values, timestamps).
@@ -67,6 +155,26 @@ class Signal:
         from a sink exception after an ambiguous acknowledgement.
         """
         return {key: transport_value(value) for key, value in asdict(self).items()}
+
+    def identified(self, *, account_uid: str, network: str, strategy: str) -> Signal:
+        """This signal with its execution-context identity.
+
+        An ENTRY gets its deterministic :func:`entry_signal_id`; HOLD and EXIT
+        keep their own ids, since one epoch may legitimately produce several
+        HOLDs and each is audited.
+        """
+        if self.type != "ENTRY" or self.epoch_id is None:
+            return self
+        return replace(
+            self,
+            signal_id=entry_signal_id(
+                account_uid=account_uid,
+                network=network,
+                strategy=strategy,
+                symbol=self.symbol,
+                epoch_id=self.epoch_id,
+            ),
+        )
 
 
 def transport_value(value: Any) -> Any:
@@ -200,4 +308,14 @@ class Strategy(abc.ABC):
         return None
 
 
-__all__ = ["Signal", "SignalSink", "SignalType", "Strategy", "StrategyServices"]
+__all__ = [
+    "EXIT_POLICY_VERSION",
+    "SIGNAL_ID_NAMESPACE",
+    "ExitPolicy",
+    "Signal",
+    "SignalSink",
+    "SignalType",
+    "Strategy",
+    "StrategyServices",
+    "entry_signal_id",
+]

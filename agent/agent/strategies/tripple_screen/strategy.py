@@ -12,7 +12,14 @@ from typing import Any
 
 from binance_sdk_spot.websocket_streams.models import KlineResponse
 
-from agent.strategies.base import Signal, Strategy, StrategyServices, transport_value
+from agent.strategies.base import (
+    EXIT_POLICY_VERSION,
+    ExitPolicy,
+    Signal,
+    Strategy,
+    StrategyServices,
+    transport_value,
+)
 from agent.strategies.registry import strategy
 from agent.strategies.tripple_screen.indicators import (
     Candle,
@@ -752,6 +759,22 @@ class TripleScreenStrategy(Strategy):
             provenance["ripple"],
             provenance["state"],
         )
+        exit_policy = None
+        if reason is None:
+            distance = settings.min_stop_distance_pct / 100
+            exit_policy = ExitPolicy(
+                version=EXIT_POLICY_VERSION,
+                stop_ref=min(swing, trigger.close * (1 - distance)),
+                swing_low_ref=swing,
+                min_stop_distance_pct=settings.min_stop_distance_pct,
+                stop_buffer_pct=settings.stop_buffer_pct,
+                tp_pct=settings.tp_pct,
+                trail_interval=settings.ripple_interval,
+                trail_n=settings.trail_m15_n,
+                trail_cap_pct=settings.trail_cap_pct,
+                max_hold_hours=settings.max_hold_hours,
+                cooldown_minutes=settings.cooldown_minutes,
+            )
         return Signal(
             type="HOLD" if reason else "ENTRY",
             symbol=symbol,
@@ -761,6 +784,7 @@ class TripleScreenStrategy(Strategy):
             entry_ref=None if reason else trigger.close,
             swing_low_ref=None if reason else swing,
             tp_rule=None if reason else f"fill x {1 + settings.tp_pct / 100}",
+            exit_policy=exit_policy,
             valid_until=None
             if reason
             else now + timedelta(minutes=settings.signal_validity_minutes),

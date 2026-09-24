@@ -68,6 +68,9 @@ def test_backend_accepts_every_declared_default() -> None:
         {"ema_tide_periods": [5, 13, 34]},
         {"tide_interval": "8h", "wave_interval": "2h", "ripple_interval": "30m"},
         {"rest_concurrency": 5, "cooldown_minutes": 0},
+        {"trail_cap_pct": 0},
+        {"trail_cap_pct": "3", "tp_pct": "3.5"},
+        {"max_hold_hours": "0.25"},
     ],
 )
 def test_backend_and_agent_accept_the_same_parameters(params: dict[str, Any]) -> None:
@@ -93,6 +96,13 @@ def test_backend_and_agent_accept_the_same_parameters(params: dict[str, Any]) ->
         {"ripple_interval": "5m"},
         {"kline_window": 34},
         {"stochastic_k_period": 1000},
+        # The trailing cap must stay below the take-profit (spec §7.4).
+        {"trail_cap_pct": 10},
+        {"trail_cap_pct": 11},
+        {"trail_cap_pct": -1},
+        {"tp_pct": 2},
+        {"max_hold_hours": 0},
+        {"max_hold_hours": -1},
     ],
 )
 def test_backend_and_agent_reject_the_same_parameters(params: dict[str, Any]) -> None:

@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "schema_hash": "89757569c12b2485fed8615ccfced0a21ec1980c7281844ade98294449137580",
-  "published_at": "2026-09-15T13:42:56.416509+00:00",
+  "schema_hash": "40c0d6f2167568ea2776ccfc14ffe6b117f79cb3d8c4ea121f593597af9362ed",
+  "published_at": "2026-09-24T16:59:34.796043+00:00",
   "lookups": {
     "intervals_ms": {
       "1s": 1000,
@@ -220,6 +220,36 @@
             "default": "10",
             "title": "Take profit %"
           },
+          "trail_cap_pct": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "4",
+            "description": "The trailing stop never rises above fill \u00d7 (1 + cap/100); must be below the take-profit %.",
+            "title": "Trailing stop cap %"
+          },
+          "max_hold_hours": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "8",
+            "description": "A position still open this long after its fill is sold.",
+            "title": "Max hold (hours)"
+          },
           "cooldown_minutes": {
             "default": 60,
             "minimum": 0,
@@ -240,9 +270,11 @@
             "type": "integer"
           },
           "ws_top_n": {
-            "default": 50,
+            "default": 30,
+            "description": "Stage-2 cap: of the symbols that pass the EMA13/EMA34 screen, at most this many are streamed and fully processed, ranked by trend strength (EMA13-over-EMA34 spread).",
             "exclusiveMinimum": 0,
-            "title": "WS top N symbols",
+            "maximum": 100,
+            "title": "Max active symbols",
             "type": "integer"
           },
           "volume_window": {
@@ -263,6 +295,16 @@
         "additionalProperties": false
       },
       "constraints": [
+        {
+          "cmp": "lt",
+          "lhs": {
+            "field": "trail_cap_pct"
+          },
+          "rhs": {
+            "field": "tp_pct"
+          },
+          "message": "trailing stop cap % must be below take profit %"
+        },
         {
           "cmp": "lt",
           "lhs": {

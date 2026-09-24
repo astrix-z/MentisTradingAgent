@@ -18,7 +18,7 @@ from typing import Any
 
 from binance_sdk_spot.rest_api.models import KlinesIntervalEnum
 
-from agent.strategies.tripple_screen.settings import interval_ms
+from agent.strategies.tripple_screen.settings import TRAIL_CAP_MESSAGE, interval_ms
 
 EMA_MESSAGE = "EMA tide periods must be three strictly increasing positive periods"
 RATIO_MESSAGE = "timeframes must have tide:wave:ripple ratio 16:4:1"
@@ -48,6 +48,13 @@ LOOKUPS: dict[str, dict[str, int]] = {"intervals_ms": _intervals_ms()}
 
 #: Cross-field rules, in the constraint grammar of :mod:`agent.protocol`.
 CONSTRAINTS: list[dict[str, Any]] = [
+    {
+        # stop ≤ fill × (1 + cap) < TP must hold for every fill (spec §7.4).
+        "cmp": "lt",
+        "lhs": {"field": "trail_cap_pct"},
+        "rhs": {"field": "tp_pct"},
+        "message": TRAIL_CAP_MESSAGE,
+    },
     {
         "cmp": "lt",
         "lhs": {"field": ["ema_tide_periods", 0]},
