@@ -36,7 +36,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent.exchange.rest import ExchangeError, ExchangeRest
+from agent.exchange.rest import ExchangeError
 from agent.exchange.trade import TradeCallError
 from agent.execution.filters import FilterCache
 from agent.execution.ledger import losing_trades_today, record_event
@@ -475,37 +475,6 @@ class Admission:
         )
 
 
-def build_admission(runtime: ExecutionRuntime) -> Admission:
-    """Admission on public market-data clients, one per network."""
-    clients: dict[str, ExchangeRest] = {}
-
-    def market(network: str) -> ExchangeRest:
-        if network not in clients:
-            if network not in ("live", "testnet"):
-                raise ValueError(f"unknown network: {network!r}")
-            clients[network] = ExchangeRest.connect_public(
-                "live" if network == "live" else "testnet"
-            )
-        return clients[network]
-
-    async def fetch(network: str, symbol: str) -> Any:
-        return await market(network).exchange_info(symbol)
-
-    async def price(network: str, symbol: str) -> Decimal | None:
-        ticker = await market(network).ticker_price(symbol)
-        value = getattr(getattr(ticker, "actual_instance", ticker), "price", None)
-        return Decimal(value) if value else None
-
-    admission = Admission(
-        runtime,
-        quotes=lambda network: QuoteProvider(market(network)),
-        filters=FilterCache(fetch),
-        prices=price,
-    )
-    runtime.set_admission_wake(admission.wake)
-    return admission
-
-
 async def _consume(session: AsyncSession, signal_id: uuid.UUID) -> None:
     signal = await session.get(SignalInbox, signal_id, with_for_update=True)
     if signal is None or signal.processed_at is not None:
@@ -589,7 +558,6 @@ def _seconds(value: int) -> timedelta:
 
 __all__ = [
     "Admission",
-    "build_admission",
     "Decision",
     "UNSAFE_STATES",
     "admission_lock_key",
