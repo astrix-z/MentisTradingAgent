@@ -29,6 +29,7 @@ from agent.exchange import (
     balance_map,
     balance_snapshot,
 )
+from agent.execution.admission import record_signal
 from agent.execution.runtime import ExecutionRuntime
 from agent.execution.settings import ExecutionSettings
 from agent.strategies import Signal, Strategy, StrategyServices, build_strategy
@@ -310,7 +311,44 @@ class Engine:
             await strategy.on_position_opened(event)
 
     async def _on_signal(self, signal: Signal) -> None:
-        """Handle a strategy signal (execution lane hooks in here later)."""
+        """Handle a strategy signal: inbox first, then the log and the UI.
+
+        With an execution context the signal is committed to the durable inbox
+        before anything else — that commit is the successful emit, and a
+        failure there is raised back to the strategy, which keeps the epoch
+        unconsumed and retries. An ENTRY takes its deterministic id; one the
+        inbox already has (a replay of a consumed epoch) is not re-emitted.
+        The Redis publish is then only a notification for the UI.
+        """
+        runtime = self.execution
+        durable = False
+        if (
+            runtime is not None
+            and runtime.context is not None
+            and runtime.schema_ready
+            and runtime.context.network == self._network
+        ):
+            signal = signal.identified(
+                account_uid=runtime.context.account,
+                network=runtime.context.network,
+                strategy=self._strategy_name,
+            )
+            async with runtime.session() as session:
+                recorded = await record_signal(
+                    session,
+                    signal,
+                    context=runtime.context,
+                    strategy=self._strategy_name,
+                )
+            if not recorded:
+                logger.info(
+                    "signal %s %s epoch=%s already recorded; not re-emitted",
+                    signal.type,
+                    signal.symbol,
+                    signal.epoch_id,
+                )
+                return
+            durable = True
         logger.info(
             "signal %s %s reason=%s epoch=%s",
             signal.type,
@@ -337,7 +375,14 @@ class Engine:
                 signal.valid_until,
                 signal.exit_reason or "-",
             )
-        await self._publish_event("signal", signal)
+        try:
+            await self._publish_event("signal", signal)
+        except RedisError:
+            if not durable:
+                raise
+            logger.warning("signal recorded but not published (Redis unavailable)")
+        if durable and signal.type == "ENTRY" and runtime is not None:
+            runtime.wake_admission()
 
     async def _publish_event(self, kind: str, signal: Signal) -> None:
         payload = {"kind": kind, **signal.transport()}

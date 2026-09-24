@@ -32,6 +32,7 @@ from agent.engine import (
     REDIS_COMMAND_STREAM,
     Engine,
 )
+from agent.execution.admission import build_admission
 from agent.execution.runtime import ExecutionRuntime
 from agent.monitoring import MONITORING_REFRESH_SECONDS, refresh_monitoring
 from agent.protocol import publish_catalog
@@ -366,9 +367,11 @@ async def run() -> None:
     )
     engine.execution = runtime
     runtime.feedback = engine.position_feedback
+    admission = build_admission(runtime)
     # Independent of Start/Stop and of the saved running flag: unfinished
     # positions are followed from boot, even when the strategy stays off.
     await runtime.boot()
+    admission.start()
 
     try:
         async with asyncio.TaskGroup() as tg:
@@ -379,6 +382,7 @@ async def run() -> None:
             tg.create_task(_monitoring_loop(redis, stop))
     finally:
         await engine.shutdown()
+        await admission.stop()
         await runtime.shutdown()
         await redis.aclose()
         await db.dispose_engines()

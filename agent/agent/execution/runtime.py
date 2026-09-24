@@ -126,6 +126,8 @@ class ExecutionRuntime:
         self._restore_pending = False
         #: Delivers committed position changes to the running strategy.
         self.feedback: Callable[[PositionEvent, bool], Awaitable[None]] | None = None
+        #: Wakes the admission worker when a new ENTRY is in the inbox.
+        self._admission_wake: Callable[[], None] | None = None
 
     # --- wiring ------------------------------------------------------------
 
@@ -239,6 +241,13 @@ class ExecutionRuntime:
 
     def resume(self) -> None:
         self.paused_by_owner = False
+
+    def set_admission_wake(self, wake: Callable[[], None]) -> None:
+        self._admission_wake = wake
+
+    def wake_admission(self) -> None:
+        if self._admission_wake is not None:
+            self._admission_wake()
 
     # --- strategy feedback (plan §4.4) -------------------------------------------
 
