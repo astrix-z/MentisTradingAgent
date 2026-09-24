@@ -166,7 +166,8 @@ class Strategy(abc.ABC):
 1. **Execution lane** — по `Signal` считать размер и ставить ордера через
    `ExchangeRest` (округление под фильтры Binance, идемпотентные client-id).
 2. **Position monitoring (spec §7)** — initial stop, trailing, TP по live-цене;
-   приоритет ≥ входной оценки; инвариант `stop < fill < tp`.
+   приоритет ≥ входной оценки; инварианты spec §7.4 (v1.2: трейлинг до
+   `fill × 1.04`, выход по времени через 8 ч). План: `docs/ORDER_EXECUTION_PLAN.md`.
 3. **Universe scan в самой Стратегии (spec §1)** — H4 slope, top-N по 24h volume,
    динамический WS-set. Сам список торгуемых символов и его отбор уже есть (§8),
    но Стратегия пока берёт символы из `start`, а не сканирует их сама.

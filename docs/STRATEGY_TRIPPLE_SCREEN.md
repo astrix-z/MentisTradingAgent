@@ -1,10 +1,10 @@
-# Стратегия «Три Экрана» (Triple Screen) — Strategy Spec v1.1
+# Стратегия «Три Экрана» (Triple Screen) — Strategy Spec v1.2
 
 - **Owner decision:** `OWNER-STRATEGY-02`
 - **Статус:** утверждено владельцем; §1.2/§9/§10 пересмотрены реализацией
   2026-09-17 (см. «Ревизия v1.1» ниже) — требует owner-review при следующем
   формальном пересмотре.
-- **История:** Design Draft v0.1
+- **История:** Design Draft v0.1 → v1.0 → v1.1 (2026-09-17) → v1.2 (2026-09-24)
 - **Продукт:** Binance Spot, **long-only**
 
 ### Ревизия v1.1 (2026-09-17)
@@ -22,7 +22,19 @@ strategies/tripple_screen/strategy.py`, метод `_screen_universe`) была
 - Символ с открытой позицией **исключён из ранжирования и cap**: остаётся в
   WS-set до закрытия позиции, даже если перестал проходить slope-filter.
 
-Секции ниже отражают эту (v1.1) версию.
+### Ревизия v1.2 (2026-09-24, решение владельца)
+
+Правила выхода уточнены при планировании реального исполнения
+(`docs/ORDER_EXECUTION_PLAN.md`, Q12):
+
+- **Потолок трейлинга:** stop поднимается не выше `fill × (1 + trail_cap_pct)`,
+  default 4% (§7.2).
+- **Выход по времени:** позиция, открытая дольше `max_hold_hours` (default 8 ч)
+  от entry fill, закрывается по рынку, `exit_reason = time` (§7.5).
+- **Инвариант выходов** (§7.4): прежнее «`stop < fill < tp` в любой момент»
+  заменено. Трейлинг может поднять stop выше fill; всегда `stop < tp`.
+
+Секции ниже отражают версию v1.2.
 
 Документ описывает точный алгоритм стратегии для исполнителя. Разделы 1–8
 разделы 9–13 —
@@ -238,7 +250,7 @@ BUY(symbol) = BullishTide(H4)                              # Экран 1
 
 - **Одна открытая позиция на символ.** Пока позиция открыта — BUY по символу = HOLD.
 - **Единый re-entry cooldown: 60 минут** после любого закрытия позиции
-  (stop / trail / tp), конфиг `cooldown_minutes`, default 60.
+  (stop / trail / tp / time), конфиг `cooldown_minutes`, default 60.
   - Отсчёт — от timestamp exit fill.
   - Scope — per symbol.
   - **Персистентен через рестарт Engine** (Persist/Outbox lane, `STRATEGY-02`).
@@ -255,7 +267,7 @@ Position monitoring — отдельный lane (Engine Spec §10.7), приор
 entry-evaluation, управляется независимо (pause entry не останавливает мониторинг).
 Работает по live-цене.
 
-Выходы: **stop** (initial), **trail** (трейлинг), **tp**. Trend-flip exit удалён.
+Выходы: **stop** (initial), **trail** (трейлинг), **tp**, **time** (§7.5). Trend-flip exit удалён.
 
 ### 7.1 Initial stop
 
@@ -279,8 +291,10 @@ stop_price = min(swing_low_ref, fill_price × 0.99)
 - Включается сразу после fill.
 - На каждом закрытии M15: `trail_candidate = min(low(M15)[i], i = 1..N) × 0.999`,
   `N = trail_m15_n` (конфиг, default 2), буфер 0.1%.
-- Ratchet: `new_stop = max(current_stop, trail_candidate)` — перенос **только вверх**
-  (уменьшение убытка / рост защищённой прибыли).
+- Ratchet: `new_stop = min(max(current_stop, trail_candidate), fill_price × (1 + trail_cap_pct))`
+  — перенос **только вверх** (уменьшение убытка / рост защищённой прибыли),
+  но не выше потолка `fill × 1.04` (`trail_cap_pct`, default 4%). Достигнув
+  потолка, stop больше не переставляется.
 - Проверка пробоя стопа — по live-цене (защита от гэпа вниз, который может
   «перепрыгнуть» цену стоп-ордера).
 
@@ -297,11 +311,20 @@ tp_price = fill_price × 1.10     # tp_pct (конфиг, default 10%)
 
 ### 7.4 Инварианты выходов
 
-- `stop_price < fill_price < tp_price` — в любой момент жизни позиции.
-- Трейлинг не может подняться выше TP раньше исполнения TP (цена, достигающая
-  уровня трейлинга выше TP, сперва проходит TP → TP исполняется первым). Поэтому
-  таблица precedence выходов не требуется.
-- Exit reason в EXIT-сигнале: `stop` / `trail` / `tp`.
+- На входе: `initial_stop < fill_price < tp_price`.
+- Далее stop монотонно не убывает и всегда
+  `stop ≤ fill_price × (1 + trail_cap_pct) < tp_price`. Трейлинг может поднять
+  stop выше fill (защита прибыли). Прежнее требование «`stop < fill` в любой
+  момент» снято в v1.2.
+- Если новый уровень stop ≥ текущей цены (цена уже ниже), stop не
+  переставляется, а позиция закрывается по рынку (`trail`).
+- Exit reason: `stop` / `trail` / `tp` / `time`.
+
+### 7.5 Выход по времени
+
+- Позиция, открытая `max_hold_hours` (default 8 ч) от entry fill, закрывается
+  по рынку независимо от цены, `exit_reason = time`.
+- Cooldown (§6) начисляется так же, как после любого закрытия.
 
 ---
 
@@ -316,7 +339,7 @@ emitted_at; market window versions; config version          # STRATEGY-03
 
 ENTRY: epoch_id; entry_ref = close триггерного M15;
        swing_low_ref; tp_rule = "fill × 1.10"; valid_until = emitted_at + 15 min
-EXIT:  exit_reason ∈ {stop, trail, tp}
+EXIT:  exit_reason ∈ {stop, trail, tp, time}
 HOLD:  reason ∈ {no_pullback, no_trigger, position_open, cooldown, epoch_consumed}
 
 provenance (все типы):
@@ -359,6 +382,8 @@ evaluation event не создаёт duplicate signal (`STRATEGY-03`).
 | `oversold_threshold` | `20` | зона oversold Э2 |
 | `swing_low_h1_n` | `2` | окно initial stop |
 | `trail_m15_n` | `2` | окно трейлинга |
+| `trail_cap_pct` | `4%` | потолок трейлинга: stop ≤ `fill × 1.04` (v1.2) |
+| `max_hold_hours` | `8` | выход по рынку через 8 ч после fill, `exit_reason=time` (v1.2) |
 | `stop_buffer_pct` | `0.1%` | `×0.999` к swing low (initial и trailing) |
 | `min_stop_distance_pct` | `1%` | `fill × 0.99` |
 | `tp_pct` | `10%` | `fill × 1.10` |
@@ -391,8 +416,9 @@ evaluation event не создаёт duplicate signal (`STRATEGY-03`).
    любого закрытия, отсчёт от exit fill; персистентен через рестарт; наблюдаем
    в audit chain.
 7. **Position monitoring:** стопы/трейлинг/TP по live-цене; приоритет ≥
-   entry-evaluation; управляется независимо от entry; инвариант
-   `stop < fill < tp` соблюдается.
+   entry-evaluation; управляется независимо от entry; инварианты §7.4
+   соблюдаются (stop не убывает, `stop ≤ fill × 1.04 < tp`); выход по времени
+   через `max_hold_hours`.
 8. **Audit chain:** цепочка `market state → signal → intent → risk → plan → order →
    outcome` полна для каждого сигнала, включая no-order HOLD.
 9. **Config-driven:** все периоды и пороги — через versioned config; hardcode
