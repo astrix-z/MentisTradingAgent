@@ -450,6 +450,12 @@ class TradeClient:
             "get_order_list", priority, orig_client_order_id=list_client_order_id
         )
 
+    async def open_orders(
+        self, *, symbol: str, priority: Priority = Priority.RECONCILE
+    ) -> TradeResult[list[Any]]:
+        """Open orders of one symbol (for quarantine and divergence checks)."""
+        return await self._call("get_open_orders", priority, symbol=symbol)
+
     async def open_order_list(self) -> TradeResult[list[OpenOrderListResponse]]:
         return await self._call("open_order_list", Priority.RECONCILE)
 

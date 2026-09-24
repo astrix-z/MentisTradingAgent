@@ -35,7 +35,6 @@ from agent.execution.ledger import lock_position, record_event
 from agent.execution.models import Position, PositionStatus
 from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.protection import TERMINAL, Protector, Step, StepResult
-from agent.execution.sizing import sellable
 
 logger = logging.getLogger(__name__)
 
@@ -236,13 +235,7 @@ class PositionWorker:
         if not proven:
             return StepResult(Step.WAITING, "leg fills not proven yet")
         position = await self.protector._position(position_id)
-        filters, quote = await self.protector._market(position, strict=False)
-        price = quote.last_price() if quote is not None else position.fill_vwap
-        if (
-            filters is not None
-            and price is not None
-            and not sellable(filters, position.quantity, price)
-        ):
+        if await self.protector.nothing_to_sell(position):
             above = filled_type == "LIMIT_MAKER"
             await self.protector._finalize(
                 position_id,

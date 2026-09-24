@@ -313,13 +313,7 @@ class Protector:
         order_ids = [int(o.order_id) for o in order_list.orders or []]
         filled_leg = await self._book_orders(position_id, order_ids)
         position = await self._position(position_id)
-        filters, quote = await self._market(position, strict=False)
-        price = quote.last_price() if quote is not None else position.fill_vwap
-        if (
-            filters is not None
-            and price is not None
-            and not sellable(filters, position.quantity, price)
-        ):
+        if await self.nothing_to_sell(position):
             above = filled_leg == "LIMIT_MAKER"
             return await self._finalize(
                 position_id,
@@ -327,6 +321,23 @@ class Protector:
                 ExitMechanism.EXCHANGE_TP if above else ExitMechanism.EXCHANGE_STOP,
             )
         return StepResult(Step.WAITING, "list finished with a remainder")
+
+    async def nothing_to_sell(self, position: Position) -> bool:
+        """Whether the booked remainder is zero or dust (plan §8.4).
+
+        Zero needs no market data. Otherwise the symbol's rules decide, at the
+        freshest price there is — the fill price when no quote can be had, so
+        a quiet tape never keeps a sold-out position open.
+        """
+        if position.quantity <= 0:
+            return True
+        try:
+            filters = await self.orders.filters.get(position.network, position.symbol)
+        except Exception:  # noqa: BLE001 - no rules: cannot call it dust
+            return False
+        _, quote = await self._market(position, strict=False)
+        price = quote.last_price() if quote is not None else position.fill_vwap
+        return price is not None and not sellable(filters, position.quantity, price)
 
     # --- deadline -------------------------------------------------------------------
 
