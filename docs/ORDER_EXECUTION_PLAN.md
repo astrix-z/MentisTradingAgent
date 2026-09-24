@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| Статус | **v2.1** (2026-09-24): правило слотов §7 по решению владельца. Готов к декомпозиции на задачи |
-| История | v1 (2026-09-24, `f9db7d1`) → ревью R1–R26 (GPT-6-Astra) → решения владельца Q1–Q16 → v2 (`b95bc76`) → v2.1 (слоты до 3 символов) |
+| Статус | **v2.2** (2026-09-24): ревью декомпозиции R-EXEC (ClickUp) и решения владельца Q17–Q19. Задачи EXEC-01…15 — §12.1 |
+| История | v1 (2026-09-24, `f9db7d1`) → ревью R1–R26 (GPT-6-Astra) → решения владельца Q1–Q16 → v2 (`b95bc76`) → v2.1 (`8b47a27`, слоты до 3 символов) → ревью задач R-EXEC-01…13, R-EXEC-plan.1–5 (GPT-6-Astra, 3 круга) → v2.2 |
 | Автор | Claude-Mentis (Claude Code) по запросу владельца; ревьюер — GPT-6-Astra |
 | Трекер | ClickUp 869f6m8kj «Execution: план реального исполнения ордеров по сигналам стратегии» |
-| Порядок обсуждения | §14. Замечания к v2 — новыми тредами R27+ |
+| Порядок обсуждения | §14. Замечания к плану — тредами R27+ в §14; к задачам — `[R-EXEC-NN.k]` в самих задачах ClickUp |
 
 Документ самодостаточен: для работы с ним не нужен контекст прежних разговоров.
 Опора — спецификация стратегии `docs/STRATEGY_TRIPPLE_SCREEN.md` (**v1.2**:
@@ -33,6 +33,20 @@
 | События в backend | Redis Stream | Stream + **transactional outbox**, идемпотентное применение | R22 |
 | EXIT | `Signal(EXIT)` из монитора | **`ExecutionOutcome`**, отдельный от Signal | R24 |
 | Этапы | dry-run → testnet → live | + **fault-injection по crash-матрице**, UDS **до** live | R25 |
+
+**v2.2** (ревью задач, треды `[R-EXEC-…]` в ClickUp):
+
+| Область | Было в v2.1 | Стало в v2.2 | Тред |
+|---|---|---|---|
+| Владение состоянием | fills/ledger/close в разных компонентах | единый **PositionApplier** и одна транзакционная **финализация** (§8.5) | plan.5, 11.1 |
+| Котировка для входа | из MonitorFeed (есть только при позиции) | **QuoteProvider** на REST, опорная цена по каждому фильтру (§9.8) | plan.3, 03.1 |
+| WS-подписки | два экземпляра `MarketDataStreams` | один **StreamHub** на процесс, одна сеть (§9.3) | 10.1 |
+| Бюджет запросов | возврат `rate_limits` | общий scheduler с приоритетами (§6.9) | plan.4 |
+| Защита после BUY | остаток из ответа FOK | **барьер полноты fills** на всех путях; дедлайн → `protection_overdue`, продажа только доказанного остатка (§6.3, §6.7) | 08.2, 09.1, 09.2 |
+| UNKNOWN | запрет повтора того же id | запрет повтора **логической операции** с любым id (§6.8) | 08.1 |
+| Резервы | «освобождение при доказанном исходе» | lifecycle quote-резерва и слота (§7.5) | 06.1 |
+| Решения владельца | — | Q17 USDT only, Q18 рост до минимума может тратить резерв, Q19 определение убыточной сделки (§13) | 03.2, 03.3, 06.2 |
+| Нарезка | EXEC-01…13 | + EXEC-14/15, PR-подзадачи 08a–c, 09a–c, 11a–b, DAG (§12.1) | plan.1, plan.2 |
 
 ## 1. Проблема
 
@@ -105,7 +119,9 @@ Strategy ─Signal─▶ Engine._on_signal ─▶ signals.log, agent:events (UI,
           │ (durable)  (valid_until,  (резервы,   (размер,  (один на позицию,│
           │            эпоха)         лимиты)     фильтры)  сериализованные  │
           │                                                  операции)       │
-          │ MonitorFeed (свои kline + trade по открытым позициям)            │
+          │ PositionApplier (fills → ledger → позиция) + Finalizer (§8.5)    │
+          │ QuoteProvider (REST: last trade, avgPrice, referencePrice, §9.8) │
+          │ StreamHub ─▶ MonitorFeed (kline + trade по открытым позициям)    │
           │ Reconciler (старт, реконнект, по расписанию, по UNKNOWN)         │
           │ OutboxPublisher (execution_event → Redis Stream agent:executions)│
           └───────────────┬──────────────────────────────────────┬─────────┘
@@ -119,6 +135,11 @@ lock** в БД агента на время жизни процесса. Вто�
 мутаций, пока не получит lock, и начинает с reconcile всех in-flight операций.
 Fencing на стороне биржи невозможен — признанный риск, закрывается деплоем в
 один контейнер. `account` = `uid` из `get_account`.
+- Lock — session-level на **выделенном соединении** вне pool, держится весь срок
+  владения; ключ — стабильный хеш `(account, network)`, не зависящий от процесса.
+- Потеря lock-соединения или БД → новые мутации запрещены до повторного lock и
+  reconcile. Уже отправленный `to_thread`-запрос отменённым не считается.
+- Ошибка миграции БД → исполнение fail-closed (сейчас она только логируется).
 
 ### 4.3 Режимы
 `execution.enabled = false` — наблюдение: сигналы в inbox/audit, ордеров нет,
@@ -128,6 +149,13 @@ Stop стратегии = закрыть admission; позиции, OCO и мо�
 позиции — только командой `close_position` или по правилам выхода.
 Смена `network`/аккаунта при открытых, pending или UNKNOWN позициях в текущем
 контексте — отказ `start` до teardown.
+- **Контекст при boot** (account, network) восстанавливается из незавершённых
+  intents/attempts/позиций в БД, а не из desired network в Redis и не из
+  `agent:runtime.running`. UID новых credentials сверяется с сохранённым; смена
+  аккаунта **и** сети проверяется до teardown.
+- **Quote asset (Q17):** реальное исполнение в v1 только для `quote_asset=USDT`.
+  Start с `enabled=true` и USDC → отказ с причиной; USDC работает в режиме `off`.
+- Одна активная сеть market streams на процесс (§9.3).
 
 ### 4.4 Обратная связь стратегии (generic)
 В базовый `Strategy` (`strategies/base.py`) — методы
@@ -137,20 +165,35 @@ Stop стратегии = закрыть admission; позиции, OCO и мо�
 (закрывает ClickUp 869f6m7vg). Вызовы идемпотентны по event id. Cooldown
 восстанавливается абсолютным сроком, не пересчётом; `_forget_symbol` его не
 удаляет (R18). Символ с позицией остаётся в WS-set вне cap (spec §1).
+Cooldown пишет только финализация (§8.5); стратегия получает feedback **после
+commit** и восстанавливается через snapshot, сама ничего не пишет.
 
 ## 5. Сигнальный контракт: изменения
 
-- **Детерминированный `signal_id`** для ENTRY: `uuid5(NS, account|network|strategy|epoch_id)`.
-  Повторная генерация той же эпохи после рестарта даёт тот же id; уникальный
-  индекс inbox отсекает дубль. Потребление эпохи персистентно и не зависит от
-  решения Risk (spec §4.1).
+- **Детерминированный `signal_id`** для ENTRY: `uuid5(NS, "<account_uid>|<network>|<strategy>|<symbol>|<epoch_id>")`,
+  `NS` — фиксированный UUID-константа в коде, каноническая сборка ключа — одна
+  чистая функция с контрольным примером в тестах. Повторная генерация той же
+  эпохи после рестарта или ротации ключа даёт тот же id; уникальный индекс inbox
+  отсекает дубль. Потребление эпохи персистентно и не зависит от решения Risk
+  (spec §4.1).
+- **Источник `account_uid`** — проверенный `uid` из `get_account` в
+  execution-контексте; Engine подставляет его до всех sinks (inbox, audit, UI).
+  API key идентичностью не является. Контракт — в сигнальном слое, получение
+  UID — в runtime.
 - **`exit_policy`** — структурированное поле ENTRY вместо текстового `tp_rule`:
   `{version, stop_ref, swing_low_ref, min_stop_distance_pct, stop_buffer_pct,
   tp_pct, trail_interval, trail_n, trail_cap_pct, max_hold_hours, cooldown_minutes}`.
   Фиксируется в позиции при открытии; новый Start её не меняет (R15).
-- **`stop_ref`** (Q13) = `min(swing_low_ref, entry_ref × (1 − min_stop_distance_pct))`
+  **Единицы:** все `*_pct` — процентные пункты, как в текущих настройках
+  (`1`, `0.1`, `10`, `4`); деление на 100 — только в расчётах. Формулы ниже
+  записаны с `/100`. PositionWorker берёт `trail_cap_pct` из сохранённой policy
+  позиции, не константу.
+- **Межполевые правила каталога** (одинаково в агенте и backend):
+  `trail_cap_pct ≥ 0`, `trail_cap_pct < tp_pct`, `max_hold_hours > 0`.
+- **`stop_ref`** (Q13) = `min(swing_low_ref, entry_ref × (1 − min_stop_distance_pct/100))`
   — оценка стопа для pre-submit проверки. Фактический stop считается от fill.
-- **HOLD** тоже пишется в audit (inbox), не только ENTRY/EXIT.
+- **HOLD** тоже пишется в audit (inbox), не только ENTRY/EXIT. Уникальность
+  эпохи действует только для ENTRY; HOLD той же эпохи допустим.
 - **`ExecutionOutcome`** — доменное событие закрытия/исполнения, **не** `Signal`:
   position/order/fill ids, исходный `signal_id` и policy, время, объём,
   `reason ∈ {stop, trail, tp, time, manual, emergency}` и отдельно
@@ -162,7 +205,7 @@ Stop стратегии = закрыть admission; позиции, OCO и мо�
 
 ### 6.1 Вход: LIMIT FOK (Q2)
 `new_order(side=BUY, type=LIMIT, timeInForce=FOK, price=cap, quantity=qty)`,
-`cap = entry_ref × (1 + max_slippage_pct)`, стартовое значение **0.3%** —
+`cap = entry_ref × (1 + max_slippage_pct/100)`, стартовое значение **0.3%** —
 гипотеза, проверяется статистикой dry-run (спред bookTicker в момент сигнала
 пишется в audit). `price` округляется **вниз** по tick, `quantity` — по step
 (§7). FOK: либо исполнено полностью, либо `EXPIRED` без fill. Повторного входа
@@ -170,12 +213,15 @@ Stop стратегии = закрыть admission; позиции, OCO и мо�
 
 Pre-submit (сразу перед отправкой, не только при admission):
 1. `now < valid_until` (UTC; при replay дедлайн исходный);
-2. last trade `> stop_ref` (Q13), котировка не старше `quote_max_age_s`;
+2. last trade `> stop_ref` (Q13); котировка от QuoteProvider (§9.8), свежая по
+   `quote_max_fetch_age_s` и `quote_max_trade_age_s`;
 3. символ `TRADING`, `ocoAllowed`, нужные `orderTypes`;
 4. нет открытой / pending / UNKNOWN позиции по символу, нет cooldown;
 5. **preflight выхода:** обе ноги будущей защиты при `fill = cap` и
-   `stop = min(swing_low_ref, cap × 0.99)` проходят фильтры (§7);
-6. резерв (символ, USDT, слот) взят одной транзакцией (R8).
+   `stop = min(swing_low_ref, cap × (1 − min_stop_distance_pct/100))` проходят
+   фильтры (§7.2) — по окончательно округлённым параметрам каждой ноги, включая
+   `below_price` fallback;
+6. резерв (символ, USDT, слот) взят одной транзакцией (R8, §7.5).
 
 Expiry запрещает только новый BUY; reconcile и защита уже принятой заявки
 продолжаются.
@@ -187,34 +233,46 @@ Expiry запрещает только новый BUY; reconcile и защита
 |---|---|
 | `side` | `SELL` |
 | `quantity` | qty позиции по ledger (§8.3), округлено вниз по step |
-| `above_type` / `above_price` | `LIMIT_MAKER` / `tp = fill_vwap × (1 + tp_pct)`, вверх по tick |
+| `above_type` / `above_price` | `LIMIT_MAKER` / `tp = fill_vwap × (1 + tp_pct/100)`, вверх по tick |
 | `below_type` / `below_stop_price` | `STOP_LOSS` / `stop`, вниз по tick — если символ разрешает `STOP_LOSS` |
-| fallback | `STOP_LOSS_LIMIT` + `below_price = stop × (1 − stop_limit_gap_pct)` + `below_time_in_force=GTC`, **и** включается guard (§6.6) |
+| fallback | `STOP_LOSS_LIMIT` + `below_price = stop × (1 − stop_limit_gap_pct/100)` + `below_time_in_force=GTC`, **и** включается guard (§6.6) |
 | `list_client_order_id`, `above_client_order_id`, `below_client_order_id` | по схеме §6.8 |
 
-`stop = min(swing_low_ref, fill_vwap × (1 − min_stop_distance_pct))` (spec §7.1).
+`stop = min(swing_low_ref, fill_vwap × (1 − min_stop_distance_pct/100))` (spec §7.1).
 Preflight: `tp > last trade > stop`, фильтры PRICE_FILTER / LOT_SIZE /
-NOTIONAL / PERCENT_PRICE_BY_SIDE для каждой ноги. Если last trade уже ≤ stop —
+NOTIONAL / PERCENT_PRICE_BY_SIDE для каждой ноги с опорной ценой по §9.8.
+`quantity` — только **доказанный** остаток (барьер §6.7). Если last trade уже ≤ stop —
 OCO не ставится, **рыночный выход** `reason=stop, mechanism=market_gap` (Q13).
 Enum'ы и response — из SDK.
 
 ### 6.3 Окно без защиты (Q4)
-- Дедлайн **30 с** от подтверждённого fill до подтверждённой защиты.
-- Попытки OCO на 0, 1, 3, 7, 15 с. Детерминированный отказ (фильтр/цена) → сразу
-  аварийный выход. Неоднозначный ответ → reconcile по `list_client_order_id`.
-- Дедлайн истёк без подтверждённой защиты → `MARKET SELL` qty позиции,
-  `reason=emergency, mechanism=market_unprotected`. Двойную продажу исключает
-  блокировка баланса на бирже: если OCO всё же встала, актив заблокирован и SELL
-  получит `insufficient balance` → это признак существующей защиты, позиция
-  уходит в reconcile. Условие — выделенный аккаунт (Q16, §9.6).
-- Пока есть позиция в `unprotected` или `UNKNOWN` — admission закрыт.
+- Дедлайн **30 с** от подтверждённого или обнаруженного fill до подтверждённой
+  защиты. Момент начала (`unprotected_since`) пишется durable и при recovery
+  **не сбрасывается**; таймер не зависит от ожидания ответов SDK.
+- Попытки OCO: 0, 1, 3, 7, 15 с — самые ранние моменты следующей попытки, а не
+  независимые отправки. Новая попытка — только после **доказанного** исхода
+  предыдущей; незавершённая или UNKNOWN → сначала reconcile по
+  `list_client_order_id`. Детерминированный отказ (фильтр/цена) → аварийная ветка.
+- **Барьер полноты fills** (одинаков для всех путей, §6.7): OCO и аварийный SELL
+  считаются только от ledger, где учтённые fills BUY = `executedQty` из
+  `get_order` и комиссии применены. fills из ответа FOK — один из источников,
+  а не доказательство полноты (в SDK поле опционально); после потери ответа
+  qty восстанавливается через `get_order` + `my_trades`.
+- Дедлайн истёк → позиция в `protection_overdue`: alert, admission закрыт,
+  приоритетный reconcile. Аварийный `MARKET SELL` (`reason=emergency,
+  mechanism=market_unprotected`) — только на **доказанный** остаток после
+  барьера и если защита не подтверждена к этому моменту. Одна логическая
+  аварийная SELL; её UNKNOWN — по §6.8.
+- `insufficient balance` в ответ на SELL — повод для reconcile, **не**
+  доказательство живой защиты.
+- Пока есть позиция в `unprotected`, `protection_overdue` или `UNKNOWN` — admission закрыт.
   Alert — `message` heartbeat + UI (Telegram позже, 869f6ndt4).
 
 ### 6.4 Трейлинг (spec v1.2 §7.2, Q12)
 На каждом закрытии бара `trail_interval` (M15) по позиции:
 ```
-candidate = min(low[1..trail_n]) × (1 − stop_buffer_pct)
-new_stop  = min(max(exchange_stop, candidate), fill_vwap × (1 + trail_cap_pct))
+candidate = min(low[1..trail_n]) × (1 − stop_buffer_pct/100)
+new_stop  = min(max(exchange_stop, candidate), fill_vwap × (1 + trail_cap_pct/100))
 ```
 - Перестановка, только если `new_stop − exchange_stop ≥ 1 tick` после округления.
 - Достигнут потолок `fill × 1.04` — stop больше не двигается.
@@ -229,9 +287,10 @@ new_stop  = min(max(exchange_stop, candidate), fill_vwap × (1 + trail_cap_pct))
 недоступен в момент срока — выход сразу после reconcile.
 
 ### 6.6 Guard (только для fallback `STOP_LOSS_LIMIT`)
-Источник цены — **last trade** (`trade`/`aggTrade` stream), как у биржевого
-триггера. Если `last ≤ stop` и стоп-нога не исполнилась за `guard_grace_s` → выход
-через §6.7, `mechanism=guard`. Котировка старше `quote_max_age_s` → guard не
+Источник цены — **last trade** из `trade`-потока MonitorFeed (§9.3), как у
+биржевого триггера; QuoteProvider (§9.8) его не заменяет. Guard работает и после
+Stop стратегии. Если `last ≤ stop` и стоп-нога не исполнилась за `guard_grace_s` → выход
+через §6.7, `mechanism=guard`. Trade-котировка старше `guard_max_trade_age_s` → guard не
 срабатывает, состояние `degraded` в heartbeat.
 
 ### 6.7 Протокол операций позиции (R5)
@@ -239,12 +298,19 @@ new_stop  = min(max(exchange_stop, candidate), fill_vwap × (1 + trail_cap_pct))
 guard, `close_position`, повторную защиту остатка.
 1. Записать операцию и её версию в БД (`operation`, `op_version`).
 2. `delete_order_list` по `list_client_order_id`.
-3. Подтвердить исход отмены: `get_order_list` + дочитать fills **обеих ног**
-   (`my_trades`). Нога могла исполниться во время отмены.
+   Момент потери защиты (`unprotected_since`) пишется durable **до** отправки
+   cancel.
+3. **Барьер:** обе старые ноги терминальны (по ордерам из
+   `get_order_list.orders`, не по одному `ALL_DONE`), сумма учтённых fills
+   каждой ноги = её `executedQty`, комиссии в ledger. Пока история отстаёт —
+   повторная сверка с backoff, новых мутаций нет.
 4. Пересчитать остаток по ledger.
-5. Остаток > 0 → новая OCO (трейлинг) или `MARKET SELL` (выход); остаток ниже
-   минимумов → позиция закрыта (dust, §8.4).
-Unknown cancel блокирует шаги 4–5 до разрешения через reconcile. В позиции
+5. Остаток > 0 → новая OCO (тот же протокол, что §6.3) или `MARKET SELL`
+   (выход); остаток ниже минимумов → позиция закрыта (dust, §8.4).
+Unknown cancel блокирует шаги 3–5 до разрешения через reconcile: старая OCO
+могла остаться живой. Дедлайн 30 с от `unprotected_since` действует и здесь,
+но срабатывание даёт `protection_overdue` (§6.3), а не продажу неподтверждённого
+остатка. В позиции
 хранятся `desired_stop` и **`exchange_stop`** (подтверждённый); UI показывает
 второй.
 
@@ -252,12 +318,17 @@ Unknown cancel блокирует шаги 4–5 до разрешения че�
 - **Client ids** (≤ 36 символов): `mta-<sig24>-<роль><n>`, где `sig24` — первые 24
   hex `signal_id`; роли: `e` (вход), `pl`/`pt`/`ps` (список/TP/stop защиты,
   `n` — номер постановки), `x` (рыночный выход, `n` — номер попытки).
-- Intent, client ids и attempt **коммитятся до отправки**.
+- Счётчик `n` ограничен так, чтобы id ≤ 36 символов; переполнение → fail-closed,
+  обрезания нет.
+- Intent, client ids и attempt **коммитятся до отправки**. После рестарта
+  `prepared` считается **потенциально отправленным** (crash между send и commit).
 - Таймаут, 5xx, обрыв, отмена coroutine → состояние **`UNKNOWN`** (резерв и
   блокировка admission сохраняются). Разрешение: UDS, `get_order` /
   `get_order_list(orig_client_order_id)` / `my_trades` с backoff. Одиночный
   not-found **не** доказывает отсутствие ордера.
-- **Повторная отправка с тем же id запрещена:** Binance требует уникальности
+- **UNKNOWN блокирует повтор логической операции** (BUY, аварийная SELL,
+  OCO) с **любым** client id до доказанного исхода. В частности, запрещена
+  повторная отправка с тем же id: Binance требует уникальности
   `newClientOrderId` только среди открытых ордеров, и после FILLED повтор купит
   второй раз. Не удалось доказать исход за `unknown_escalate_s` → эскалация
   (heartbeat `message`), admission закрыт, повтора нет.
@@ -265,16 +336,27 @@ Unknown cancel блокирует шаги 4–5 до разрешения че�
 
 ### 6.9 Торговый клиент (Q9, R11, R21)
 - Отдельный от market-data `ConfigurationRestAPI`: `timeout = 15000` мс,
-  `retries = 0` (SDK сам ретраит GET/DELETE — для отмен это недопустимо),
-  `recvWindow = 5000`, проверка расхождения часов через `/api/v3/time` при
+  `retries = 0` (SDK сам ретраит GET/DELETE — для отмен это недопустимо).
+  `recv_window=5000` передаётся **аргументом каждого signed-вызова** — в
+  конфигурации SDK его нет. Проверка расхождения часов через `/api/v3/time` при
   старте и раз в час.
-- `_call` возвращает данные **и** `rate_limits`; общий бюджет запросов с
-  приоритетом: защита/выход > reconcile > вход. 429 → пауза по `Retry-After`;
-  418 → admission закрыт до снятия бана.
-- Сохраняются тип, код и HTTP-статус ошибки SDK.
-- Decimal → SDK: контрактный тест сериализации через установленный SDK;
-  если SDK принимает только `float`, форматирование через `str(Decimal)` на
-  границе адаптера. Ни самописного HTTP, ни своих моделей.
+- **Общий request budget** по весу IP для trade, reconcile и market-data (разные
+  SDK-клиенты не дают разных IP-бюджетов). Приоритет: защита/выход > reconcile >
+  вход. 429 → пауза по `Retry-After` без скрытого повтора мутаций; 418 →
+  admission закрыт, состояние в heartbeat. Прохождение защиты во время бана не
+  обещается.
+- **Классификация ошибок** — по классу исключения SDK, с раздельными
+  `exchange_code` и `http_status`: `binance-common 4.4.0` при HTTP
+  400/401/403/404/418/429 кладёт в `status_code` код Binance, при 5xx —
+  HTTP-статус. `rejected` — только доказанный отказ. -1006/-1007, 5xx, timeout,
+  обрыв и непарсируемый ответ после отправки → `UNKNOWN`. Ключи и подписи в
+  audit маскируются.
+- Decimal → SDK: фиксированная десятичная строка `format(d, "f")` после
+  квантования по tick/step (`str(Decimal("0.00000001"))` = `1E-8`). Контрактные
+  тесты — через настоящий сериализатор SDK с перехватом транспорта: LIMIT FOK;
+  SELL OCO `LIMIT_MAKER`+`STOP_LOSS` без `below_price`/`below_time_in_force`;
+  fallback с `below_price` и GTC; все три client id. Ни самописного HTTP, ни
+  своих моделей.
 
 ## 7. Размер позиции и лимиты (Q1)
 
@@ -287,8 +369,11 @@ Unknown cancel блокирует шаги 4–5 до разрешения че�
   E      = equity в USDT (§7.3)
   slots  = min(3, floor(E / 7))              # E < 7 → 0 слотов, новых входов нет
   size   = 0.90 × E / slots                  # размер одной позиции (quote)
-  reserve= 0.10 × E                          # не распределяется, покрывает убытки по стопам
+  reserve= 0.10 × E                          # ориентир sizing, покрывает убытки по стопам
   ```
+- **Q18:** рост qty до минимума биржи и округление вверх (§7.2) **могут**
+  расходовать 10%-резерв. Верхняя граница — свободный USDT за вычетом
+  pending/UNKNOWN резервов других intents (§7.5).
 - Пересчёт при каждом admission. Если открытых позиций уже `≥ slots`
   (например, equity упала после убытков), новые входы не принимаются до
   закрытия позиций.
@@ -315,10 +400,18 @@ qty_min  = max(minQty,
                minNotional_exit  / tp_est)
 qty      = roundUp(max(qty0, qty_min), stepSize)          # растёт до минимума биржи
 ```
-`qty × cap > free USDT` → пропуск `reason=insufficient_balance`. Проверяются
-также `maxQty`, MARKET_LOT_SIZE (для рыночных выходов), PERCENT_PRICE_BY_SIDE.
-Неизвестный значимый фильтр → вход fail-closed. Кэш фильтров — по
-`(network, symbol)`, инвалидация при reject.
+`qty × cap > free USDT − Σ quote-резервов pending/UNKNOWN` → пропуск
+`reason=insufficient_balance`. Проверяются также `maxQty`, MARKET_LOT_SIZE (для
+рыночных выходов). Неизвестный значимый фильтр → вход fail-closed. Кэш
+фильтров — по `(network, symbol)`, инвалидация при reject.
+
+**Валидатор** — чистая функция: правила из `exchangeInfo` + котировка из
+QuoteProvider (§9.8) + тип выхода. Учитывает PERCENT_PRICE_BY_SIDE (множители
+BUY/SELL, `avgPriceMins`), NOTIONAL (min/max, `applyMinToMarket`,
+`applyMaxToMarket`), MIN_NOTIONAL (`applyToMarket`). Проверяются окончательно
+округлённые параметры каждой ноги; для `STOP_LOSS_LIMIT` — и `below_price`.
+Опорная цена выбирается отдельно для каждого фильтра (§9.8); неподтверждённая —
+fail-closed до BUY.
 
 ### 7.3 Equity
 `E` = свободный + заблокированный USDT + открытые позиции по last price
@@ -330,30 +423,57 @@ qty      = roundUp(max(qty0, qty_min), stepSize)          # растёт до м
   лимита убытка на сделку нет.
 - **Единственный лимит:** 5 убыточных сделок за UTC-сутки → пауза входов до
   00:00 UTC (мониторинг работает). Счётчик персистентен.
+- **Убыточная сделка (Q19):** закрытая позиция целиком (partial fills отдельно
+  не считаются) с net realized PnL < 0: выручка SELL − стоимость BUY − все
+  комиссии; комиссии в BNB пересчитываются в USDT по цене BNBUSDT на момент
+  fill. Дата — UTC-дата **последнего закрывающего fill**, не момент
+  обнаружения. Счётчик увеличивает только финализация (§8.5), ровно один раз.
 - **Комиссии в BNB** (владелец включает «Use BNB to pay fees»). Код всё равно
   берёт `commission`/`commissionAsset` из каждого fill. Остаток BNB ниже
-  порога → предупреждение в heartbeat.
+  порога → предупреждение в heartbeat (порог и проверка — ExecutionRuntime).
 - Резервы (символ, USDT, слот) берутся одной транзакцией и учитывают pending и
   UNKNOWN (R8). Два сигнала одновременно не займут один слот.
+
+### 7.5 Жизненный цикл резервов
+Два ресурса:
+- **quote-резерв** = окончательные `qty × cap` (после фильтров, роста до
+  минимума и округлений) — только на время входа;
+- **занятость символа и слота** — от admission до закрытия позиции.
+
+| Исход входа | quote-резерв | символ и слот |
+|---|---|---|
+| доказанный zero-fill или reject (в т.ч. FOK `EXPIRED`) | освобождается | освобождаются — в одной транзакции с исходом intent; позиции нет, эпоха использована |
+| `UNKNOWN` | держится | держатся |
+| учтённый BUY fill | погашается applier'ом в транзакции fill (потраченное уже в балансе и ledger, разница «cap − цена» освобождается) | переходят к позиции, освобождаются финализацией `closed` |
+
+Отмена coroutine резерв не освобождает. Все переходы идемпотентны по исходу
+intent / event id: replay не удваивает освобождение, crash его не теряет.
+Формула слотов считает открытые позиции + pending/UNKNOWN intents.
 
 ## 8. Данные
 
 ### 8.1 Таблицы агента
 Все ключи — в контексте `(account, network)`. Схема растёт → для БД агента
-заводится **Alembic** (сейчас `create_all`).
+заводится **Alembic** (сейчас `create_all`, `agent/agent/core/db.py`).
+- Пустая БД → обычный `upgrade`.
+- Существующая БД без `alembic_version` → **проверенный adoption**: сверка
+  схемы с baseline (таблицы, колонки, индексы), `stamp` именно baseline, затем
+  `upgrade`. Несовпадающая или частичная схема → исполнение fail-closed с явной
+  ошибкой.
+- `create_all` уходит из production-пути; миграции входят в Docker-образ.
 
 | Таблица | Ключ | Назначение |
 |---|---|---|
-| `signal_inbox` | `signal_id` | каждый сигнал (ENTRY/HOLD/EXIT) целиком; уникальность эпохи |
+| `signal_inbox` | `signal_id` | каждый сигнал (ENTRY/HOLD/EXIT) целиком; partial unique `(account, network, strategy, epoch_id) WHERE type='ENTRY'` |
 | `execution_intent` | `signal_id` | решение Admission/Risk, причина отказа, расчёт размера, резервы |
 | `order_attempt` | `client_order_id` | каждая попытка: роль, параметры, статус SDK (родное значение), `UNKNOWN`, raw response (без секретов) |
 | `fill` | `(account, network, symbol, trade_id)` | каждая сделка из `my_trades`/UDS, комиссия и её актив |
-| `position` | `id`; уникальный open по `(account, network, symbol)` | ledger qty, `fill_vwap`, `exit_policy`, `desired_stop`, `exchange_stop`, tp, `opened_at`, статус, `op_version`, outcome |
+| `position` | `id`; partial unique `(account, network, symbol) WHERE status <> 'closed'` (держат opening … UNKNOWN) | ledger qty, `fill_vwap`, `exit_policy`, `desired_stop`, `exchange_stop`, tp, `opened_at`, статус, `op_version`, outcome |
 | `symbol_cooldown` | `(account, network, symbol)` | абсолютный `cooldown_until` (пишется с outcome в одной транзакции) |
-| `monitor_watermark` | `(position_id, interval)` | последний обработанный закрытый бар трейлинга |
+| `monitor_watermark` | `(position_id, interval)` | последний закрытый бар трейлинга, чей результат (ratchet/операция) **сохранён** |
 | `risk_state` | `(account, network, utc_date)` | счётчик убыточных сделок, пауза |
 | `execution_event` | autoinc + `aggregate_seq` | append-only audit **и** transactional outbox |
-| `trade_cursor` | `(account, network, symbol)` | курсор `my_trades` для reconcile |
+| `trade_cursor` | `(account, network, symbol)` | курсор `my_trades`; продвигается в одной транзакции с применением страницы fills |
 
 `order_attempt` — журнал наших действий с raw-ответом SDK, а не замена
 `NewOrderResponse` (`CONTEXT.md` §4).
@@ -363,17 +483,33 @@ qty      = roundUp(max(qty0, qty_min), stepSize)          # растёт до м
 intent:   received → rejected(reason) | expired | reserved → submitted
 attempt:  prepared → sent → acked(status SDK) | UNKNOWN → resolved
 position: opening → protecting → protected ⇄ repricing → closing → closed(outcome)
-                        ↘ unprotected ↗             ↘ UNKNOWN ↗
+                        ↘ unprotected → protection_overdue ↗   ↘ UNKNOWN ↗
 ```
 
 ### 8.3 Ledger
 qty позиции = Σ buy fills − Σ sell fills − комиссии в base. Продажа ограничена
-этим остатком; `account.free/locked` — только для сверки (R10).
+этим остатком; `account.free/locked` — только для сверки (R10). Остаток
+считается доказанным только после барьера полноты fills (§6.3, §6.7).
 
 ### 8.4 Dust (Q14)
 Позиция закрыта, когда остаток по ledger нельзя продать (`< minQty` или
 `< minNotional`). Остаток не учитывается, владелец вручную переводит его в BNB.
 Сверка баланса игнорирует остатки ниже `minNotional`.
+
+### 8.5 Владельцы состояния
+| Состояние | Единственный писатель |
+|---|---|
+| inbox, intent, резервы | Admission (§7.5) |
+| attempt | общий протокол отправки OrderManager / PositionWorker |
+| fills, ledger, позиция | **PositionApplier** — идемпотентный, сериализованный по позиции; им пользуются OrderManager, PositionWorker и Reconciler |
+| close/outcome + cooldown + `risk_state` + `execution_event` + освобождение резервов | **Finalizer** — одна транзакция, ровно один раз |
+| `monitor_watermark` | PositionWorker, вместе с результатом бара |
+| `trade_cursor` | Reconciler, вместе с применением страницы через applier |
+| порог BNB low, heartbeat | ExecutionRuntime |
+
+Схема БД задаёт constraints, envelope событий и `aggregate_seq`, но вторым
+писателем не является. Feedback стратегии — после commit (§4.4). Replay любого
+fill или close даёт ровно один outcome, cooldown, инкремент риска и событие.
 
 ## 9. Надёжность
 
@@ -390,18 +526,31 @@ qty позиции = Σ buy fills − Σ sell fills − комиссии в base
 Старт: admission закрыт до окончания. Всё незавершённое (intents, attempts,
 списки, позиции, включая ещё не созданные локально) сверяется через
 `get_order`, `get_order_list`, `my_trades` (пагинация, persisted cursor,
-перекрытие окна). Позиция закрывается только по учтённым fills (или dust), не
-по `ALL_DONE` списка. Позиция без живой защиты → §6.3. Ордер `mta-` без связи с
+перекрытие окна). Ключ дедупликации — `(account, network, symbol, trade_id)`;
+`fromId` включительный, граница дедуплицируется. Страница fills, их применение
+(через PositionApplier, §8.5) и продвижение `trade_cursor` — одна транзакция.
+Reconciler не мутирует позицию сам. Позиция закрывается только по учтённым
+fills (или dust), не по `ALL_DONE` списка. Позиция без живой защиты → §6.3. Ордер `mta-` без связи с
 intent → **quarantine** (не трогаем, divergence). Также после реконнекта, раз в
 `reconcile_interval` и при каждом UNKNOWN.
 
 ### 9.3 Monitor feed (R17)
 Независим от стратегии: свои kline-подписки (интервал из `exit_policy`) и
 `trade` по **authoritative открытым позициям**, включая символы вне universe.
-Cold start и реконнект: догрузка пропущенных закрытых баров от watermark,
-ratchet прогоняется по порядку; дубли и out-of-order отбрасываются;
-формирующийся бар не используется. Stale/gap → `degraded`. Инфраструктура
-реконнекта и backfill — из 37dcaf7.
+- **StreamHub** — единственный владелец WS-подписок на процесс, lifecycle
+  агента, refcount/fan-out; стратегия и MonitorFeed — подписчики. Причина: карта
+  `stream_connections_map` в SDK глобальна на модуль, и второй экземпляр
+  `MarketDataStreams` (`_forget_streams`, unsubscribe) ломает чужие подписки.
+- **Одна сеть** market streams на процесс: подписка на другую сеть отклоняется
+  до изменения первой. Допустимая смена (§4.3) — полный teardown: закрыть
+  клиент SDK, удалить его записи из глобальной карты, сбросить callbacks.
+- Cold start и реконнект: догрузка пропущенных закрытых баров от watermark
+  **плюс `trail_n` баров контекста** до него; WS-бары буферизуются до закрытия
+  gap; ratchet прогоняется по порядку; дубли и out-of-order отбрасываются;
+  формирующийся бар не используется.
+- Watermark подтверждает сохранённое решение по бару (ratchet или operation), а
+  не доставку; коммитит его PositionWorker.
+- Stale/gap → `degraded`. Инфраструктура реконнекта и backfill — из 37dcaf7.
 
 ### 9.4 Ручные команды
 `execution_pause` / `execution_resume` (только входы), `close_position {symbol}`
@@ -423,6 +572,27 @@ ratchet прогоняется по порядку; дубли и out-of-order �
 HALT/delisting символа с позицией, 429/418, рассинхрон часов, отказ прав
 ключа, ручная сверка с историей ордеров. Секреты и подписи маскируются в audit
 и логах.
+
+### 9.8 QuoteProvider
+Свежая котировка для admission и pre-submit **независимо от наличия позиций**,
+через REST-методы SDK: `get_trades(limit=1)`, `avg_price`, `reference_price`
+(`GET /api/v3/referencePrice`), `ticker_book_ticker` — только для аудита спреда.
+```
+QuoteSnapshot{symbol, network, fetched_at,
+              last_trade{price, time}, avg{price, mins, closeTime},
+              reference{price | null, timestamp}}
+```
+Опорная цена выбирается **для каждого фильтра** отдельно (Binance `filters.md`):
+1. `reference.price` не null → reference;
+2. иначе `avgPriceMins` фильтра = 0 → last trade;
+3. иначе `avg.price`, только если `avg.mins == avgPriceMins` фильтра;
+4. иначе, или данных нет, или они устарели → fail-closed, `reason=reference_unverified`.
+
+Свежесть: `fetched_at` не старше `quote_max_fetch_age_s` (5 с) в момент
+отправки; last trade, `avg.closeTime` и `reference.timestamp` не старше
+`quote_max_trade_age_s` (60 с). Last trade не подменяется bookTicker или 24h
+close. Запрос — при admission и повторно перед отправкой, через общий
+request budget (§6.9).
 
 ## 10. Backend и UI
 
@@ -467,14 +637,62 @@ HALT/delisting символа с позицией, 429/418, рассинхрон
 | 7 | Live pilot | текущий аккаунт, слоты по §7.1 (при ≈13.9 USDT — 1), runbook готов | **критерий допуска:** ноль неразрешённых orphan/UNKNOWN/divergence на testnet; qty и комиссии сходятся с историей биржи; Close и pause работают. Время прогона — дополнительный критерий |
 
 **Crash-матрица (этап 2):** accept → timeout; delayed not-found; FOK expired;
-частичное исполнение выходной ноги; fill во время cancel OCO; reject OCO
-(фильтр) и transient; crash на каждой границе commit / send / ack / publish /
-XACK; Stop во время BUY; Stop → restart; boot-off с открытой позицией; неудачный
-Start при открытой позиции; смена сети при UNKNOWN; два экземпляра runtime;
-потеря Redis; stale feed; пропуск нескольких баров трейлинга; duplicate и
-out-of-order бар; time exit во время простоя; restart во время перестановки;
-повторное применение одного fill; close → demotion → promotion символа
-(cooldown сохраняется).
+ответ BUY потерян → `get_order=FILLED` → `my_trades` временно неполон (в т.ч.
+base-комиссия); частичное исполнение выходной ноги; terminal partial MARKET;
+fill во время cancel OCO; UNKNOWN cancel > 30 с; terminal cancel с fills lag
+> 30 с; reject OCO (фильтр) и transient; crash на каждой границе commit / send /
+ack; Stop во время BUY; Stop → restart; boot-off с открытой позицией; неудачный
+Start при открытой позиции; смена сети при UNKNOWN; два экземпляра runtime (два
+реальных DB-сеанса); потеря lock-соединения PostgreSQL; **Redis недоступен** при
+emit после DB commit, при boot с открытой позицией, при Stop/recovery и при
+сопровождении без heartbeat publish; stale feed; пропуск нескольких баров
+трейлинга; duplicate и out-of-order бар; time exit во время простоя; restart во
+время перестановки; повторное применение одного fill; комиссии в base/quote/BNB;
+client id ≤ 36; close → demotion → promotion символа (cooldown сохраняется);
+дневной лимит и сброс в 00:00 UTC.
+
+Сценарии publish/XACK проекции в backend — этап 6 (перенос части матрицы, в
+матрице помечен явно).
+
+**Инварианты** после каждого сценария:
+- нет повторной **логической** мутации при UNKNOWN и нет oversell; отдельные
+  подтверждённые SELL остатка разрешены;
+- ledger = Σ buy − Σ sell − base-комиссии, сходится с fills;
+- **прогресс:** после восстановления доступности и разрешения исходов позиция
+  `protected` или `closed`, либо в обоснованном UNKNOWN с эскалацией; дедлайн,
+  `protection_overdue` и резервы проверяются во времени (управляемые часы);
+- нет позиции без записи; резервы освобождены только по §7.5.
+
+### 12.1 Задачи этапов 1–2 (ClickUp, согласованный DAG)
+Узел ← зависимости. Подзадачи `a/b/c` — отдельные PR со своими fake-SDK
+fault-тестами; EXEC-13 — интеграционная матрица.
+
+| Задача | Содержание | ← |
+|---|---|---|
+| EXEC-01 | БД: Alembic, adoption, таблицы §8.1 | — |
+| EXEC-02 | Торговый клиент, классификация ошибок, request budget (§6.9) | — |
+| EXEC-04 | Сигнальный контракт, `signal_id(account_uid, …)`, `exit_policy` (§5) | — |
+| EXEC-12 | Fake SDK с lifetime дольше runtime | 02 |
+| EXEC-03 | Фильтры, sizing, валидатор, тип `QuoteSnapshot` (§7) | 02 |
+| EXEC-14 | QuoteProvider (§9.8) | 02, 03, 12 |
+| EXEC-05 | ExecutionRuntime: lock, UID, контекст, настройки (§4) | 01, 02 |
+| EXEC-15 | PositionApplier + Finalizer (§8.5) | 01, 04, 12 |
+| EXEC-07 | Feedback и snapshot стратегии (§4.4) | 04, 15 |
+| EXEC-06 | Inbox и admission, резервы, дневной лимит (§7.4–7.5) | 01, 03, 04, 05, 14 |
+| EXEC-08a | attempt, client id, UNKNOWN (§6.8) | 02, 06, 12, 15 |
+| EXEC-08b | Вход FOK, fills через applier, барьер полноты | 08a |
+| EXEC-08c | Initial OCO, дедлайн, `protection_overdue` (§6.2–6.3) | 08b |
+| EXEC-10 | StreamHub, MonitorFeed, watermark (§9.3) | 05, 12 |
+| EXEC-09a | Протокол §6.7: cancel, барьер, replace-or-exit | 08c, 15 |
+| EXEC-09b | Трейлинг и watermark (§6.4) | 09a, 10 |
+| EXEC-09c | Time exit, guard, `close_position` (§6.5–6.6, §9.4) | 09a, 10 |
+| EXEC-11a | Reconciler core: fills → applier, cursor (§9.2) | 01, 02, 12, 15 |
+| EXEC-11b | Startup-интеграция: контекст, reconcile до admission | 05, 08c, 09a, 11a |
+| EXEC-13 | Crash-матрица | все |
+
+Топологический порядок: 01, 02, 04, 12, 03, 14, 05, 15, 07, 06, 08a, 08b, 08c,
+10, 09a, 09b, 09c, 11a, 11b, 13. Циклов нет, 08↔11 нет. Финализацию делает
+только EXEC-15.
 
 ## 13. Решения владельца и риски
 
@@ -496,6 +714,9 @@ out-of-order бар; time exit во время простоя; restart во вр
 | Q14 | Dust не учитывается (§8.4) |
 | Q15 | Виртуальные позиции → архив (§10) |
 | Q16 | Аккаунт выделен под агента (§9.6) |
+| Q17 | Реальное исполнение в v1 только для `quote_asset=USDT`; USDC — режим `off` (§4.3; R-EXEC-03.2) |
+| Q18 | Рост до минимума биржи может расходовать 10%-резерв в пределах свободного USDT (§7.1; R-EXEC-03.3) |
+| Q19 | Убыточная сделка — net PnL < 0 закрытой позиции, UTC-дата закрывающего fill (§7.4; R-EXEC-06.2) |
 
 **Остаточные риски (приняты):** окно без защиты при падении агента/сети между
 BUY и OCO; `STOP_LOSS` (market) не гарантирует цену при гэпе; рост размера до
@@ -508,6 +729,8 @@ BUY и OCO; `STOP_LOSS` (market) не гарантирует цену при г�
 ## 14. Обсуждение
 
 Ссылки на разделы в тредах R1–R26 относятся к нумерации **v1** (`f9db7d1`).
+Ревью декомпозиции на задачи (`[R-EXEC-NN.k]`, `[R-EXEC-plan.k]`, 3 круга) —
+в комментариях задач EXEC-01…13 и трекера 869f6m8kj; итог внесён в v2.2 (§0).
 
 ### Правила
 1. Документ — единственный источник правды. Изменения в §0–§13 вносит **автор
