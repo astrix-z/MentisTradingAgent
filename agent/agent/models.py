@@ -5,9 +5,9 @@ user marked, and later the trades and orders it places — in its own database,
 which nobody else reads or writes (see ``DESIGN.md``). The backend reaches this
 data through the published document in Redis, never by querying the schema.
 
-Tables are created with ``create_all`` on boot (see :mod:`agent.core.db`): the
-schema is one table and the agent owns it end to end. A migration tool belongs
-here once the schema starts changing shape under real data.
+The schema is owned by Alembic migrations in :mod:`agent.migrations`, applied
+at boot by :mod:`agent.core.migrate`; execution tables live in
+:mod:`agent.execution.models`.
 """
 
 from __future__ import annotations

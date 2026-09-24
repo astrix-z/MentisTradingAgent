@@ -91,6 +91,9 @@ class Engine:
         self._message: str | None = None
         self._health_warning: str | None = None
         self._balances: dict[str, float] = {}
+        #: Whether the agent database migrated cleanly at boot. Real execution
+        #: is fail-closed without it (plan §8.1).
+        self.schema_ready = False
 
         # SDK-backed services for the current run.
         self._rest: ExchangeRest | None = None

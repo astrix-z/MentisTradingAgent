@@ -345,14 +345,19 @@ async def run() -> None:
     redis: Redis = Redis.from_url(str(settings.REDIS_URL), decode_responses=True)
     engine = Engine(redis)
 
-    # The agent owns its own database (working symbols now, trades later). It is
-    # optional at boot, so a missing or unreachable one is reported and the
-    # daemon carries on: trading must not depend on it.
+    # The agent owns its own database (working symbols, and everything real
+    # execution records). A missing or unreachable one is reported and the
+    # daemon carries on for signals, but execution stays closed: it must never
+    # run on a schema that did not migrate cleanly (plan §8.1).
+    schema_ready = False
     try:
         if await db.ensure_settings_database():
-            await db.init_settings_schema()
+            schema_ready = await db.init_settings_schema() is not None
     except Exception:  # noqa: BLE001 - never let settings storage block boot
-        logger.exception("cannot prepare the agent settings database")
+        logger.exception(
+            "cannot prepare the agent database; real execution stays closed"
+        )
+    engine.schema_ready = schema_ready
 
     try:
         async with asyncio.TaskGroup() as tg:
