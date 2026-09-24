@@ -227,11 +227,14 @@ class PositionApplier:
         *,
         exit_policy: ExitPolicy,
         fills: Iterable[FillRecord],
+        detected_at: datetime | None = None,
     ) -> ApplyResult:
         """Turn a filled ENTRY into a position (or find the one it already made).
 
         In the same transaction the intent's quote reserve is paid off and its
-        symbol and slot pass to the position (plan §7.5).
+        symbol and slot pass to the position (plan §7.5). ``detected_at`` is
+        when the fill was first confirmed or found: the protection deadline
+        runs from it and is never moved later (plan §6.3).
         """
         if intent.position_id is not None:
             position = await lock_position(session, intent.position_id)
@@ -243,7 +246,7 @@ class PositionApplier:
                 symbol=intent.symbol,
                 strategy=intent.strategy,
                 signal_id=intent.signal_id,
-                status=PositionStatus.OPENING,
+                status=PositionStatus.PROTECTING,
                 exit_policy=exit_policy.transport(),
                 quantity=Decimal(0),
                 bought_qty=Decimal(0),
@@ -254,6 +257,7 @@ class PositionApplier:
                 commission_quote=Decimal(0),
                 op_version=0,
                 aggregate_seq=0,
+                unprotected_since=detected_at or datetime.now(UTC),
             )
             session.add(position)
             await session.flush()

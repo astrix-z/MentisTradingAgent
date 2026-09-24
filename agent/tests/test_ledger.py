@@ -229,7 +229,8 @@ def test_filled_entry_opens_the_position_and_pays_off_the_reserve() -> None:
     async def scenario(sessions: async_sessionmaker[AsyncSession]) -> None:
         position_id = await open_position(sessions, fill(1, price="100.2"))
         position = await get(sessions, position_id)
-        assert position.status == PositionStatus.OPENING
+        assert position.status == PositionStatus.PROTECTING
+        assert position.unprotected_since is not None
         assert position.quantity == Decimal("0.1")
         assert position.fill_vwap == Decimal("100.2")
         assert position.commission_quote == Decimal("0.00001667") * 600
