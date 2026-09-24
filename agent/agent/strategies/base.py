@@ -23,7 +23,7 @@ from uuid import UUID, uuid4, uuid5
 from pydantic import BaseModel
 
 from agent.exchange.rest import ExchangeRest
-from agent.exchange.streams import MarketDataStreams
+from agent.exchange.streams import MarketStreams
 
 SignalType = Literal["ENTRY", "EXIT", "HOLD"]
 
@@ -235,7 +235,7 @@ class StrategyServices:
     network: str
     symbols: list[str]
     rest: ExchangeRest
-    streams: MarketDataStreams
+    streams: MarketStreams
     emit: SignalSink
 
 

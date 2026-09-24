@@ -21,6 +21,7 @@ import contextlib
 import logging
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any, Protocol
 
 from binance_common.configuration import ConfigurationWebSocketStreams
 from binance_common.websocket import RequestStreamHandle, global_stream_connections
@@ -32,6 +33,7 @@ from binance_sdk_spot.spot import Spot
 from binance_sdk_spot.websocket_streams.models import (
     KlineIntervalEnum,
     KlineResponse,
+    TradeResponse,
 )
 
 from agent.exchange.rest import Network
@@ -52,7 +54,28 @@ _RECONNECT_BACKOFF_S: tuple[float, ...] = (1, 2, 5, 10, 30, 60)
 _STALE_AFTER = timedelta(minutes=2)
 
 KlineCallback = Callable[[KlineResponse], None]
+TradeCallback = Callable[[TradeResponse], None]
 KlineKey = tuple[str, str]
+
+
+class MarketStreams(Protocol):
+    """What a strategy may use of market streams (a hub view or the adapter)."""
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...
+
+    def on_reconnect(self, listener: Callable[[], None]) -> None: ...
+
+    def health_warning(self) -> str | None: ...
+
+    async def subscribe_klines_batch(
+        self, subscriptions: Sequence[tuple[str, str, KlineCallback]]
+    ) -> None: ...
+
+    async def unsubscribe_klines_batch(
+        self, pairs: Sequence[tuple[str, str]]
+    ) -> None: ...
 
 
 class MarketDataStreams:
@@ -75,6 +98,7 @@ class MarketDataStreams:
         self._started = False
         self._stopping = False
         self._kline_callbacks: dict[KlineKey, KlineCallback] = {}
+        self._trade_callbacks: dict[str, TradeCallback] = {}
         self._reconnect_listeners: list[Callable[[], None]] = []
         self._recovery: asyncio.Task[None] | None = None
         self._last_message_at: datetime | None = None
@@ -99,7 +123,8 @@ class MarketDataStreams:
         """Why market data is not flowing, or ``None`` while it is (or while
         nothing is subscribed, so nothing is expected)."""
         last = self._last_message_at
-        if self._stopping or not self._kline_callbacks or last is None:
+        subscribed = self._kline_callbacks or self._trade_callbacks
+        if self._stopping or not subscribed or last is None:
             return None
         if datetime.now(UTC) - last <= _STALE_AFTER:
             return None
@@ -136,6 +161,29 @@ class MarketDataStreams:
             ]
         )
 
+    async def subscribe_trades_batch(
+        self, subscriptions: Sequence[tuple[str, TradeCallback]]
+    ) -> None:
+        """Subscribe to ``<symbol>@trade`` streams (last trade for the guard)."""
+        if not subscriptions:
+            return
+        await self._ensure_connected()
+        entries: dict[str, tuple[Any, Callable[[Any], None]]] = {
+            _trade_stream(symbol): (TradeResponse, callback)
+            for symbol, callback in subscriptions
+        }
+        await self._subscribe_streams(entries)
+        for symbol, callback in subscriptions:
+            self._trade_callbacks[symbol.upper()] = callback
+
+    async def unsubscribe_trades_batch(self, symbols: Sequence[str]) -> None:
+        streams = [
+            _trade_stream(symbol)
+            for symbol in symbols
+            if self._trade_callbacks.pop(symbol.upper(), None) is not None
+        ]
+        await self._drop(streams)
+
     async def unsubscribe_klines_batch(self, pairs: Sequence[tuple[str, str]]) -> None:
         """Drop many symbol/interval kline subscriptions in one message.
 
@@ -151,12 +199,15 @@ class MarketDataStreams:
             for symbol, interval in pairs
             if self._kline_callbacks.pop((symbol.upper(), interval), None) is not None
         ]
+        await self._drop(streams)
+
+    async def _drop(self, streams: list[str]) -> None:
         if not streams:
             return
         try:
             await self._client.unsubscribe(streams=streams)  # type: ignore[no-untyped-call]
         except Exception:  # noqa: BLE001 - best-effort teardown
-            logger.debug("kline unsubscribe failed streams=%s", streams, exc_info=True)
+            logger.debug("unsubscribe failed streams=%s", streams, exc_info=True)
         # A failed send (dead socket) leaves the SDK's module-global map
         # pointing at the old connection, which would make a later subscribe
         # of the same stream a silent no-op.
@@ -171,6 +222,7 @@ class MarketDataStreams:
             with contextlib.suppress(BaseException):
                 await recovery
         await self.unsubscribe_klines_batch(list(self._kline_callbacks))
+        await self.unsubscribe_trades_batch(list(self._trade_callbacks))
         self._started = False
         # create_connection may allocate a session/pool entry before failing or
         # being cancelled. Let the SDK close the entire owned pool even when it
@@ -195,7 +247,17 @@ class MarketDataStreams:
         self._client.on_connection("close", self._on_close)
 
     async def _subscribe(self, items: Sequence[tuple[KlineKey, KlineCallback]]) -> None:
-        streams = {_kline_stream(*key): (key, callback) for key, callback in items}
+        entries: dict[str, tuple[Any, Callable[[Any], None]]] = {
+            _kline_stream(*key): (KlineResponse, callback) for key, callback in items
+        }
+        await self._subscribe_streams(entries)
+        for key, callback in items:
+            self._kline_callbacks[key] = callback
+
+    async def _subscribe_streams(
+        self, streams: dict[str, tuple[Any, Callable[[Any], None]]]
+    ) -> None:
+        """Subscribe named streams, each with its SDK model and callback."""
         # Entries left behind by a dropped connection would make the SDK skip
         # these streams as "already subscribed".
         self._forget_streams(list(streams), dead_only=True)
@@ -209,7 +271,7 @@ class MarketDataStreams:
         if fresh:
             await self._client.subscribe(
                 streams=fresh,
-                response_model=KlineResponse,  # type: ignore[arg-type]
+                response_model=streams[fresh[0]][0],
             )
             missing = [
                 s
@@ -221,15 +283,14 @@ class MarketDataStreams:
                 # own reconnect is in flight.
                 raise ConnectionError(f"kline subscribe not applied streams={missing}")
             for stream in fresh:
-                handle = RequestStreamHandle(self._client, stream, KlineResponse)
-                handle.on("message", self._track(streams[stream][1]))
+                model, callback = streams[stream]
+                handle = RequestStreamHandle(self._client, stream, model)
+                handle.on("message", self._track(callback))
             # New streams get a full staleness window before they count as silent.
             self._last_message_at = datetime.now(UTC)
-        for key, callback in streams.values():
-            self._kline_callbacks[key] = callback
 
-    def _track(self, callback: KlineCallback) -> KlineCallback:
-        def tracked(data: KlineResponse) -> None:
+    def _track(self, callback: Callable[[Any], None]) -> Callable[[Any], None]:
+        def tracked(data: Any) -> None:
             self._last_message_at = datetime.now(UTC)
             callback(data)
 
@@ -296,6 +357,13 @@ class MarketDataStreams:
         if not self._client.connections:
             await self._open()
         await self._subscribe(list(self._kline_callbacks.items()))
+        if self._trade_callbacks:
+            await self._subscribe_streams(
+                {
+                    _trade_stream(symbol): (TradeResponse, callback)
+                    for symbol, callback in self._trade_callbacks.items()
+                }
+            )
 
     def _forget_streams(
         self, streams: Sequence[str], *, dead_only: bool = False
@@ -317,7 +385,13 @@ def _kline_stream(symbol: str, interval: str) -> str:
     return f"{symbol.lower()}@kline_{KlineIntervalEnum(interval).value}"
 
 
+def _trade_stream(symbol: str) -> str:
+    return f"{symbol.lower()}@trade"
+
+
 __all__ = [
     "KlineCallback",
     "MarketDataStreams",
+    "MarketStreams",
+    "TradeCallback",
 ]

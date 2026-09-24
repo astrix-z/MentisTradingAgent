@@ -29,6 +29,8 @@ from agent.exchange import (
     balance_map,
     balance_snapshot,
 )
+from agent.exchange.hub import StreamHub
+from agent.exchange.streams import MarketStreams
 from agent.execution.admission import record_signal
 from agent.execution.runtime import ExecutionRuntime
 from agent.execution.settings import ExecutionSettings
@@ -104,7 +106,10 @@ class Engine:
         # SDK-backed services for the current run.
         self._rest: ExchangeRest | None = None
         self._rest_network: str | None = None
-        self._streams: MarketDataStreams | None = None
+        self._streams: MarketStreams | None = None
+        #: The one market-data connection of the process (plan §9.3); the
+        #: running strategy is one of its subscribers.
+        self.hub = StreamHub(factory=lambda network: MarketDataStreams(network))
         self._strategy: Strategy | None = None
 
     # --- introspection -----------------------------------------------------
@@ -239,7 +244,7 @@ class Engine:
             self._balances = {}
             self._message = None
             rest = self._ensure_rest(network)
-            self._streams = MarketDataStreams(network)  # type: ignore[arg-type]
+            self._streams = await self.hub.attach(network, "strategy")  # type: ignore[arg-type]
             await self._streams.start()
             # Register before on_start: it can acquire resources and then fail.
             self._strategy = strategy_obj
