@@ -41,6 +41,7 @@ from agent.execution.protection import Protector
 from agent.execution.quotes import QuoteProvider
 from agent.execution.runtime import ExecutionContext, ExecutionRuntime
 from agent.execution.settings import ExecutionSettings
+from agent.execution.worker import PositionWorker
 from agent.strategies.base import EXIT_POLICY_VERSION, ExitPolicy, Signal
 
 CONTEXT = ExecutionContext("1001", "live")
@@ -83,6 +84,7 @@ class Stack:
     orders: OrderManager
     rest: ExchangeRest
     protector: Protector
+    worker: PositionWorker
 
 
 @dataclass
@@ -138,6 +140,7 @@ class World:
             network="live", settings=self.settings, params={"quote_asset": "USDT"}
         )
         runtime.open_admission("tripple_screen")
+        protector = Protector(orders, finalizer)
         stack = Stack(
             runtime,
             admission,
@@ -145,7 +148,8 @@ class World:
             finalizer,
             orders,
             rest,
-            Protector(orders, finalizer),
+            protector,
+            PositionWorker(protector),
         )
         self.stacks.append(stack)
         return stack
@@ -198,6 +202,12 @@ class World:
         result = await stack.orders.execute_entry(signal_id)
         assert result.position_id is not None, result
         return result.position_id
+
+    async def protected(self, stack: Stack, symbol: str = "BTCUSDT") -> uuid.UUID:
+        position_id = await self.filled(stack, symbol)
+        result = await stack.protector.protect(position_id)
+        assert result.step.value == "protected", result
+        return position_id
 
     async def position(self, stack: Stack, position_id: uuid.UUID) -> Position:
         async with stack.runtime.session() as session:

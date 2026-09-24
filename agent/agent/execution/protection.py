@@ -118,8 +118,10 @@ class Protector:
                 return await self._exit(
                     position_id, ExitReason.EMERGENCY, ExitMechanism.MARKET_UNPROTECTED
                 )
-            if not await self.orders.prove_entry(position_id):
-                return StepResult(Step.WAITING, "entry fills not proven")
+            if not await self.orders.prove_entry(position_id) or not await self._proven(
+                position_id
+            ):
+                return StepResult(Step.WAITING, "fills not proven")
             position = await self._position(position_id)
             if position.status == PositionStatus.PROTECTION_OVERDUE:
                 return await self._exit(
@@ -156,8 +158,14 @@ class Protector:
             await self.orders.sleep((min(earliest, deadline) - now).total_seconds())
         return None
 
-    async def _place(self, position: Position) -> StepResult | None:
-        """Compute the legs from the proven ledger and send one OCO."""
+    async def _place(
+        self, position: Position, *, stop_at: Decimal | None = None
+    ) -> StepResult | None:
+        """Compute the legs from the proven ledger and send one OCO.
+
+        ``stop_at`` replaces the initial stop (a trailing reprice); the
+        take-profit always comes from the policy and the fill.
+        """
         runtime = self.runtime
         filters, quote = await self._market(position)
         if filters is None or quote is None:
@@ -165,7 +173,12 @@ class Protector:
         policy = ExitPolicy.from_transport(position.exit_policy)
         assert position.fill_vwap is not None
         qty = round_down(position.quantity, filters.step)
-        stop = round_down(policy.initial_stop(position.fill_vwap), filters.tick)
+        initial = policy.initial_stop(position.fill_vwap)
+        if stop_at is None and position.desired_stop is not None:
+            # Replacing a lost list: the ratchet never goes back down.
+            stop_at = max(position.desired_stop, initial)
+        trailing = stop_at is not None and stop_at > initial
+        stop = round_down(stop_at if stop_at is not None else initial, filters.tick)
         tp = round_up(policy.take_profit(position.fill_vwap), filters.tick)
         stop_type = stop_order_type(filters)
         limit = (
@@ -177,6 +190,10 @@ class Protector:
         if not sellable(filters, qty, last):
             return await self._close_dust(position.id)
         if last <= stop:
+            if trailing:  # a trailing stop the price already crossed
+                return await self._exit(
+                    position.id, ExitReason.TRAIL, ExitMechanism.MARKET_TRAIL
+                )
             return await self._exit(
                 position.id, ExitReason.STOP, ExitMechanism.MARKET_GAP
             )
