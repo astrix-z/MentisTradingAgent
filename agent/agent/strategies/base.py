@@ -195,6 +195,35 @@ def transport_value(value: Any) -> Any:
 SignalSink = Callable[[Signal], Awaitable[None]]
 
 
+@dataclass(frozen=True)
+class PositionEvent:
+    """Execution telling a strategy that one of its positions opened or closed.
+
+    Sent after the change is committed. ``event_id`` identifies the change
+    (the outbox event), so a repeated delivery is harmless; ``cooldown_until``
+    of a close is absolute, computed once by execution from the exit fill.
+    """
+
+    event_id: str
+    symbol: str
+    position_id: str
+    at: datetime
+    cooldown_until: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PositionsSnapshot:
+    """Everything a strategy needs to know about positions before it decides.
+
+    Open positions by symbol and the absolute end of every running cooldown.
+    Restored before the first evaluation of a run (Start and resume alike), so
+    a lost feedback call is repaired by the next run rather than repeated.
+    """
+
+    open_symbols: frozenset[str] = frozenset()
+    cooldown_until: dict[str, datetime] = field(default_factory=dict)
+
+
 @dataclass
 class StrategyServices:
     """Everything a strategy may use, wired by the engine.
@@ -285,6 +314,17 @@ class Strategy(abc.ABC):
         (e.g. a background cycle that keeps failing), or ``None``."""
         return None
 
+    # --- feedback from execution (plan §4.4) -------------------------------
+
+    async def on_position_opened(self, event: PositionEvent) -> None:  # noqa: B027
+        """A position of this strategy opened (committed). Idempotent."""
+
+    async def on_position_closed(self, event: PositionEvent) -> None:  # noqa: B027
+        """A position closed; ``event.cooldown_until`` is absolute. Idempotent."""
+
+    async def restore_positions(self, snapshot: PositionsSnapshot) -> None:  # noqa: B027
+        """Replace position knowledge with ``snapshot``; called before start."""
+
     def indicator_snapshot(self) -> dict[str, Any] | None:
         """Indicator values on the last closed bar of each indicator's own
         interval, per symbol the strategy currently processes — for the
@@ -312,6 +352,8 @@ __all__ = [
     "EXIT_POLICY_VERSION",
     "SIGNAL_ID_NAMESPACE",
     "ExitPolicy",
+    "PositionEvent",
+    "PositionsSnapshot",
     "Signal",
     "SignalSink",
     "SignalType",

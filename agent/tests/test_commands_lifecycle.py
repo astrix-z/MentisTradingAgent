@@ -121,7 +121,12 @@ def test_stop_barrier_and_new_start(monkeypatch: pytest.MonkeyPatch) -> None:
         engine = Engine(redis)
         entered = asyncio.Event()
         count = 0
-        strategy = Mock(on_stop=AsyncMock(), active_symbols=None, health_warning=None)
+        strategy = Mock(
+            on_stop=AsyncMock(),
+            restore_positions=AsyncMock(),
+            active_symbols=None,
+            health_warning=None,
+        )
 
         async def bootstrap(*_: Any) -> None:
             nonlocal count
@@ -216,7 +221,12 @@ def test_listener_and_heartbeat_during_resume(
             {"running": True, "strategy": "test", "symbols": ["BTCUSDT"]}
         )
         monkeypatch.setitem(STRATEGIES, "test", Mock())
-        strategy = Mock(on_stop=AsyncMock(), active_symbols=None, health_warning=None)
+        strategy = Mock(
+            on_stop=AsyncMock(),
+            restore_positions=AsyncMock(),
+            active_symbols=None,
+            health_warning=None,
+        )
 
         async def bootstrap(*_: Any) -> None:
             assert subscribed.is_set()
@@ -354,6 +364,7 @@ def test_start_failure_result(monkeypatch: pytest.MonkeyPatch) -> None:
         strategy = Mock(
             on_start=AsyncMock(side_effect=RuntimeError("subscription failed")),
             on_stop=AsyncMock(),
+            restore_positions=AsyncMock(),
             active_symbols=None,
             health_warning=None,
         )

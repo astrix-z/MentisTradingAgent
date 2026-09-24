@@ -365,6 +365,7 @@ async def run() -> None:
         schema_ready=schema_ready,
     )
     engine.execution = runtime
+    runtime.feedback = engine.position_feedback
     # Independent of Start/Stop and of the saved running flag: unfinished
     # positions are followed from boot, even when the strategy stays off.
     await runtime.boot()

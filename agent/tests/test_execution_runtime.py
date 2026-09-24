@@ -36,6 +36,7 @@ from agent.execution.models import (
 )
 from agent.execution.runtime import ContextRefused, ExecutionContext, ExecutionRuntime
 from agent.execution.settings import ExecutionSettings
+from agent.strategies.base import PositionsSnapshot
 
 ENABLED = ExecutionSettings(enabled=True)
 USDT: dict[str, Any] = {"quote_asset": "USDT"}
@@ -351,6 +352,7 @@ def test_refused_start_leaves_the_current_run_and_stop_only_closes_admission(
         engine, _redis, strategy, _streams = setup_engine(monkeypatch)
         runtime = Mock(
             prepare_start=AsyncMock(),
+            positions_snapshot=AsyncMock(return_value=PositionsSnapshot()),
             open_admission=Mock(),
             close_admission=Mock(),
             heartbeat=Mock(return_value={"mode": "enabled"}),

@@ -48,8 +48,10 @@ from agent.execution.models import (
     OrderAttempt,
     Position,
     PositionStatus,
+    SymbolCooldown,
 )
 from agent.execution.settings import ExecutionSettings
+from agent.strategies.base import PositionEvent, PositionsSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,8 @@ class ExecutionRuntime:
         self._last_clock_check: datetime | None = None
         self._last_account_check: datetime | None = None
         self._restore_pending = False
+        #: Delivers committed position changes to the running strategy.
+        self.feedback: Callable[[PositionEvent, bool], Awaitable[None]] | None = None
 
     # --- wiring ------------------------------------------------------------
 
@@ -235,6 +239,49 @@ class ExecutionRuntime:
 
     def resume(self) -> None:
         self.paused_by_owner = False
+
+    # --- strategy feedback (plan §4.4) -------------------------------------------
+
+    async def positions_snapshot(self) -> PositionsSnapshot:
+        """Open positions and running cooldowns of the current context."""
+        if self.context is None or self._sessions is None:
+            return PositionsSnapshot()
+        now = self._clock()
+        async with self.session() as session:
+            symbols = (
+                await session.scalars(
+                    select(Position.symbol).where(
+                        Position.account == self.context.account,
+                        Position.network == self.context.network,
+                        Position.status != PositionStatus.CLOSED,
+                    )
+                )
+            ).all()
+            cooldowns = (
+                await session.execute(
+                    select(SymbolCooldown.symbol, SymbolCooldown.cooldown_until).where(
+                        SymbolCooldown.account == self.context.account,
+                        SymbolCooldown.network == self.context.network,
+                        SymbolCooldown.cooldown_until > now,
+                    )
+                )
+            ).all()
+        return PositionsSnapshot(
+            open_symbols=frozenset(symbols),
+            cooldown_until={symbol: until for symbol, until in cooldowns},
+        )
+
+    async def notify(self, event: PositionEvent, *, closed: bool) -> None:
+        """Tell the strategy about a committed change; never raises.
+
+        A lost notification is repaired by the snapshot the next run restores.
+        """
+        if self.feedback is None:
+            return
+        try:
+            await self.feedback(event, closed)
+        except Exception:  # noqa: BLE001 - feedback must not undo a commit
+            logger.exception("strategy feedback failed for %s", event.symbol)
 
     # --- questions other components ask ----------------------------------------
 

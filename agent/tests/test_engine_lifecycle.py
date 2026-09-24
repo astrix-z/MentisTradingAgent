@@ -21,6 +21,7 @@ def setup_engine(monkeypatch: pytest.MonkeyPatch) -> tuple[Engine, Any, Any, Any
     strategy = Mock(
         on_start=AsyncMock(),
         on_stop=AsyncMock(),
+        restore_positions=AsyncMock(),
         active_symbols=None,
         health_warning=None,
     )

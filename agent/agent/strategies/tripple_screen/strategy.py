@@ -15,6 +15,8 @@ from binance_sdk_spot.websocket_streams.models import KlineResponse
 from agent.strategies.base import (
     EXIT_POLICY_VERSION,
     ExitPolicy,
+    PositionEvent,
+    PositionsSnapshot,
     Signal,
     Strategy,
     StrategyServices,
@@ -302,7 +304,9 @@ class TripleScreenStrategy(Strategy):
             key=lambda item: item[1],
             reverse=True,
         )
-        keep_for_position = {s for s in self._active_symbols if s in self._positions}
+        # Positions stay streamed outside the cap — including at a cold start,
+        # before anything is active, and for symbols outside the universe.
+        keep_for_position = set(self._positions)
         budget = max(0, settings.ws_top_n - len(keep_for_position))
         admitted_new = [
             symbol for symbol, _ in qualifiers if symbol not in keep_for_position
@@ -361,7 +365,8 @@ class TripleScreenStrategy(Strategy):
         self._last_price.pop(symbol, None)
         self._pending.pop(symbol, None)
         self._evaluated.pop(symbol, None)
-        self._cooldown_until.pop(symbol, None)
+        # Cooldown is not per-stream state: it belongs to the symbol and must
+        # survive the symbol dropping out of the active set and coming back.
         prefix = f"{symbol}:"
         self._consumed_epochs.difference_update(
             {epoch for epoch in self._consumed_epochs if epoch.startswith(prefix)}
@@ -477,12 +482,40 @@ class TripleScreenStrategy(Strategy):
     def mark_position_open(self, symbol: str) -> None:
         self._positions.add(symbol.upper())
 
-    def mark_position_closed(self, symbol: str, at: datetime | None = None) -> None:
+    def mark_position_closed(
+        self,
+        symbol: str,
+        at: datetime | None = None,
+        *,
+        cooldown_until: datetime | None = None,
+    ) -> None:
+        """Forget the position and start (or keep) the symbol's cooldown.
+
+        ``cooldown_until`` is the absolute end computed by execution; without
+        it the cooldown runs from ``at`` with the current settings. An end
+        already known is never shortened nor extended by a repeated close.
+        """
         symbol = symbol.upper()
         self._positions.discard(symbol)
-        self._cooldown_until[symbol] = (at or datetime.now(UTC)) + timedelta(
+        until = cooldown_until or (at or datetime.now(UTC)) + timedelta(
             minutes=self.settings.cooldown_minutes
         )
+        known = self._cooldown_until.get(symbol)
+        self._cooldown_until[symbol] = until if known is None else max(known, until)
+
+    async def on_position_opened(self, event: PositionEvent) -> None:
+        self.mark_position_open(event.symbol)
+
+    async def on_position_closed(self, event: PositionEvent) -> None:
+        self.mark_position_closed(
+            event.symbol, event.at, cooldown_until=event.cooldown_until
+        )
+
+    async def restore_positions(self, snapshot: PositionsSnapshot) -> None:
+        self._positions = {symbol.upper() for symbol in snapshot.open_symbols}
+        self._cooldown_until = {
+            symbol.upper(): until for symbol, until in snapshot.cooldown_until.items()
+        }
 
     async def _on_kline(self, symbol: str, interval: str, data: KlineResponse) -> None:
         if data.k is None:

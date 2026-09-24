@@ -32,6 +32,7 @@ from agent.exchange import (
 from agent.execution.runtime import ExecutionRuntime
 from agent.execution.settings import ExecutionSettings
 from agent.strategies import Signal, Strategy, StrategyServices, build_strategy
+from agent.strategies.base import PositionEvent, PositionsSnapshot
 
 logger = logging.getLogger(__name__)
 # Dedicated, durable record of ENTRY/EXIT only — configured with its own file
@@ -206,12 +207,14 @@ class Engine:
         execution_settings = ExecutionSettings.from_payload(execution)
 
         async with self._lifecycle_lock:
+            snapshot = PositionsSnapshot()
             if self.execution is not None:
                 await self.execution.prepare_start(
                     network=network, settings=execution_settings, params=params
                 )
+                snapshot = await self.execution.positions_snapshot()
             self._startup = asyncio.create_task(
-                self._start_run(network, strategy, normalized, strategy_obj)
+                self._start_run(network, strategy, normalized, strategy_obj, snapshot)
             )
             try:
                 await self._startup
@@ -221,7 +224,12 @@ class Engine:
                 self.execution.open_admission(strategy)
 
     async def _start_run(
-        self, network: str, strategy: str, symbols: list[str], strategy_obj: Strategy
+        self,
+        network: str,
+        strategy: str,
+        symbols: list[str],
+        strategy_obj: Strategy,
+        snapshot: PositionsSnapshot | None = None,
     ) -> None:
         try:
             await self._stop_run()
@@ -234,6 +242,8 @@ class Engine:
             await self._streams.start()
             # Register before on_start: it can acquire resources and then fail.
             self._strategy = strategy_obj
+            # Positions and cooldowns before the first evaluation (plan §4.4).
+            await strategy_obj.restore_positions(snapshot or PositionsSnapshot())
             services = StrategyServices(
                 network=network,
                 symbols=symbols,
@@ -288,6 +298,16 @@ class Engine:
             self._state = "error"
             self._message = str(exc)
             await self.publish_heartbeat()
+
+    async def position_feedback(self, event: PositionEvent, closed: bool) -> None:
+        """Forward a committed position change to the running strategy."""
+        strategy = self._strategy
+        if strategy is None or self._state != "running":
+            return
+        if closed:
+            await strategy.on_position_closed(event)
+        else:
+            await strategy.on_position_opened(event)
 
     async def _on_signal(self, signal: Signal) -> None:
         """Handle a strategy signal (execution lane hooks in here later)."""
