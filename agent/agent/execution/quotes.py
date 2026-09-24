@@ -17,9 +17,17 @@ Order of preference, per filter:
 
 from __future__ import annotations
 
+import asyncio
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+
+from agent.exchange.budget import Priority
+from agent.exchange.rest import ExchangeRest
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_FETCH_AGE = timedelta(seconds=5)
 DEFAULT_MAX_TRADE_AGE = timedelta(seconds=60)
@@ -58,6 +66,13 @@ class QuoteSnapshot:
     reference: ReferencePrice | None
     bid: Decimal | None = None
     ask: Decimal | None = None
+
+    @property
+    def spread_pct(self) -> Decimal | None:
+        """Bid-ask spread in percent of the mid price, for the audit only."""
+        if self.bid is None or self.ask is None or self.bid <= 0:
+            return None
+        return (self.ask - self.bid) / ((self.ask + self.bid) / 2) * 100
 
     def check_fresh(
         self,
@@ -108,11 +123,105 @@ class QuoteSnapshot:
         return self.avg.price
 
 
+def _utc(ms: int | None) -> datetime | None:
+    return datetime.fromtimestamp(ms / 1000, UTC) if isinstance(ms, int) else None
+
+
+def _decimal(value: str | None) -> Decimal | None:
+    return Decimal(value) if value not in (None, "") else None
+
+
+class QuoteProvider:
+    """Fresh quotes for a symbol, with or without a position (plan §9.8).
+
+    Everything comes from the SDK's REST market-data methods through the shared
+    request budget, at ENTRY priority: a quote is only needed to decide whether
+    to buy, and protection outranks it. A read that fails leaves its part of the
+    snapshot empty — the validator then fails the entry closed; nothing here
+    substitutes one price for another.
+    """
+
+    def __init__(
+        self,
+        rest: ExchangeRest,
+        *,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        max_wait: float | None = 2.0,
+    ) -> None:
+        self._rest = rest
+        self._clock = clock
+        self._max_wait = max_wait
+
+    @property
+    def network(self) -> str:
+        return self._rest.network
+
+    async def snapshot(self, symbol: str) -> QuoteSnapshot:
+        entry, wait = Priority.ENTRY, self._max_wait
+        trades, avg, reference, book = await asyncio.gather(
+            self._rest.last_trades(symbol, priority=entry, max_wait=wait),
+            self._rest.avg_price(symbol, priority=entry, max_wait=wait),
+            self._rest.reference_price(symbol, priority=entry, max_wait=wait),
+            self._rest.book_ticker(symbol, priority=entry, max_wait=wait),
+            return_exceptions=True,
+        )
+        fetched_at = self._clock()
+        for name, result in (
+            ("trades", trades),
+            ("avgPrice", avg),
+            ("referencePrice", reference),
+            ("bookTicker", book),
+        ):
+            if isinstance(result, BaseException):
+                logger.warning("quote %s for %s unavailable: %s", name, symbol, result)
+        return QuoteSnapshot(
+            symbol=symbol,
+            network=self.network,
+            fetched_at=fetched_at,
+            last_trade=_last_trade(trades),
+            avg=_average(avg),
+            reference=_reference(reference),
+            bid=_book_side(book, "bid_price"),
+            ask=_book_side(book, "ask_price"),
+        )
+
+
+def _last_trade(result: object) -> LastTrade | None:
+    if not isinstance(result, list) or not result:
+        return None
+    trade = result[-1]
+    price = _decimal(getattr(trade, "price", None))
+    when = _utc(getattr(trade, "time", None))
+    return LastTrade(price, when) if price is not None and when is not None else None
+
+
+def _average(result: object) -> AveragePrice | None:
+    price = _decimal(getattr(result, "price", None))
+    mins = getattr(result, "mins", None)
+    when = _utc(getattr(result, "close_time", None))
+    if price is None or not isinstance(mins, int) or when is None:
+        return None
+    return AveragePrice(price, mins, when)
+
+
+def _reference(result: object) -> ReferencePrice | None:
+    when = _utc(getattr(result, "timestamp", None))
+    if when is None:
+        return None
+    return ReferencePrice(_decimal(getattr(result, "reference_price", None)), when)
+
+
+def _book_side(result: object, side: str) -> Decimal | None:
+    inner = getattr(result, "actual_instance", result)
+    return _decimal(getattr(inner, side, None))
+
+
 __all__ = [
     "DEFAULT_MAX_FETCH_AGE",
     "DEFAULT_MAX_TRADE_AGE",
     "AveragePrice",
     "LastTrade",
+    "QuoteProvider",
     "QuoteSnapshot",
     "ReferencePrice",
     "ReferenceUnverified",

@@ -24,11 +24,15 @@ from binance_sdk_spot import (
     SPOT_REST_API_TESTNET_URL,
 )
 from binance_sdk_spot.rest_api.models import (
+    AvgPriceResponse,
     ExchangeInfoResponseSymbolsInner,
     GetAccountResponse,
     GetAccountResponseBalancesInner,
+    GetTradesResponse,
     KlinesIntervalEnum,
+    ReferencePriceResponse,
     Ticker24hrResponse2Inner,
+    TickerBookTickerResponse,
 )
 from binance_sdk_spot.spot import Spot
 
@@ -181,10 +185,20 @@ class ExchangeRest:
         except Exception as exc:  # noqa: BLE001 - SDK raises many typed errors
             raise ExchangeError(f"Binance REST call failed: {exc}") from exc
 
-    async def _market(self, method: Any, /, **kwargs: Any) -> Any:
-        """Run a read under the shared budget at market-data priority."""
+    async def _market(
+        self,
+        method: Any,
+        /,
+        *,
+        priority: Priority = Priority.MARKET,
+        max_wait: float | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a read under the shared budget (market-data priority by default)."""
         try:
-            await self.budget.acquire(Priority.MARKET, weight_of(method.__name__))
+            await self.budget.acquire(
+                priority, weight_of(method.__name__), max_wait=max_wait
+            )
         except BudgetExhausted as exc:
             raise ExchangeError(f"Binance REST call not sent: {exc}") from exc
         return await asyncio.to_thread(self._call, method, **kwargs)
@@ -241,6 +255,57 @@ class ExchangeRest:
         """
         info = await self.exchange_info()
         return list(info.symbols or [])
+
+    # --- quotes for execution (plan §9.8) ----------------------------------
+
+    async def last_trades(
+        self, symbol: str, *, priority: Priority, max_wait: float | None = None
+    ) -> list[GetTradesResponse]:
+        """The most recent trade (``GET /api/v3/trades?limit=1``).
+
+        The SDK annotates this endpoint as a single model; it returns a list.
+        """
+        trades: list[GetTradesResponse] = await self._market(
+            self._client.rest_api.get_trades,
+            priority=priority,
+            max_wait=max_wait,
+            symbol=symbol,
+            limit=1,
+        )
+        return trades
+
+    async def avg_price(
+        self, symbol: str, *, priority: Priority, max_wait: float | None = None
+    ) -> AvgPriceResponse:
+        result: AvgPriceResponse = await self._market(
+            self._client.rest_api.avg_price,
+            priority=priority,
+            max_wait=max_wait,
+            symbol=symbol,
+        )
+        return result
+
+    async def reference_price(
+        self, symbol: str, *, priority: Priority, max_wait: float | None = None
+    ) -> ReferencePriceResponse:
+        result: ReferencePriceResponse = await self._market(
+            self._client.rest_api.reference_price,
+            priority=priority,
+            max_wait=max_wait,
+            symbol=symbol,
+        )
+        return result
+
+    async def book_ticker(
+        self, symbol: str, *, priority: Priority, max_wait: float | None = None
+    ) -> TickerBookTickerResponse:
+        result: TickerBookTickerResponse = await self._market(
+            self._client.rest_api.ticker_book_ticker,
+            priority=priority,
+            max_wait=max_wait,
+            symbol=symbol,
+        )
+        return result
 
     async def tickers_24h(self) -> dict[str, Ticker24hrResponse2Inner]:
         """24h statistics per symbol, keyed by symbol.
