@@ -1,6 +1,7 @@
 """Binance Spot REST access — a thin adapter over ``binance_sdk_spot``.
 
-This is the **only** module in the agent that talks to the REST API directly.
+This module is the market-data and account-read side; orders go through
+:mod:`agent.exchange.trade`, which has its own non-retrying client.
 It deliberately does not define its own order/quote/balance models: every call
 returns the SDK's own response objects (``NewOrderResponse``,
 ``GetAccountResponseBalancesInner``, ...). If we need a value from the exchange,
@@ -17,26 +18,28 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from binance_common.configuration import ConfigurationRestAPI
+from binance_common.errors import RateLimitBanError, TooManyRequestsError
 from binance_sdk_spot import (
     SPOT_REST_API_PROD_URL,
     SPOT_REST_API_TESTNET_URL,
 )
 from binance_sdk_spot.rest_api.models import (
-    DeleteOrderResponse,
     ExchangeInfoResponseSymbolsInner,
     GetAccountResponse,
     GetAccountResponseBalancesInner,
-    GetOrderResponse,
     KlinesIntervalEnum,
-    NewOrderResponse,
-    NewOrderSideEnum,
-    NewOrderTimeInForceEnum,
-    NewOrderTypeEnum,
     Ticker24hrResponse2Inner,
 )
 from binance_sdk_spot.spot import Spot
 
 from agent.core.config import settings
+from agent.exchange.budget import (
+    BudgetExhausted,
+    Priority,
+    RequestBudget,
+    budget_for,
+    weight_of,
+)
 
 Network = Literal["testnet", "live"]
 
@@ -120,9 +123,14 @@ def balance_snapshot(
 class ExchangeRest:
     """Network-scoped, async facade over ``Spot.rest_api``."""
 
-    def __init__(self, network: Network, client: Spot) -> None:
+    def __init__(
+        self, network: Network, client: Spot, budget: RequestBudget | None = None
+    ) -> None:
         self._network = network
         self._client = client
+        #: Market data draws from the same per-IP budget as trading, at the
+        #: lowest priority (plan §6.9).
+        self.budget = budget if budget is not None else budget_for(network)
 
     @property
     def network(self) -> Network:
@@ -153,22 +161,42 @@ class ExchangeRest:
         return cls(network, Spot(config_rest_api=config))
 
     def _call(self, method: Any, /, **kwargs: Any) -> Any:
-        """Run a blocking SDK method in a worker thread, wrapping failures."""
+        """Run a blocking SDK method in a worker thread, wrapping failures.
+
+        Feeds the shared budget: the exchange's weight count on success, a
+        pause on 429 and a ban on 418.
+        """
         try:
             response = method(**kwargs)
+            self.budget.observe(response.rate_limits)
             return response.data()
         except ExchangeError:
             raise
+        except TooManyRequestsError as exc:
+            self.budget.on_rate_limited(exc.retry_after)
+            raise ExchangeError(f"Binance REST call failed: {exc}") from exc
+        except RateLimitBanError as exc:
+            self.budget.on_banned(exc.retry_after)
+            raise ExchangeError(f"Binance REST call failed: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 - SDK raises many typed errors
             raise ExchangeError(f"Binance REST call failed: {exc}") from exc
+
+    async def _market(self, method: Any, /, **kwargs: Any) -> Any:
+        """Run a read under the shared budget at market-data priority."""
+        try:
+            await self.budget.acquire(Priority.MARKET, weight_of(method.__name__))
+        except BudgetExhausted as exc:
+            raise ExchangeError(f"Binance REST call not sent: {exc}") from exc
+        return await asyncio.to_thread(self._call, method, **kwargs)
 
     # --- account -----------------------------------------------------------
 
     async def account(self) -> GetAccountResponse:
         """Return the full account snapshot."""
-        return await asyncio.to_thread(
-            self._call, self._client.rest_api.get_account, omit_zero_balances=True
+        account: GetAccountResponse = await self._market(
+            self._client.rest_api.get_account, omit_zero_balances=True
         )
+        return account
 
     async def balances(self) -> list[GetAccountResponseBalancesInner]:
         """Return the account's balance rows (SDK model, strings for amounts)."""
@@ -187,8 +215,7 @@ class ExchangeRest:
         end_time: int | None = None,
     ) -> list[Any]:
         """Return raw kline arrays (``open_time, open, high, low, close, ...``)."""
-        return await asyncio.to_thread(
-            self._call,
+        rows: list[Any] = await self._market(
             self._client.rest_api.klines,
             symbol=symbol,
             interval=KlinesIntervalEnum(interval).value,
@@ -196,18 +223,15 @@ class ExchangeRest:
             start_time=start_time,
             end_time=end_time,
         )
+        return rows
 
     async def ticker_price(self, symbol: str) -> Any:
         """Return the latest price for a symbol."""
-        return await asyncio.to_thread(
-            self._call, self._client.rest_api.ticker_price, symbol=symbol
-        )
+        return await self._market(self._client.rest_api.ticker_price, symbol=symbol)
 
     async def exchange_info(self, symbol: str | None = None) -> Any:
         """Return exchange metadata (filters, symbol status, ...)."""
-        return await asyncio.to_thread(
-            self._call, self._client.rest_api.exchange_info, symbol=symbol
-        )
+        return await self._market(self._client.rest_api.exchange_info, symbol=symbol)
 
     async def symbols(self) -> list[ExchangeInfoResponseSymbolsInner]:
         """Every symbol the exchange lists, with its metadata.
@@ -224,82 +248,12 @@ class ExchangeRest:
         The endpoint returns either one object or a list depending on the
         parameters; asked without any, it returns every symbol.
         """
-        response = await asyncio.to_thread(self._call, self._client.rest_api.ticker24hr)
+        response = await self._market(self._client.rest_api.ticker24hr)
         payload = getattr(response, "actual_instance", None)
         if payload is None:
             return {}
         entries = payload if isinstance(payload, list) else [payload]
         return {entry.symbol: entry for entry in entries if entry.symbol}
-
-    # --- orders ------------------------------------------------------------
-
-    async def new_order(
-        self,
-        *,
-        symbol: str,
-        side: str,
-        order_type: str,
-        quantity: float | None = None,
-        quote_order_qty: float | None = None,
-        price: float | None = None,
-        time_in_force: str | None = None,
-        stop_price: float | None = None,
-        client_order_id: str | None = None,
-    ) -> NewOrderResponse:
-        """Place a new order and return the SDK response model."""
-        return await asyncio.to_thread(
-            self._call,
-            self._client.rest_api.new_order,
-            symbol=symbol,
-            side=NewOrderSideEnum(side),
-            type=NewOrderTypeEnum(order_type),
-            quantity=quantity,
-            quote_order_qty=quote_order_qty,
-            price=price,
-            time_in_force=(
-                NewOrderTimeInForceEnum(time_in_force) if time_in_force else None
-            ),
-            stop_price=stop_price,
-            new_client_order_id=client_order_id,
-        )
-
-    async def cancel_order(
-        self,
-        *,
-        symbol: str,
-        order_id: int | None = None,
-        client_order_id: str | None = None,
-    ) -> DeleteOrderResponse:
-        """Cancel a resting order by exchange id or client id."""
-        return await asyncio.to_thread(
-            self._call,
-            self._client.rest_api.delete_order,
-            symbol=symbol,
-            order_id=order_id,
-            orig_client_order_id=client_order_id,
-        )
-
-    async def open_orders(self, symbol: str | None = None) -> list[Any]:
-        """List currently open orders, optionally scoped to one symbol."""
-        return await asyncio.to_thread(
-            self._call, self._client.rest_api.get_open_orders, symbol=symbol
-        )
-
-    async def get_order(
-        self,
-        *,
-        symbol: str,
-        order_id: int | None = None,
-        client_order_id: str | None = None,
-    ) -> GetOrderResponse:
-        """Return the current state of a single order."""
-        return await asyncio.to_thread(
-            self._call,
-            self._client.rest_api.get_order,
-            symbol=symbol,
-            order_id=order_id,
-            orig_client_order_id=client_order_id,
-        )
 
 
 __all__ = [
