@@ -12,6 +12,7 @@ from typing import Any
 
 from binance_sdk_spot.websocket_streams.models import KlineResponse
 
+from agent.common.intervals import bar_open, interval_ms
 from agent.strategies.base import (
     EXIT_POLICY_VERSION,
     ExitPolicy,
@@ -31,7 +32,7 @@ from agent.strategies.tripple_screen.indicators import (
     stochastic_k_series,
 )
 from agent.strategies.tripple_screen.schema import CONSTRAINTS, LOOKUPS
-from agent.strategies.tripple_screen.settings import TripleScreenSettings, interval_ms
+from agent.strategies.tripple_screen.settings import TripleScreenSettings
 
 logger = logging.getLogger(__name__)
 
@@ -377,8 +378,8 @@ class TripleScreenStrategy(Strategy):
     def _next_rescreen_ms(self, now_ms: int) -> int:
         """First instant after ``now_ms`` at which the next tide bar has
         closed, plus a small buffer for the exchange's own bar to settle."""
-        step = interval_ms(self.settings.tide_interval)
-        return (now_ms // step + 1) * step + _RESCREEN_BUFFER_MS
+        tide = self.settings.tide_interval
+        return bar_open(now_ms, tide) + interval_ms(tide) + _RESCREEN_BUFFER_MS
 
     async def _rescreen_loop(self) -> None:
         """Re-run stage 1 over the full universe at every tide-interval close.
@@ -414,7 +415,8 @@ class TripleScreenStrategy(Strategy):
         prevents it from taking a slot in the configured closed-bar window.
         """
         step = interval_ms(interval)
-        end = (cutoff + 1) // step * step - 1
+        # +1 keeps the bar that closes exactly at ``cutoff``.
+        end = bar_open(cutoff + 1, interval) - 1
         start = end + 1 - self.settings.kline_window * step
         cursor = max(0, start)
         found: dict[int, Candle] = {}
@@ -550,7 +552,8 @@ class TripleScreenStrategy(Strategy):
         self, candles: list[Candle], interval: str, cutoff: int
     ) -> list[Candle] | None:
         step = interval_ms(interval)
-        end = (cutoff + 1) // step * step - 1
+        # +1 keeps the bar that closes exactly at ``cutoff``.
+        end = bar_open(cutoff + 1, interval) - 1
         start = end + 1 - self.settings.kline_window * step
         selected = [
             c

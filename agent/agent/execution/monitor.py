@@ -37,6 +37,7 @@ from typing import Any
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent.common.intervals import interval_ms
 from agent.exchange.hub import StreamHub, StreamView
 from agent.execution.models import MonitorWatermark
 from agent.execution.quotes import LastTrade
@@ -68,11 +69,6 @@ class Followed:
 
 
 KlineLoader = Callable[[str, str, int | None, int], Awaitable[list[list[Any]]]]
-
-
-def interval_ms(interval: str) -> int:
-    units = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
-    return int(interval[:-1]) * units[interval[-1]]
 
 
 async def commit_watermark(
@@ -306,5 +302,4 @@ __all__ = [
     "Followed",
     "MonitorFeed",
     "commit_watermark",
-    "interval_ms",
 ]

@@ -11,23 +11,13 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Annotated, Any, Literal, Self
 
-from binance_sdk_spot.rest_api.models import KlinesIntervalEnum
-from binance_sdk_spot.websocket_streams.models import KlineIntervalEnum
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from agent.common.intervals import interval_ms
 
 PositiveInt = Annotated[int, Field(gt=0)]
 
 TRAIL_CAP_MESSAGE = "trailing stop cap % must be below take profit %"
-
-
-def interval_ms(interval: str) -> int:
-    """Fixed UTC intraday SDK intervals; calendar/week alignment is unsupported."""
-    KlinesIntervalEnum(interval)
-    KlineIntervalEnum(interval)
-    units = {"s": 1000, "m": 60_000, "h": 3_600_000}
-    if interval[-1] not in units:
-        raise ValueError("only fixed intraday SDK intervals are supported")
-    return int(interval[:-1]) * units[interval[-1]]
 
 
 class TripleScreenSettings(BaseModel):

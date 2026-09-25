@@ -18,7 +18,8 @@ from typing import Any
 
 from binance_sdk_spot.rest_api.models import KlinesIntervalEnum
 
-from agent.strategies.tripple_screen.settings import TRAIL_CAP_MESSAGE, interval_ms
+from agent.common.intervals import interval_ms
+from agent.strategies.tripple_screen.settings import TRAIL_CAP_MESSAGE
 
 EMA_MESSAGE = "EMA tide periods must be three strictly increasing positive periods"
 RATIO_MESSAGE = "timeframes must have tide:wave:ripple ratio 16:4:1"
@@ -29,8 +30,8 @@ def _intervals_ms() -> dict[str, int]:
 
     Derived from the SDK enums through the same :func:`interval_ms` the
     strategy uses, so the published list cannot drift from what a run accepts:
-    values the SDK knows but ``interval_ms`` rejects (calendar/week alignment)
-    are simply absent.
+    values the SDK knows but ``interval_ms`` rejects (``1M``, ``3d``: no fixed
+    grid) are simply absent.
     """
     allowed: dict[str, int] = {}
     for member in KlinesIntervalEnum:

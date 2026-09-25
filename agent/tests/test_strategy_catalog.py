@@ -19,6 +19,7 @@ import pytest
 from pydantic import BaseModel, Field
 from redis.exceptions import RedisError
 
+from agent.common.intervals import interval_ms
 from agent.engine import REDIS_STRATEGIES_KEY
 from agent.protocol import (
     CATALOG_VERSION,
@@ -29,7 +30,7 @@ from agent.protocol import (
 )
 from agent.strategies import STRATEGIES
 from agent.strategies.base import Strategy, StrategyServices
-from agent.strategies.tripple_screen.settings import TripleScreenSettings, interval_ms
+from agent.strategies.tripple_screen.settings import TripleScreenSettings
 
 PARAMS_ENTRY = describe_strategy("tripple_screen", STRATEGIES["tripple_screen"])
 

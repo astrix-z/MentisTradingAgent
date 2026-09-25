@@ -15,11 +15,12 @@ import pytest
 from binance_sdk_spot.websocket_streams.models import KlineResponse, KlineResponseK
 from pydantic import ValidationError
 
+from agent.common.intervals import interval_ms
 from agent.exchange.rest import ExchangeRest
 from agent.exchange.streams import MarketDataStreams
 from agent.strategies.base import Signal, StrategyServices
 from agent.strategies.tripple_screen.indicators import Candle
-from agent.strategies.tripple_screen.settings import TripleScreenSettings, interval_ms
+from agent.strategies.tripple_screen.settings import TripleScreenSettings
 from agent.strategies.tripple_screen.strategy import TripleScreenStrategy
 
 SYMBOL = "BTCUSDT"
@@ -1172,3 +1173,71 @@ def test_next_rescreen_ms_is_tide_boundary_plus_buffer() -> None:
     assert strategy._next_rescreen_ms(now_ms) == step * 11 + 5_000
     # Exactly on a boundary still waits for the *next* one, not this instant.
     assert strategy._next_rescreen_ms(step * 10) == step * 11 + 5_000
+
+
+# 2026-09-21T00:00Z, a Monday: Binance weekly bars open on Mondays.
+MONDAY = 1_789_948_800_000
+DAY = 86_400_000
+
+
+def _with_tide(strategy: TripleScreenStrategy, interval: str) -> None:
+    # 16:4:1 still forbids a daily/weekly tide in a validated model; the
+    # rescreen timer only reads the tide interval, so bypass validation here.
+    strategy._settings = strategy.settings.model_copy(
+        update={"tide_interval": interval}
+    )
+
+
+@pytest.mark.parametrize(
+    ("interval", "boundary"),
+    [("1w", MONDAY), ("1d", MONDAY + 4 * DAY)],
+)
+def test_next_rescreen_follows_daily_and_weekly_closes(
+    interval: str, boundary: int
+) -> None:
+    strategy = TripleScreenStrategy(PARAMS)
+    _with_tide(strategy, interval)
+    step = interval_ms(interval)
+    # The last instant of a bar: the rescreen fires right after it closes.
+    assert strategy._next_rescreen_ms(boundary - 1) == boundary + 5_000
+    # On the boundary itself the bar just opened; wait for its close.
+    assert strategy._next_rescreen_ms(boundary) == boundary + step + 5_000
+
+
+@pytest.mark.parametrize("interval", ["1w", "1d", "4h"])
+def test_slice_includes_the_bar_closing_exactly_at_cutoff(interval: str) -> None:
+    strategy = TripleScreenStrategy(PARAMS)
+    step = interval_ms(interval)
+    # 14 bars: a full 12-bar window plus one older and one closing after cutoff.
+    bars = [bar(MONDAY - (12 - i) * step, interval) for i in range(-1, 13)]
+    last_closed = bars[-2]
+    selected = strategy._slice(bars, interval, last_closed.close_time)
+    assert selected is not None
+    assert selected[-1] == last_closed
+    assert len(selected) == 12
+    # One millisecond earlier that bar has not closed yet: the window shifts.
+    earlier = strategy._slice(bars, interval, last_closed.close_time - 1)
+    assert earlier is not None
+    assert earlier[-1] == bars[-3]
+
+
+def test_weekly_window_is_full_and_continuous() -> None:
+    async def run() -> None:
+        step = interval_ms("1w")
+        weeks = [bar(MONDAY - (20 - i) * step, "1w") for i in range(21)]
+        rest = Rest({"1w": weeks}, page_size=5)
+        strategy = TripleScreenStrategy(PARAMS)
+        strategy._services = services(rest, Streams(), RedisSink())
+        # Friday 2026-09-25: the running week (opened Monday) is not closed.
+        cutoff = MONDAY + 4 * DAY + 12 * 3_600_000
+        window = await strategy._load_window(SYMBOL, "1w", cutoff)
+        assert len(window) == 12
+        assert window[-1].open_time == MONDAY - step
+        assert window[-1].close_time == MONDAY - 1
+        assert all(
+            later.open_time - earlier.open_time == step
+            for earlier, later in zip(window, window[1:], strict=False)
+        )
+        assert strategy._slice(window, "1w", cutoff) == window
+
+    asyncio.run(run())
