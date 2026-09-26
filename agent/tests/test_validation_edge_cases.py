@@ -139,8 +139,17 @@ class EnvelopeRejected:
     category: str
 
 
-def envelope_rejection(entry_point: str, caplog: pytest.LogCaptureFixture) -> Any:
-    """The mapped category of the logged refusal; a silent drop fails the test."""
+def envelope_rejection(
+    entry_point: str, text: str, caplog: pytest.LogCaptureFixture
+) -> Any:
+    """The mapped category of the logged refusal; a silent drop fails the test.
+
+    Only params that really do not parse may be refused this way: the same log
+    line is written for other envelope defects (a missing key, a wrong type),
+    and those must not pass as ``invalid_json``.
+    """
+    with pytest.raises(ValueError):
+        json.loads(text)
     rule = ERROR_MAP["envelope"][entry_point]
     logged = [record.getMessage() for record in caplog.records]
     assert any(re.search(rule["pattern"], line) for line in logged), logged
@@ -171,7 +180,7 @@ def run_command(
         # Nothing may have happened: no result, no run.
         assert results(redis) == {}
         engine._start_run.assert_not_awaited()  # type: ignore[attr-defined]
-        return envelope_rejection("agent_command", caplog)
+        return envelope_rejection("agent_command", text, caplog)
     assert spy.calls == 1
     result = results(redis)["agent:result:edge"]
     assert result["ok"] is (spy.error is None), result
@@ -193,7 +202,7 @@ def run_resume(
     started = engine._start_run.await_count  # type: ignore[attr-defined]
     if spy.calls == 0:
         assert started == 0
-        return envelope_rejection("agent_resume", caplog)
+        return envelope_rejection("agent_resume", text, caplog)
     assert spy.calls == 1
     assert started == (0 if spy.error else 1)
     return spy.error or spy.settings

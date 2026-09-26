@@ -100,9 +100,17 @@ def category(error: dict[str, Any]) -> tuple[str, str | None]:
     """Map one 422 ``detail`` item to the fixture's ``(category, field)`` pair."""
     loc = list(error.get("loc") or [])
     # ["body", "params", <field>] or the compiled model's bare [<field>];
-    # a body-level error (e.g. ["body", 21] for broken JSON) has no field.
+    # ["body", <position>] (broken JSON) has no field. Any other body location
+    # is an error in the wrapper (symbols, network, ...), not in params: the
+    # cases never expect one, so it fails the runner instead of reading as a
+    # field-less rule error.
     if loc[:1] == ["body"]:
-        loc = loc[2:] if loc[1:2] == ["params"] else []
+        if loc[1:2] == ["params"]:
+            loc = loc[2:]
+        elif len(loc) == 2 and isinstance(loc[1], int):
+            loc = []
+        else:
+            raise AssertionError(f"error outside params: {error}")
     field = loc[0] if loc and isinstance(loc[0], str) else None
     kind = error["type"]
     if kind in ERROR_MAP["types"]:
