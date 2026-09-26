@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import EmailStr
-from sqlalchemy import CheckConstraint, DateTime, Index, func, text
+from sqlalchemy import CheckConstraint, DateTime, Index, false, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, Relationship, SQLModel, col
 
@@ -157,7 +157,8 @@ class SignalPosition(SQLModel, table=True):
 #
 # Table names are explicit: the implicit ones (cf. ``signalposition``) would not
 # match the migration's. ``params``/``options``/``errors`` are JSONB, times are
-# timestamptz. The rows are written by the preset API (PRESET-06) and the
+# timestamptz. Service columns (id, is_builtin, times) also have server
+# defaults, so the sync's raw SQL may leave them out. The rows are written by the preset API (PRESET-06) and the
 # built-in sync (PRESET-05b); this module only declares them.
 
 
@@ -166,12 +167,18 @@ class StrategyPreset(SQLModel, table=True):
 
     __tablename__ = "strategy_preset"
 
-    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    id: uuid.UUID = Field(
+        default_factory=uuid.uuid4,
+        primary_key=True,
+        sa_column_kwargs={"server_default": text("gen_random_uuid()")},
+    )
     strategy: str = Field(max_length=64)
     # Stored trimmed; unique per strategy ignoring case (ux_strategy_preset_name).
     name: str = Field(max_length=64)
     params: dict[str, Any] = Field(sa_type=JSONB)
-    is_builtin: bool = Field(default=False)
+    is_builtin: bool = Field(
+        default=False, sa_column_kwargs={"server_default": false()}
+    )
     # A built-in preset that disappeared from the catalog; hidden, id kept.
     retired_at: datetime | None = Field(
         default=None,
@@ -184,10 +191,12 @@ class StrategyPreset(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=get_datetime_utc,
         sa_type=DateTime(timezone=True),  # type: ignore
+        sa_column_kwargs={"server_default": func.now()},
     )
     updated_at: datetime = Field(
         default_factory=get_datetime_utc,
         sa_type=DateTime(timezone=True),  # type: ignore
+        sa_column_kwargs={"server_default": func.now()},
     )
 
 
@@ -211,6 +220,7 @@ class StrategyFieldOptions(SQLModel, table=True):
     updated_at: datetime = Field(
         default_factory=get_datetime_utc,
         sa_type=DateTime(timezone=True),  # type: ignore
+        sa_column_kwargs={"server_default": func.now()},
     )
 
 

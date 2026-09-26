@@ -776,14 +776,14 @@ def with_presets(presets: Any, **properties: Any) -> Any:
 
 
 def statuses(strategy: Any) -> list[tuple[int, str | None, str]]:
-    return [(r.index, r.name, r.status) for r in strategy.presets.records]
+    return [(r.index, r.name, r.status) for r in strategy.parse_presets().records]
 
 
 def test_a_catalog_without_presets_reads_as_absent() -> None:
     strategy = compiled()
-    assert strategy.presets.form == "absent"
-    assert strategy.presets.records == []
-    assert not strategy.presets.has_errors
+    assert strategy.parse_presets().form == "absent"
+    assert strategy.parse_presets().records == []
+    assert not strategy.parse_presets().has_errors
 
 
 def test_a_bad_preset_beside_a_good_one_leaves_catalog_and_start_working() -> None:
@@ -794,18 +794,20 @@ def test_a_bad_preset_beside_a_good_one_leaves_catalog_and_start_working() -> No
         ]
     )
     assert statuses(strategy) == [(0, "Good", "accepted"), (1, "Bad", "rejected")]
-    assert [r.params for r in strategy.presets.accepted] == [GOOD]
-    assert strategy.presets.errors == [{"index": 1, "name": "Bad", "type": "rejected"}]
-    assert strategy.presets.has_errors
+    assert [r.params for r in strategy.parse_presets().accepted] == [GOOD]
+    assert strategy.parse_presets().errors == [
+        {"index": 1, "name": "Bad", "type": "rejected"}
+    ]
+    assert strategy.parse_presets().has_errors
     assert strategy.validate({}) == []  # Start still validates
 
 
 @pytest.mark.parametrize("presets", ["oops", {"name": "Good"}, 5])
 def test_presets_that_are_not_a_list_are_malformed(presets: Any) -> None:
     strategy = with_presets(presets)
-    assert strategy.presets.form == "malformed"
-    assert strategy.presets.accepted == []
-    assert strategy.presets.has_errors
+    assert strategy.parse_presets().form == "malformed"
+    assert strategy.parse_presets().accepted == []
+    assert strategy.parse_presets().has_errors
     assert strategy.validate({}) == []
 
 
@@ -830,7 +832,9 @@ def test_a_preset_must_be_a_full_snapshot_without_const() -> None:
 def test_an_unreadable_entry_is_reported_by_index() -> None:
     strategy = with_presets([{"name": "Good", "params": GOOD}, None])
     assert statuses(strategy) == [(0, "Good", "accepted"), (1, None, "unreadable")]
-    assert strategy.presets.errors == [{"index": 1, "name": None, "type": "unreadable"}]
+    assert strategy.parse_presets().errors == [
+        {"index": 1, "name": None, "type": "unreadable"}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -845,7 +849,29 @@ def test_an_unreadable_entry_is_reported_by_index() -> None:
 )
 def test_an_envelope_defect_is_unreadable_and_good_ones_stay(entry: Any) -> None:
     strategy = with_presets([entry, {"name": "Good", "params": GOOD}])
-    assert [r.status for r in strategy.presets.records] == ["unreadable", "accepted"]
+    assert [r.status for r in strategy.parse_presets().records] == [
+        "unreadable",
+        "accepted",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("entry", "name"),
+    [
+        ({"name": "x" * 65, "params": GOOD}, None),
+        ({"name": "   ", "params": GOOD}, None),
+        ({"name": 5, "params": GOOD}, None),
+        ({"name": " NoParams ", "params": None}, "NoParams"),
+    ],
+)
+def test_an_error_names_only_a_name_that_passed_the_envelope(
+    entry: Any, name: str | None
+) -> None:
+    """R81: ``name|null`` — an empty or overlong name is ``null``, not ``""``."""
+    strategy = with_presets([entry])
+    assert strategy.parse_presets().errors == [
+        {"index": 0, "name": name, "type": "unreadable"}
+    ]
 
 
 def test_a_64_character_name_is_fine_and_trimmed() -> None:
@@ -858,6 +884,7 @@ def test_a_64_character_name_is_fine_and_trimmed() -> None:
     [
         {"name": "fast", "params": GOOD},  # same identity, both valid
         {"name": " FAST ", "params": {**GOOD, "window": 3}},  # accepted + rejected
+        {"name": "FAST", "params": None},  # accepted + unreadable (R81)
     ],
 )
 def test_a_repeated_identity_rejects_the_whole_group(second: Any) -> None:
@@ -868,7 +895,7 @@ def test_a_repeated_identity_rejects_the_whole_group(second: Any) -> None:
             {"name": "Default", "params": GOOD},
         ]
     )
-    assert [r.status for r in strategy.presets.records] == [
+    assert [r.status for r in strategy.parse_presets().records] == [
         "duplicate_name",
         "duplicate_name",
         "accepted",
@@ -883,7 +910,58 @@ def test_a_preset_with_an_old_parameter_name_is_translated() -> None:
     entry["presets"] = [{"name": "Old", "params": {**params, "size": 10}}]
     strategy = compile_catalog(document).strategy("unit_strategy")
     assert strategy is not None
-    assert [r.params for r in strategy.presets.accepted] == [GOOD]
+    assert [r.params for r in strategy.parse_presets().accepted] == [GOOD]
+
+
+def test_a_preset_with_an_old_and_a_new_name_that_disagree_is_rejected() -> None:
+    document = with_properties()
+    entry = document["strategies"][0]
+    entry["legacy_keys"] = {"size": "window"}
+    entry["presets"] = [
+        {"name": "Both", "params": {**GOOD, "size": 9}},
+        {"name": "Good", "params": GOOD},
+    ]
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    records = strategy.parse_presets().records
+    assert [(r.name, r.status) for r in records] == [
+        ("Both", "rejected"),
+        ("Good", "accepted"),
+    ]
+    assert [e["type"] for e in records[0].reasons] == ["legacy_conflict"]
+
+
+def test_a_rule_that_cannot_be_evaluated_rejects_the_preset_only() -> None:
+    """A catalog defect shows on Start; the preset is rejected, not fatal."""
+    document = with_properties()
+    entry = document["strategies"][0]
+    entry["constraints"] = [
+        rule(lhs={"field": "interval"}, message="interval is not a number")
+    ]
+    entry["presets"] = [{"name": "Good", "params": GOOD}]
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    (record,) = strategy.parse_presets().records
+    assert record.status == "rejected"
+    assert [e["type"] for e in record.reasons] == ["catalog_error"]
+
+
+def test_compiling_does_not_parse_presets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R82: parsing is the sync's, after its idempotency check, not a Start's."""
+    from app.core import strategy_catalog
+
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        strategy_catalog.CompiledStrategy,
+        "_presets_from",
+        lambda self, raw: calls.append(raw) or strategy_catalog.PresetsParse("list"),
+    )
+    strategy = with_presets([{"name": "Good", "params": GOOD}])
+    assert strategy.validate({}) == []
+    assert calls == []
+    strategy.parse_presets()
+    strategy.parse_presets()
+    assert len(calls) == 2  # not cached either
 
 
 def test_an_unexpected_parse_failure_is_isolated(
@@ -896,5 +974,5 @@ def test_an_unexpected_parse_failure_is_isolated(
 
     monkeypatch.setattr(strategy_catalog.CompiledStrategy, "_preset_record", boom)
     strategy = with_presets([{"name": "Good", "params": GOOD}])
-    assert strategy.presets.form == "malformed"
+    assert strategy.parse_presets().form == "malformed"
     assert strategy.validate({}) == []

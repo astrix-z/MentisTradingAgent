@@ -155,9 +155,10 @@ def test_an_old_ui_payload_is_refused_with_a_reload_hint() -> None:
 def test_backend_accepts_the_agents_builtin_presets() -> None:
     """PRESET-04: Default and Fast arrive whole and pass the backend pipeline."""
     presets = agent_presets.BUILTIN_PRESETS
-    assert STRATEGY.presets.form == "list"
-    assert not STRATEGY.presets.has_errors
-    assert {r.name: r.params for r in STRATEGY.presets.accepted} == presets
+    parsed = STRATEGY.parse_presets()
+    assert parsed.form == "list"
+    assert not parsed.has_errors
+    assert {r.name: r.params for r in parsed.accepted} == presets
 
 
 def test_backend_reports_the_agents_own_message() -> None:

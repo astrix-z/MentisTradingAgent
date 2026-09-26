@@ -250,6 +250,8 @@ def test_builtin_presets_are_full_valid_snapshots() -> None:
         ({"P": {"thing": 1, "fixed": "x"}}, "exactly the non-const parameters"),
         ({"P": {"thing": 0}}, "invalid"),
         ({"P": {"thing": 1}, " p ": {"thing": 2}}, "unique"),
+        ({"   ": {"thing": 1}}, "1-64 characters"),
+        ({"x" * 65: {"thing": 1}}, "1-64 characters"),  # R81: backend's envelope
     ],
 )
 def test_a_bad_builtin_preset_fails_at_publish_time(

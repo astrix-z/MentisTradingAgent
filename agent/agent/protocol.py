@@ -338,6 +338,10 @@ def describe_strategy(name: str, cls: type[Strategy]) -> dict[str, Any]:
     return entry
 
 
+#: Same rule as the backend's preset envelope and API (plan §4.2, §4.3.4).
+PRESET_NAME_MAX = 64
+
+
 def _presets(
     cls: type[Strategy], model: type[Any], schema: dict[str, Any], *, where: str
 ) -> list[dict[str, Any]]:
@@ -354,9 +358,13 @@ def _presets(
     seen: set[str] = set()
     for name, params in cls.settings_presets.items():
         label = f"{where} preset {name!r}"
+        # The backend's envelope (plan §4.2): a string of 1–64 characters after
+        # trim. Anything else it would mark unreadable for good.
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= PRESET_NAME_MAX:
+            raise CatalogError(f"{label}: name must be 1-{PRESET_NAME_MAX} characters")
         identity = name.strip().lower()
-        if not identity or identity in seen:
-            raise CatalogError(f"{label}: names must be non-empty and unique")
+        if identity in seen:
+            raise CatalogError(f"{label}: names must be unique")
         seen.add(identity)
         keys = set(params)
         if keys != editable:

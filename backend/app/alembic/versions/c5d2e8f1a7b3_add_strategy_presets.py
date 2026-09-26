@@ -2,7 +2,9 @@
 
 Tables of docs/STRATEGY_PRESETS_PLAN.md §4.3.1 (PRESET-05a). Needs neither the
 agent nor Redis: it creates the tables and seeds the T2 option lists for
-tripple_screen. downgrade drops everything it created (rollback runbook,
+tripple_screen. Every column the sync or the API may leave out has a server
+default, so raw SQL (the built-in sync's INSERT ... ON CONFLICT, §4.3.2) needs
+no service columns. downgrade drops everything it created (rollback runbook,
 PRESET-09a).
 
 Revision ID: c5d2e8f1a7b3
@@ -35,15 +37,32 @@ STRATEGY = "tripple_screen"
 def upgrade():
     op.create_table(
         "strategy_preset",
-        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column(
+            "id",
+            postgresql.UUID(as_uuid=True),
+            server_default=sa.text("gen_random_uuid()"),
+            nullable=False,
+        ),
         sa.Column("strategy", sa.String(length=64), nullable=False),
         sa.Column("name", sa.String(length=64), nullable=False),
         sa.Column("params", postgresql.JSONB(), nullable=False),
-        sa.Column("is_builtin", sa.Boolean(), nullable=False),
+        sa.Column(
+            "is_builtin", sa.Boolean(), server_default=sa.false(), nullable=False
+        ),
         sa.Column("retired_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_by", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
         sa.ForeignKeyConstraint(["created_by"], ["user.id"], ondelete="SET NULL"),
         sa.PrimaryKeyConstraint("id"),
     )
@@ -58,7 +77,12 @@ def upgrade():
         sa.Column("strategy", sa.String(length=64), nullable=False),
         sa.Column("field", sa.String(length=64), nullable=False),
         sa.Column("options", postgresql.JSONB(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
         sa.PrimaryKeyConstraint("strategy", "field"),
     )
     op.create_table(

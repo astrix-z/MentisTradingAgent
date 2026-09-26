@@ -539,7 +539,8 @@ class PresetRecord:
     """One entry of a strategy's published ``presets`` list, as parsed."""
 
     index: int
-    #: Trimmed name, or ``None`` when the entry has no string name.
+    #: Trimmed name, or ``None`` when it fails the envelope (not a string,
+    #: or not 1–64 characters after trim).
     name: str | None
     status: PresetStatus
     #: Params after ``legacy_keys`` translation; ``None`` if unreadable.
@@ -641,14 +642,17 @@ class CompiledStrategy:
                 f"{', '.join(self._interval_fields)} need an intervals_ms lookup"
             )
         self._check_defaults()
-        self.presets = self._parse_presets(entry.get("presets"))
+        self._raw_presets: Any = entry.get("presets")
 
-    def _parse_presets(self, raw: Any) -> PresetsParse:
+    def parse_presets(self) -> PresetsParse:
         """Parse ``presets`` in isolation: a defect there never fails the catalog.
 
-        Everything that goes wrong is logged and turned into a record status;
-        Start validation and the rest of the catalog are unaffected.
+        Not part of compiling and not cached with it (plan §4.3.2): only the
+        built-in sync calls this, after its idempotency check, so a Start and a
+        sync ``noop`` never pay for it. Everything that goes wrong is logged
+        and turned into a record status.
         """
+        raw = self._raw_presets
         try:
             parsed = self._presets_from(raw)
         except Exception:  # isolation is the contract: log, never raise
@@ -668,11 +672,13 @@ class CompiledStrategy:
         if not isinstance(raw, list):
             return PresetsParse(form="malformed")
         records = [self._preset_record(index, entry) for index, entry in enumerate(raw)]
-        # One identity more than once rejects the whole group, accepted or not:
-        # none of them may overwrite the stored row (plan §4.2).
+        # One identity more than once rejects the whole group, whatever each
+        # member's status: none of them may overwrite the stored row (plan
+        # §4.2). A name that passed the envelope counts even when its params
+        # are unreadable: a broken twin is an agent defect, not a winner.
         counts: dict[str, int] = {}
         for record in records:
-            if record.status != "unreadable" and record.name is not None:
+            if record.name is not None:
                 identity = record.name.lower()
                 counts[identity] = counts.get(identity, 0) + 1
         return PresetsParse(
@@ -685,9 +691,7 @@ class CompiledStrategy:
                     params=record.params,
                     reasons=record.reasons,
                 )
-                if record.status != "unreadable"
-                and record.name is not None
-                and counts[record.name.lower()] > 1
+                if record.name is not None and counts[record.name.lower()] > 1
                 else record
                 for record in records
             ],
@@ -699,12 +703,10 @@ class CompiledStrategy:
             return PresetRecord(index=index, name=None, status="unreadable")
         raw_name = entry.get("name")
         name = raw_name.strip() if isinstance(raw_name, str) else None
+        if name is not None and not 1 <= len(name) <= PRESET_NAME_MAX:
+            name = None  # reported as null: only a valid name is an identity
         params = entry.get("params")
-        if (
-            name is None
-            or not 1 <= len(name) <= PRESET_NAME_MAX
-            or not isinstance(params, dict)
-        ):
+        if name is None or not isinstance(params, dict):
             return PresetRecord(index=index, name=name, status="unreadable")
         moved, reasons = self.apply_legacy_keys(params)
         editable = self.editable_fields()
