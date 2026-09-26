@@ -15,7 +15,6 @@ from contextlib import contextmanager
 from typing import Any
 
 import pytest
-import redis as redis_lib
 from fastapi.concurrency import run_in_threadpool
 from redis.exceptions import RedisError
 from sqlalchemy import text
@@ -24,7 +23,11 @@ from sqlmodel import Session, col, delete, select
 from app.core import builtin_presets, strategy_catalog
 from app.core.builtin_presets import SyncOutcome, sync_builtin_presets
 from app.core.db import engine
-from app.core.redis_client import SYNC_REDIS_TIMEOUT_S, get_sync_redis
+from app.core.redis_client import (
+    SYNC_REDIS_TIMEOUT_S,
+    get_sync_redis,
+    make_sync_redis,
+)
 from app.models import StrategyBuiltinSync, StrategyPreset
 
 STRATEGY = "sync_test_strategy"
@@ -502,21 +505,29 @@ def test_the_blocking_client_bounds_every_read() -> None:
 
 
 def test_a_hung_redis_releases_the_lock_after_the_timeout() -> None:
-    """A real client against a server that accepts and never answers."""
+    """The production client against a server that accepts and never answers:
+    the sync fails within one timeout (no retries), and a worker waiting for
+    the lock meanwhile gets it right after and syncs (R95)."""
+    timeout = 0.5
     with socket.socket() as server:
         server.bind(("127.0.0.1", 0))
         server.listen()
-        port = server.getsockname()[1]
-        hung = redis_lib.Redis(
-            port=port, socket_timeout=0.3, socket_connect_timeout=0.3
-        )
+        hung = make_sync_redis(f"redis://127.0.0.1:{server.getsockname()[1]}", timeout)
+        waiter: list[SyncOutcome] = []
+
+        def wait_then_sync() -> None:
+            time.sleep(0.1)  # arrive while the first one holds the lock
+            waiter.append(sync(FakeRedis(document(BOTH))))
+
+        second = threading.Thread(target=wait_then_sync)
         started = time.monotonic()
+        second.start()
         with Session(engine) as session:
             assert sync_builtin_presets(session, hung, STRATEGY).result == "failed"
-        assert time.monotonic() - started < 5
+        assert time.monotonic() - started < 2 * timeout
+        second.join(timeout=30)
         hung.close()
-    assert state() is None  # rolled back: the lock is free
-    assert sync(FakeRedis(document(BOTH))).result == "applied"
+    assert [o.result for o in waiter] == ["applied"]  # waited under the lock
 
 
 def test_a_held_lock_is_waited_for_only_up_to_the_lock_timeout(

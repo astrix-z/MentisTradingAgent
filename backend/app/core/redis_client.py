@@ -46,14 +46,23 @@ def get_sync_redis() -> redis.Redis:
     """
     global _sync_client
     if _sync_client is None:
-        _sync_client = redis.Redis.from_url(
-            str(settings.REDIS_URL),
-            encoding="utf-8",
-            decode_responses=True,
-            socket_timeout=SYNC_REDIS_TIMEOUT_S,
-            socket_connect_timeout=SYNC_REDIS_TIMEOUT_S,
-        )
+        _sync_client = make_sync_redis(str(settings.REDIS_URL), SYNC_REDIS_TIMEOUT_S)
     return _sync_client
+
+
+def make_sync_redis(url: str, timeout: float) -> redis.Redis:
+    """A blocking client whose connect and every read give up after ``timeout``.
+
+    The one place the blocking client is built, so a test of its behaviour
+    (a hung server, R95) runs the production configuration.
+    """
+    return redis.Redis.from_url(
+        url,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_timeout=timeout,
+        socket_connect_timeout=timeout,
+    )
 
 
 async def close_redis() -> None:
