@@ -184,6 +184,36 @@ def test_field_level_rules_survive_the_round_trip() -> None:
     assert props["ema_tide_periods"]["title"] == "EMA tide periods"
 
 
+def test_renamed_parameters_are_published_as_legacy_keys() -> None:
+    """The schema has only the new names; the map lets old ones be explained."""
+    props = PARAMS_ENTRY["settings_schema"]["properties"]
+    assert PARAMS_ENTRY["legacy_keys"] == {
+        "swing_low_h1_n": "swing_low_wave_n",
+        "trail_m15_n": "trail_ripple_n",
+    }
+    assert props["swing_low_wave_n"]["title"] == "Swing low WAVE N"
+    assert props["trail_ripple_n"]["title"] == "Trail RIPPLE N"
+    assert not {"swing_low_h1_n", "trail_m15_n"} & set(props)
+
+
+@pytest.mark.parametrize(
+    "legacy_keys",
+    [
+        {"gone": "missing"},  # the new name must be a published parameter
+        {"thing": "thing"},  # the old name must not be one any more
+    ],
+)
+def test_a_bad_legacy_map_fails_at_publish_time(legacy_keys: dict[str, str]) -> None:
+    class _Settings(BaseModel):
+        thing: int = 1
+
+    with pytest.raises(CatalogError, match="must map a retired name"):
+        describe_strategy(
+            "dummy",
+            _dummy(settings_model=_Settings, settings_legacy_keys=legacy_keys),
+        )
+
+
 def test_no_constraints_when_a_strategy_has_no_settings() -> None:
     class _Bare(Strategy):
         async def on_start(self, services: StrategyServices) -> None: ...
@@ -193,6 +223,7 @@ def test_no_constraints_when_a_strategy_has_no_settings() -> None:
     entry = describe_strategy("bare", _Bare)
     assert entry["settings_schema"] is None
     assert entry["constraints"] == []
+    assert entry["legacy_keys"] == {}
     assert entry["label"] == "bare"
 
 
@@ -248,7 +279,7 @@ def test_published_rules_reject_what_the_model_rejects(params: dict[str, Any]) -
 def test_kline_window_message_reports_the_real_minimum() -> None:
     """The message is UI copy, so it must carry the number the model computed."""
     assert reference_check({"kline_window": 10}) == ["kline_window must be at least 35"]
-    assert reference_check({"kline_window": 10, "swing_low_h1_n": 80}) == [
+    assert reference_check({"kline_window": 10, "swing_low_wave_n": 80}) == [
         "kline_window must be at least 80"
     ]
 

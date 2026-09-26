@@ -54,6 +54,7 @@ def catalog_payload() -> dict[str, Any]:
                 "name": "tripple_screen",
                 "label": "Triple Screen",
                 "description": "Test strategy.",
+                "legacy_keys": {"take_profit_pct": "tp_pct"},
                 "settings_schema": {
                     "type": "object",
                     "additionalProperties": False,
@@ -634,6 +635,24 @@ def test_cross_field_rejection_carries_the_published_message(
     assert not redis.publications
 
 
+def test_a_renamed_parameter_is_refused_with_a_reload_hint(
+    client: TestClient,
+    redis: MemoryRedis,
+) -> None:
+    """An open tab from before a rename still sends the old name (plan G2)."""
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "params": {"take_profit_pct": 12, "tp_pct": 12}},
+        headers=headers(client),
+    )
+    assert response.status_code == 422
+    assert [error["msg"] for error in response.json()["detail"]] == [
+        "parameter 'take_profit_pct' was renamed to 'tp_pct'; reload the page"
+    ]
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
 def test_start_is_refused_when_no_catalog_is_published(
     client: TestClient,
     redis: MemoryRedis,
@@ -689,6 +708,7 @@ def test_strategies_endpoint_serves_the_published_catalog(
         "Take profit %"
     )
     assert len(entry["constraints"]) == 3
+    assert entry["legacy_keys"] == {"take_profit_pct": "tp_pct"}
 
 
 def test_strategies_endpoint_reports_a_missing_agent_without_erroring(

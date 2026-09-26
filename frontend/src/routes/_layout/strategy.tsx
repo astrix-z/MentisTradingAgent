@@ -122,7 +122,6 @@ function Strategy() {
 
   const [dirty, setDirty] = useState(false)
   const [strategy, setStrategy] = useState("")
-  const [savedParams, setSavedParams] = useState<Record<string, unknown>>({})
 
   const strategies = catalog?.strategies
   const activeStrategy = useMemo(() => {
@@ -145,11 +144,12 @@ function Strategy() {
   useEffect(() => {
     if (dirty || !status || fields.length === 0) return
     const snapshot = status.desired
-    setValues(seedFormValues(fields, snapshot.params))
+    setValues(
+      seedFormValues(fields, snapshot.params, activeStrategy?.legacy_keys),
+    )
     setNetwork(snapshot.network ?? "testnet")
     setStrategy(snapshot.strategy ?? "")
-    setSavedParams(snapshot.params ?? {})
-  }, [status, fields, dirty])
+  }, [status, fields, dirty, activeStrategy])
 
   // The symbols a Start carries are the ones marked on the Working Symbols
   // page: the agent owns that list, validates it against the exchange and
@@ -272,7 +272,6 @@ function Strategy() {
       values,
       lookups: catalog?.lookups ?? {},
       constraints: activeStrategy.constraints ?? [],
-      savedParams,
     })
     if (!result.ok) {
       setFieldErrors(result.fieldErrors)

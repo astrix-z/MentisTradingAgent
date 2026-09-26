@@ -1,0 +1,1289 @@
+{
+  "$comment": "Граничные случаи валидации params, общие для агента, backend и UI (docs/STRATEGY_PRESETS_PLAN.md §6). Раннеры: agent/tests/test_validation_edge_cases.py, backend/tests/test_validation_edge_cases.py; UI — PRESET-07.",
+  "baseline": {
+    "catalog": "frontend/tests/fixtures/strategy-catalog.json",
+    "options": {
+      "quote_asset": [
+        "USDT",
+        "USDC"
+      ],
+      "tide_interval": [
+        "1w",
+        "1d",
+        "12h",
+        "6h",
+        "4h",
+        "2h",
+        "1h",
+        "30m",
+        "15m"
+      ],
+      "wave_interval": [
+        "1d",
+        "12h",
+        "6h",
+        "4h",
+        "2h",
+        "1h",
+        "30m",
+        "15m",
+        "5m"
+      ],
+      "ripple_interval": [
+        "12h",
+        "6h",
+        "4h",
+        "2h",
+        "1h",
+        "30m",
+        "15m",
+        "5m",
+        "1m"
+      ]
+    },
+    "params": {
+      "quote_asset": "USDT",
+      "tide_interval": "4h",
+      "wave_interval": "1h",
+      "ripple_interval": "15m",
+      "ema_tide_periods": [
+        5,
+        13,
+        34
+      ],
+      "stochastic_k_period": 5,
+      "stochastic_d_period": 3,
+      "stochastic_slow_period": 3,
+      "fi_ema_period": 2,
+      "oversold_threshold": "20",
+      "swing_low_wave_n": 2,
+      "trail_ripple_n": 2,
+      "stop_buffer_pct": "0.1",
+      "min_stop_distance_pct": "1",
+      "tp_pct": "10",
+      "trail_cap_pct": "4",
+      "max_hold_hours": "8",
+      "cooldown_minutes": 60,
+      "signal_validity_minutes": 15,
+      "rest_concurrency": 3,
+      "ws_top_n": 30,
+      "kline_window": 1000
+    },
+    "symbols": [
+      "BTCUSDT"
+    ],
+    "network": "testnet"
+  },
+  "error_map": {
+    "agent": {
+      "types": {
+        "greater_than": "bound",
+        "greater_than_equal": "bound",
+        "less_than": "bound",
+        "less_than_equal": "bound",
+        "int_type": "type",
+        "int_parsing": "type",
+        "int_from_float": "type",
+        "decimal_type": "type",
+        "decimal_parsing": "type",
+        "finite_number": "type",
+        "too_short": "type",
+        "too_long": "type",
+        "tuple_type": "type",
+        "literal_error": "unsupported",
+        "missing": "type"
+      },
+      "messages": [
+        {
+          "pattern": "renamed to .* disagree",
+          "category": "legacy_conflict"
+        },
+        {
+          "pattern": "interval .* is not supported",
+          "category": "unsupported"
+        },
+        {
+          "pattern": "EMA periods must|timeframes must|trailing stop cap|kline_window must be at least",
+          "category": "constraint"
+        }
+      ]
+    },
+    "backend": {
+      "types": {
+        "greater_than": "bound",
+        "greater_than_equal": "bound",
+        "less_than": "bound",
+        "less_than_equal": "bound",
+        "int_type": "type",
+        "int_parsing": "type",
+        "int_from_float": "type",
+        "float_type": "type",
+        "float_parsing": "type",
+        "decimal_type": "type",
+        "decimal_parsing": "type",
+        "finite_number": "type",
+        "too_short": "type",
+        "too_long": "type",
+        "list_type": "type",
+        "json_invalid": "invalid_json"
+      },
+      "messages": [
+        {
+          "pattern": "^unknown parameter|was renamed to",
+          "category": "unknown_param"
+        },
+        {
+          "pattern": "EMA tide periods must|timeframes must|trailing stop cap|kline_window must be at least",
+          "category": "constraint"
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "baseline-default",
+      "note": "Default как есть: все слои принимают",
+      "ui_draft": {},
+      "params_patch": {},
+      "params_raw": null,
+      "expected_sent": {},
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": {
+          "result": "ok"
+        },
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "empty-params",
+      "note": "{} — все поля по дефолтам агента",
+      "ui_draft": null,
+      "params_patch": null,
+      "params_raw": "{}",
+      "expected_sent": null,
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "int-zero",
+      "note": "0 в поле PositiveInt",
+      "ui_draft": {
+        "stochastic_k_period": "0"
+      },
+      "params_patch": {
+        "stochastic_k_period": 0
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "int-negative",
+      "note": "-1 в поле PositiveInt",
+      "ui_draft": {
+        "fi_ema_period": "-1"
+      },
+      "params_patch": {
+        "fi_ema_period": -1
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "ema-two-items",
+      "note": "EMA из двух элементов",
+      "ui_draft": {
+        "ema_tide_periods": "5, 13"
+      },
+      "params_patch": {
+        "ema_tide_periods": [
+          5,
+          13
+        ]
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "ema-four-items",
+      "note": "EMA из четырёх элементов",
+      "ui_draft": {
+        "ema_tide_periods": "5, 13, 34, 55"
+      },
+      "params_patch": {
+        "ema_tide_periods": [
+          5,
+          13,
+          34,
+          55
+        ]
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "ema-not-increasing",
+      "note": "EMA [5, 5, 13]: правило a < b < c",
+      "ui_draft": {
+        "ema_tide_periods": "5, 5, 13"
+      },
+      "params_patch": {
+        "ema_tide_periods": [
+          5,
+          5,
+          13
+        ]
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "trail-cap-at-tp",
+      "note": "trail_cap_pct == tp_pct: правило cap < tp",
+      "ui_draft": {
+        "trail_cap_pct": "10"
+      },
+      "params_patch": {
+        "trail_cap_pct": "10"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "kline-window-short",
+      "note": "kline_window ниже требуемой истории",
+      "ui_draft": {
+        "kline_window": "10"
+      },
+      "params_patch": {
+        "kline_window": 10
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "future-param",
+      "note": "Неизвестный ключ",
+      "ui_draft": null,
+      "params_patch": {
+        "future_param": 42
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "extras: the agent ignores unknown keys (a command may carry shared keys), the backend rejects them in a Start"
+    },
+    {
+      "id": "legacy-old-only",
+      "note": "Только старые имена: значения переносятся",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_wave_n": {
+          "$delete": true
+        },
+        "trail_ripple_n": {
+          "$delete": true
+        },
+        "swing_low_h1_n": 7,
+        "trail_m15_n": 9
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "swing_low_wave_n": 7,
+        "trail_ripple_n": 9
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-old-zero",
+      "note": "Только старое имя со значением 0: ошибка, не дефолт",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_wave_n": {
+          "$delete": true
+        },
+        "swing_low_h1_n": 0
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-both-equal",
+      "note": "Оба имени, 7 и 7: берётся новое",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": 7,
+        "swing_low_wave_n": 7
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "swing_low_wave_n": 7
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-both-zero",
+      "note": "Оба имени, 0 и 0: ошибка поля",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": 0,
+        "swing_low_wave_n": 0
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            },
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            },
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            },
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-conflict",
+      "note": "Оба имени, 7 и 9: конфликт",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": 7,
+        "swing_low_wave_n": 9
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-string-equals-int",
+      "note": "Оба имени, \"7\" и 7: равны после валидации",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": "7",
+        "swing_low_wave_n": 7
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "swing_low_wave_n": 7
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "old-js-payload",
+      "note": "Старая вкладка: старые 7/9 из savedParams и новые 2/2",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": 7,
+        "trail_m15_n": 9,
+        "swing_low_wave_n": 2,
+        "trail_ripple_n": 2
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    }
+  ]
+}

@@ -45,7 +45,18 @@ strategies/tripple_screen/strategy.py`, метод `_screen_universe`) была
 - **Cutoff при некратных ТФ** зафиксирован явно (§5): волна — последний бар,
   закрытый к **открытию** триггерной ряби, а не к моменту решения.
 
-Секции ниже отражают версию v1.3.
+### Ревизия v1.4 (2026-09-26, T2a)
+
+Имена параметров (`docs/STRATEGY_PRESETS_PLAN.md` §4.1.1, §4.6):
+
+- `swing_low_h1_n` → **`swing_low_wave_n`**, `trail_m15_n` → **`trail_ripple_n`**:
+  окна считаются по wave- и ripple-ТФ, а не по фиксированным H1/M15.
+- Старые имена агент принимает и переносит (снапшот `desired`, очередь команд).
+  Если заданы оба имени, значения должны совпасть после валидации. Карта
+  `legacy_keys` публикуется в каталоге. Backend отвечает `422` на старое имя в
+  новом Start с подсказкой перезагрузить страницу.
+
+Секции ниже отражают версию v1.4.
 
 Документ описывает точный алгоритм стратегии для исполнителя. Разделы 1–8
 разделы 9–13 —
@@ -301,7 +312,7 @@ entry-evaluation, управляется независимо (pause entry не 
 ```
 swing_low_ref = min(low(H1)[i], i = 1..N) × 0.999
     где i пробегает последние N закрытых H1-баров с close_time ≤ open_time
-    триггерного M15; N = swing_low_h1_n (конфиг, default 2)
+    триггерного M15; N = swing_low_wave_n (конфиг, default 2)
 
 stop_price = min(swing_low_ref, fill_price × 0.99)
 ```
@@ -317,7 +328,7 @@ stop_price = min(swing_low_ref, fill_price × 0.99)
 
 - Включается сразу после fill.
 - На каждом закрытии M15: `trail_candidate = min(low(M15)[i], i = 1..N) × 0.999`,
-  `N = trail_m15_n` (конфиг, default 2), буфер 0.1%.
+  `N = trail_ripple_n` (конфиг, default 2), буфер 0.1%.
 - Ratchet: `new_stop = min(max(current_stop, trail_candidate), fill_price × (1 + trail_cap_pct))`
   — перенос **только вверх** (уменьшение убытка / рост защищённой прибыли),
   но не выше потолка `fill × 1.04` (`trail_cap_pct`, default 4%). Достигнув
@@ -407,8 +418,8 @@ evaluation event не создаёт duplicate signal (`STRATEGY-03`).
 | `stochastic` | `%K=5, %D=SMA3, Slow=SMA3` | Slow%D — только provenance |
 | `fi_ema_period` | `2` | по H1 (close × base volume) |
 | `oversold_threshold` | `20` | зона oversold Э2 |
-| `swing_low_h1_n` | `2` | окно initial stop |
-| `trail_m15_n` | `2` | окно трейлинга |
+| `swing_low_wave_n` | `2` | окно initial stop (до v1.4 — `swing_low_h1_n`) |
+| `trail_ripple_n` | `2` | окно трейлинга (до v1.4 — `trail_m15_n`) |
 | `trail_cap_pct` | `4%` | потолок трейлинга: stop ≤ `fill × 1.04` (v1.2) |
 | `max_hold_hours` | `8` | выход по рынку через 8 ч после fill, `exit_reason=time` (v1.2) |
 | `stop_buffer_pct` | `0.1%` | `×0.999` к swing low (initial и trailing) |

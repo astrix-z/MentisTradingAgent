@@ -419,3 +419,31 @@ def test_error_context_keeps_plain_values() -> None:
     errors = json_safe_errors(caught.value)
     assert errors[0]["ctx"]["gt"] == 0
     assert json.dumps(errors)
+
+
+@pytest.mark.parametrize(
+    "legacy_keys",
+    [None, [], "old", {"old": 1}, {"": "window"}, {"old": ""}],
+)
+def test_malformed_legacy_keys_are_dropped_not_fatal(legacy_keys: Any) -> None:
+    """Optional metadata: a bad map must not take Start validation down."""
+    document = payload()
+    if legacy_keys is not None:
+        document["strategies"][0]["legacy_keys"] = legacy_keys
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    assert strategy.legacy_keys == {}
+    assert strategy.validate({"window": 5}) == []
+
+
+def test_a_renamed_parameter_names_its_new_name() -> None:
+    document = payload()
+    document["strategies"][0]["legacy_keys"] = {"size": "window"}
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    assert strategy.legacy_keys == {"size": "window"}
+    assert [error["msg"] for error in strategy.validate({"size": 5})] == [
+        "parameter 'size' was renamed to 'window'; reload the page"
+    ]
+    # Other extras keep the generic message.
+    assert "unknown parameter" in strategy.validate({"other": 5})[0]["msg"]

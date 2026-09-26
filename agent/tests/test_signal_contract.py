@@ -139,7 +139,7 @@ def test_strategy_entry_carries_the_policy_of_its_settings() -> None:
     assert policy.trail_cap_pct == Decimal(3)
     assert policy.max_hold_hours == Decimal("0.5")
     assert policy.trail_interval == settings.ripple_interval
-    assert policy.trail_n == settings.trail_m15_n
+    assert policy.trail_n == settings.trail_ripple_n
     assert policy.cooldown_minutes == settings.cooldown_minutes
     transported = signal.transport()["exit_policy"]
     assert transported["max_hold_hours"] == "0.5"

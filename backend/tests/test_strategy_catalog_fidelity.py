@@ -131,6 +131,26 @@ def test_backend_is_stricter_about_undeclared_parameters() -> None:
     assert "unknown parameter" in errors[0]["msg"]
 
 
+def test_backend_carries_the_agents_legacy_keys() -> None:
+    """The UI reads old names from saved params through this map."""
+    assert STRATEGY.legacy_keys == agent_settings.LEGACY_KEYS
+    assert STRATEGY.legacy_keys
+
+
+def test_an_old_ui_payload_is_refused_with_a_reload_hint() -> None:
+    """Old JS merges old names from ``desired`` into a Start (plan G2)."""
+    params = {
+        "swing_low_h1_n": 7,
+        "trail_m15_n": 9,
+        "swing_low_wave_n": 2,
+        "trail_ripple_n": 2,
+    }
+    assert sorted(error["msg"] for error in STRATEGY.validate(params)) == [
+        "parameter 'swing_low_h1_n' was renamed to 'swing_low_wave_n'; reload the page",
+        "parameter 'trail_m15_n' was renamed to 'trail_ripple_n'; reload the page",
+    ]
+
+
 def test_backend_reports_the_agents_own_message() -> None:
     """The UI shows rule text, so the two services must agree on it verbatim."""
     messages = {

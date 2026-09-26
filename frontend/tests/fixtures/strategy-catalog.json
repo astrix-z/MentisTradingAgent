@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "schema_hash": "c8984cc8c17b6e151ea7dc092895b482c34d89d9344adfb489de95bb4f294cc5",
-  "published_at": "2026-09-25T17:07:21.234123+00:00",
+  "schema_hash": "483dcede3234b99c61c076b180d42e385b288c3a27f9d981aa2cefe1980e6ee5",
+  "published_at": "2026-09-26T03:49:45.453681+00:00",
   "lookups": {
     "intervals_ms": {
       "1s": 1000,
@@ -172,16 +172,16 @@
             "default": "20",
             "title": "Oversold threshold"
           },
-          "swing_low_h1_n": {
+          "swing_low_wave_n": {
             "default": 2,
             "exclusiveMinimum": 0,
-            "title": "Swing low H1 N",
+            "title": "Swing low WAVE N",
             "type": "integer"
           },
-          "trail_m15_n": {
+          "trail_ripple_n": {
             "default": 2,
             "exclusiveMinimum": 0,
-            "title": "Trail M15 N",
+            "title": "Trail RIPPLE N",
             "type": "integer"
           },
           "stop_buffer_pct": {
@@ -436,10 +436,10 @@
                 ]
               },
               {
-                "field": "swing_low_h1_n"
+                "field": "swing_low_wave_n"
               },
               {
-                "field": "trail_m15_n"
+                "field": "trail_ripple_n"
               },
               {
                 "const": 2
@@ -448,7 +448,11 @@
           },
           "message": "kline_window must be at least {rhs}"
         }
-      ]
+      ],
+      "legacy_keys": {
+        "swing_low_h1_n": "swing_low_wave_n",
+        "trail_m15_n": "trail_ripple_n"
+      }
     }
   ],
   "execution": {

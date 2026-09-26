@@ -522,7 +522,8 @@ export type StrategyCatalog = {
  * the cross-field rules it cannot express (see ``agent/agent/protocol.py``
  * for the grammar). Both are served verbatim: the backend compiles them to
  * validate a Start, the UI renders a form from them, and neither restates
- * them.
+ * them. ``legacy_keys`` lets the UI read saved params that still use a
+ * renamed parameter's old name.
  */
 export type StrategyDescription = {
     /**
@@ -549,6 +550,14 @@ export type StrategyDescription = {
     constraints?: Array<{
         [key: string]: unknown;
     }>;
+    /**
+     * Legacy Keys
+     *
+     * Renamed parameters, old name -> new name.
+     */
+    legacy_keys?: {
+        [key: string]: string;
+    };
 };
 
 /**

@@ -200,15 +200,25 @@ export function initialFormValues(fields: StrategyField[]): FieldValues {
   return values
 }
 
-/** Overlay the agent's saved desired params on top of the schema defaults. */
+/**
+ * Overlay the agent's saved desired params on top of the schema defaults.
+ * `legacyKeys` (old name -> new name, from the catalog) reads a value saved
+ * under a renamed parameter's old name; the new name wins if both are saved.
+ */
 export function seedFormValues(
   fields: StrategyField[],
   params: Record<string, unknown> | undefined,
+  legacyKeys: Record<string, string> = {},
 ): FieldValues {
   const values = initialFormValues(fields)
   if (!params) return values
+  const current: Record<string, unknown> = {}
+  for (const [oldKey, newKey] of Object.entries(legacyKeys)) {
+    if (params[oldKey] !== undefined) current[newKey] = params[oldKey]
+  }
+  Object.assign(current, params)
   for (const field of fields) {
-    const raw = params[field.key]
+    const raw = current[field.key]
     if (raw === undefined || field.kind === "const") continue
     values[field.key] = formatParamValue(raw)
   }
@@ -434,17 +444,18 @@ function runConstraints(
 
 /**
  * Validate the whole draft against the field schemas and the published
- * constraints. Params are the parsed fields merged over the agent's saved
- * desired params, so unknown keys the UI does not render are preserved.
+ * constraints. Params are exactly the schema's fields (const ones included):
+ * a key the schema does not name — an old parameter name or anything else
+ * left in the saved desired params — is never sent, since the backend
+ * rejects it.
  */
 export function validateSettings(options: {
   fields: StrategyField[]
   values: FieldValues
   lookups: Lookups
   constraints: ConstraintRule[]
-  savedParams: Record<string, unknown>
 }): ValidationResult {
-  const { fields, values, lookups, constraints, savedParams } = options
+  const { fields, values, lookups, constraints } = options
   const fieldErrors: FieldErrors = {}
   const parsed: Record<string, unknown> = {}
   for (const field of fields) {
@@ -461,5 +472,5 @@ export function validateSettings(options: {
   if (constraintResult.messages.length > 0)
     return { ok: false, fieldErrors: {}, formErrors: constraintResult.messages }
 
-  return { ok: true, params: { ...savedParams, ...parsed } }
+  return { ok: true, params: parsed }
 }

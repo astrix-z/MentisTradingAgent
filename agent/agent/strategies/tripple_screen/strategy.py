@@ -32,7 +32,10 @@ from agent.strategies.tripple_screen.indicators import (
     stochastic_k_series,
 )
 from agent.strategies.tripple_screen.schema import CONSTRAINTS, LOOKUPS
-from agent.strategies.tripple_screen.settings import TripleScreenSettings
+from agent.strategies.tripple_screen.settings import (
+    LEGACY_KEYS,
+    TripleScreenSettings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,7 @@ class TripleScreenStrategy(Strategy):
     settings_model = TripleScreenSettings
     settings_constraints = CONSTRAINTS
     settings_lookups = LOOKUPS
+    settings_legacy_keys = LEGACY_KEYS
 
     def __init__(self, params: dict[str, Any]) -> None:
         super().__init__(params)
@@ -734,7 +738,7 @@ class TripleScreenStrategy(Strategy):
         epoch = f"{symbol}:{trigger.open_time}"
         cooldown = self._cooldown_until.get(symbol)
         cooling = cooldown is not None and now < cooldown
-        swing = min(c.low for c in wave_candles[-settings.swing_low_h1_n :]) * (
+        swing = min(c.low for c in wave_candles[-settings.swing_low_wave_n :]) * (
             1 - settings.stop_buffer_pct / 100
         )
         provenance = transport_value(
@@ -806,7 +810,7 @@ class TripleScreenStrategy(Strategy):
                 stop_buffer_pct=settings.stop_buffer_pct,
                 tp_pct=settings.tp_pct,
                 trail_interval=settings.ripple_interval,
-                trail_n=settings.trail_m15_n,
+                trail_n=settings.trail_ripple_n,
                 trail_cap_pct=settings.trail_cap_pct,
                 max_hold_hours=settings.max_hold_hours,
                 cooldown_minutes=settings.cooldown_minutes,

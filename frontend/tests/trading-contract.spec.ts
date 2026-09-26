@@ -26,7 +26,14 @@ function snapshot(): TradingStatus {
       network: "live",
       strategy: "tripple_screen",
       symbols: ["ETHUSDT"],
-      params: { tp_pct: 17, ema_tide_periods: [6, 14, 35], future_param: 42 },
+      // Saved before the rename (old names) and by an older agent (future_param).
+      params: {
+        tp_pct: 17,
+        ema_tide_periods: [6, 14, 35],
+        swing_low_h1_n: 7,
+        trail_m15_n: 9,
+        future_param: 42,
+      },
       updated_at: at,
       revision: 3,
     },
@@ -274,6 +281,9 @@ test("strategy seeds desired config, preserves dirty draft and reports rejected 
   await expect(page.getByLabel("Symbols", { exact: true })).toHaveCount(0)
   await expect(page.getByLabel("Take profit %")).toHaveValue("17")
   await expect(page.getByLabel("EMA tide periods")).toHaveValue("6, 14, 35")
+  // Old parameter names are read through the catalog's legacy_keys.
+  await expect(page.getByLabel("Swing low WAVE N")).toHaveValue("7")
+  await expect(page.getByLabel("Trail RIPPLE N")).toHaveValue("9")
   await expect(
     page.getByRole("button", { name: "LIVE", exact: true }),
   ).toHaveAttribute("aria-pressed", "true")
@@ -295,8 +305,12 @@ test("strategy seeds desired config, preserves dirty draft and reports rejected 
   expect(api.posts[0].body).toMatchObject({
     network: "live",
     symbols: ["ETHUSDT"],
-    params: { tp_pct: "19", future_param: 42 },
+    params: { tp_pct: "19", swing_low_wave_n: 7, trail_ripple_n: 9 },
   })
+  // Only schema fields are sent: the backend rejects anything else.
+  const sent = (api.posts[0].body as { params: Record<string, unknown> }).params
+  for (const key of ["future_param", "swing_low_h1_n", "trail_m15_n"])
+    expect(sent).not.toHaveProperty(key)
   api.results.set(firstId, {
     command_id: firstId,
     type: "start",

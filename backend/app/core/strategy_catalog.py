@@ -385,6 +385,25 @@ def _check_rule(rule: Any) -> None:
 # --- Compiled catalog -------------------------------------------------------
 
 
+def _legacy_keys(entry: dict[str, Any], name: str) -> dict[str, str]:
+    """The strategy's renamed parameters (old -> new), or ``{}``.
+
+    Optional metadata: the backend only carries it to the UI and names the new
+    parameter when it rejects an old one, so a malformed map is logged and
+    dropped rather than failing the whole catalog.
+    """
+    raw = entry.get("legacy_keys")
+    if raw is None:
+        return {}
+    if isinstance(raw, dict) and all(
+        isinstance(old, str) and old and isinstance(new, str) and new
+        for old, new in raw.items()
+    ):
+        return dict(raw)
+    logger.warning("strategy %r: ignoring malformed legacy_keys %r", name, raw)
+    return {}
+
+
 class CompiledStrategy:
     """One strategy's settings, as declared by the agent."""
 
@@ -401,6 +420,7 @@ class CompiledStrategy:
         for rule in raw_rules:
             _check_rule(rule)
         self.constraints: list[dict[str, Any]] = list(raw_rules)
+        self.legacy_keys = _legacy_keys(entry, self.name)
         self._defaults: dict[str, Any] = {
             name: prop.get("default")
             for name, prop in (
@@ -425,7 +445,7 @@ class CompiledStrategy:
         except ValidationError as exc:
             errors = json_safe_errors(exc)
             return [
-                self._unknown_params(self._extra_keys(error))
+                self._extra_param(self._extra_keys(error))
                 if error["type"] == "extra_forbidden"
                 else error
                 for error in errors
@@ -458,6 +478,20 @@ class CompiledStrategy:
     @staticmethod
     def _extra_keys(error: dict[str, Any]) -> list[str]:
         return [str(part) for part in error.get("loc", [])[-1:]]
+
+    def _extra_param(self, keys: list[str]) -> dict[str, Any]:
+        """An extra key; a renamed one says so, since only a stale UI sends it."""
+        renamed = [key for key in keys if key in self.legacy_keys]
+        if not renamed:
+            return self._unknown_params(keys)
+        return {
+            "loc": ["body", "params"],
+            "msg": (
+                f"parameter {renamed[0]!r} was renamed to "
+                f"{self.legacy_keys[renamed[0]]!r}; reload the page"
+            ),
+            "type": "value_error",
+        }
 
     def _unknown_params(self, keys: Any) -> dict[str, Any]:
         known = ", ".join(sorted(self._defaults)) or "<none>"

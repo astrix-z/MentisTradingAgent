@@ -26,7 +26,8 @@ Redis restart cannot leave the backend without it::
           "label": "Triple Screen",
           "description": "...",
           "settings_schema": {...},   # JSON Schema 2020-12 for `params`
-          "constraints": [ ... ]      # cross-field rules, see below
+          "constraints": [ ... ],     # cross-field rules, see below
+          "legacy_keys": {"<old>": "<new>"}  # renamed parameters
         }
       ]
     }
@@ -38,13 +39,17 @@ parameters even though the agent itself tolerates them when reading a command
 (``TripleScreenSettings.from_params`` filters to known keys, which is what lets
 a payload carry shared keys).
 
-Two things JSON Schema cannot express travel beside it:
+Three things JSON Schema cannot express travel beside it:
 
 * ``constraints`` — cross-field rules as a small, strategy-agnostic AST, so the
   backend and the UI enforce the *same* rule and render the *same* message
   instead of each mirroring domain logic;
 * ``lookups`` — named value tables a rule may index by field value (the
-  interval -> milliseconds map), so no consumer needs the exchange SDK.
+  interval -> milliseconds map), so no consumer needs the exchange SDK;
+* ``legacy_keys`` — renamed parameters, old name -> new name. The schema has
+  only the new names; the agent still accepts the old ones (a runtime snapshot
+  or a queued command may carry them), the backend names the new one when it
+  rejects an old one, and the UI reads old names from saved params.
 
 Constraint grammar
 ------------------
@@ -294,10 +299,13 @@ def describe_strategy(name: str, cls: type[Strategy]) -> dict[str, Any]:
         "description": _description(cls),
         "settings_schema": None,
         "constraints": [],
+        "legacy_keys": {},
     }
     if model is None:
         if cls.settings_constraints:
             raise CatalogError(f"{where}: constraints without a settings model")
+        if cls.settings_legacy_keys:
+            raise CatalogError(f"{where}: legacy keys without a settings model")
         return entry
     schema = _settings_schema(model, where=where, lookups=cls.settings_lookups)
     scalars, arrays = _addressable_fields(schema)
@@ -309,8 +317,16 @@ def describe_strategy(name: str, cls: type[Strategy]) -> dict[str, Any]:
             arrays=arrays,
             lookups=cls.settings_lookups,
         )
+    properties = schema.get("properties") or {}
+    for old, new in cls.settings_legacy_keys.items():
+        if old in properties or new not in properties:
+            raise CatalogError(
+                f"{where}: legacy key {old!r} -> {new!r} must map a retired "
+                "name to a published parameter"
+            )
     entry["settings_schema"] = schema
     entry["constraints"] = [dict(rule) for rule in cls.settings_constraints]
+    entry["legacy_keys"] = dict(cls.settings_legacy_keys)
     return entry
 
 

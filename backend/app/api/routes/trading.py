@@ -251,7 +251,8 @@ class StrategyDescription(BaseModel):
     the cross-field rules it cannot express (see ``agent/agent/protocol.py``
     for the grammar). Both are served verbatim: the backend compiles them to
     validate a Start, the UI renders a form from them, and neither restates
-    them.
+    them. ``legacy_keys`` lets the UI read saved params that still use a
+    renamed parameter's old name.
     """
 
     name: str
@@ -259,6 +260,10 @@ class StrategyDescription(BaseModel):
     description: str = ""
     settings_schema: dict[str, Any] | None = None
     constraints: list[dict[str, Any]] = Field(default_factory=list)
+    legacy_keys: dict[str, str] = Field(
+        default_factory=dict,
+        description="Renamed parameters, old name -> new name.",
+    )
 
 
 class StrategyCatalog(BaseModel):
@@ -712,6 +717,7 @@ def _catalog_response(catalog: CompiledCatalog | None) -> StrategyCatalog:
                 description=s.description,
                 settings_schema=s.settings_schema,
                 constraints=s.constraints,
+                legacy_keys=s.legacy_keys,
             )
             for s in catalog.strategies.values()
         ],

@@ -319,7 +319,7 @@ def test_gap_swing_dedup_and_backfill() -> None:
     async def run() -> None:
         full = fixture()
         for interval in full:
-            strategy = TripleScreenStrategy({**PARAMS, "swing_low_h1_n": 12})
+            strategy = TripleScreenStrategy({**PARAMS, "swing_low_wave_n": 12})
             sink = RedisSink()
             incomplete = {i: list(bars) for i, bars in full.items()}
             incomplete[interval].pop(-3)
@@ -390,7 +390,8 @@ def test_bootstrap_full_1000_closed_and_paginated(
         {"kline_window": 10},
         {"stochastic_k_period": 0},
         {"fi_ema_period": -1},
-        {"swing_low_h1_n": 0},
+        {"swing_low_wave_n": 0},
+        {"swing_low_h1_n": 0},  # old name: moved, then rejected (not defaulted)
         {"wave_interval": "1M"},
         {"wave_interval": "3d"},
         {"ripple_interval": "1h"},  # wave == ripple
@@ -405,6 +406,13 @@ def test_bootstrap_full_1000_closed_and_paginated(
 def test_invalid_settings(params: dict[str, Any]) -> None:
     with pytest.raises((ValidationError, ValueError)):
         TripleScreenStrategy(params)
+
+
+def test_old_parameter_names_reach_the_strategy() -> None:
+    """A snapshot or queued Start from before the rename keeps its values."""
+    strategy = TripleScreenStrategy({"swing_low_h1_n": 7, "trail_m15_n": 9})
+    assert strategy.settings.swing_low_wave_n == 7
+    assert strategy.settings.trail_ripple_n == 9
 
 
 def test_settings_immutable_and_detached() -> None:

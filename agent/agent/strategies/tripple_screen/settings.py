@@ -11,7 +11,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from agent.common.intervals import interval_ms
 
@@ -19,6 +19,15 @@ PositiveInt = Annotated[int, Field(gt=0)]
 
 TRAIL_CAP_MESSAGE = "trailing stop cap % must be below take profit %"
 TIMEFRAME_MESSAGE = "timeframes must satisfy tide > wave > ripple"
+
+#: Renamed parameters, old name -> new name. Snapshots, queued commands and
+#: open browser tabs still carry the old names, so the model translates them
+#: (see ``translate_legacy_keys``) and the catalog publishes this map for the
+#: backend and UI.
+LEGACY_KEYS: dict[str, str] = {
+    "swing_low_h1_n": "swing_low_wave_n",
+    "trail_m15_n": "trail_ripple_n",
+}
 
 
 class TripleScreenSettings(BaseModel):
@@ -52,8 +61,8 @@ class TripleScreenSettings(BaseModel):
     oversold_threshold: Decimal = Field(
         default=Decimal(20), gt=0, lt=100, title="Oversold threshold"
     )
-    swing_low_h1_n: PositiveInt = Field(default=2, title="Swing low H1 N")
-    trail_m15_n: PositiveInt = Field(default=2, title="Trail M15 N")
+    swing_low_wave_n: PositiveInt = Field(default=2, title="Swing low WAVE N")
+    trail_ripple_n: PositiveInt = Field(default=2, title="Trail RIPPLE N")
     stop_buffer_pct: Decimal = Field(
         default=Decimal("0.1"), ge=0, lt=100, title="Stop buffer %"
     )
@@ -94,6 +103,47 @@ class TripleScreenSettings(BaseModel):
     volume_window: Literal["24h"] = Field(default="24h", title="Volume window")
     kline_window: PositiveInt = Field(default=1000, title="Kline window")
 
+    @model_validator(mode="before")
+    @classmethod
+    def translate_legacy_keys(cls, data: Any) -> Any:
+        """Move old parameter names to the new ones (presets plan §4.1.1).
+
+        An old name alone is moved and then validated like any value (``0``
+        stays an error, it does not fall back to the default). With both names
+        present each value is validated by the field's type first, so ``"7"``
+        and ``7`` agree; an invalid one is left under the new name for the
+        field's own error, and two valid values that differ are a conflict.
+        """
+        if not isinstance(data, dict) or not LEGACY_KEYS.keys() & data.keys():
+            return data
+        data = dict(data)
+        for old, new in LEGACY_KEYS.items():
+            if old not in data:
+                continue
+            legacy = data.pop(old)
+            if new not in data:
+                data[new] = legacy
+                continue
+            info = cls.model_fields[new]
+            adapter: TypeAdapter[Any] = TypeAdapter(
+                Annotated[info.annotation, *info.metadata]
+            )
+            try:
+                legacy_value = adapter.validate_python(legacy)
+            except ValueError:
+                data[new] = legacy
+                continue
+            try:
+                current_value = adapter.validate_python(data[new])
+            except ValueError:
+                continue
+            if legacy_value != current_value:
+                raise ValueError(
+                    f"{old} (renamed to {new}) and {new} disagree: "
+                    f"{legacy!r} != {data[new]!r}"
+                )
+        return data
+
     @model_validator(mode="after")
     def coherent(self) -> Self:
         fast, mid, slow = self.ema_tide_periods
@@ -118,8 +168,8 @@ class TripleScreenSettings(BaseModel):
             + self.stochastic_slow_period
             - 2,
             self.fi_ema_period + 2,
-            self.swing_low_h1_n,
-            self.trail_m15_n,
+            self.swing_low_wave_n,
+            self.trail_ripple_n,
             2,
         )
         if self.kline_window < needed:
@@ -128,10 +178,18 @@ class TripleScreenSettings(BaseModel):
 
     @classmethod
     def from_params(cls, params: dict[str, Any]) -> TripleScreenSettings:
-        """Ignore shared/unknown command keys, validate all known parameters."""
+        """Ignore shared/unknown command keys, validate all known parameters.
+
+        Old parameter names are known too: they pass the filter so that
+        :meth:`translate_legacy_keys` can move them.
+        """
         return cls.model_validate(
-            {k: v for k, v in params.items() if k in cls.model_fields}
+            {
+                k: v
+                for k, v in params.items()
+                if k in cls.model_fields or k in LEGACY_KEYS
+            }
         )
 
 
-__all__ = ["TRAIL_CAP_MESSAGE", "TripleScreenSettings"]
+__all__ = ["LEGACY_KEYS", "TRAIL_CAP_MESSAGE", "TripleScreenSettings"]

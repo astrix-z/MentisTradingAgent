@@ -273,6 +273,11 @@ class Strategy(abc.ABC):
     #: the ``intervals_ms`` table.
     settings_lookups: ClassVar[dict[str, dict[str, int]]] = {}
 
+    #: Renamed parameters, old name -> new name. The settings model translates
+    #: them itself; the catalog publishes the map so the backend can explain a
+    #: rejected old name and the UI can read old names from saved params.
+    settings_legacy_keys: ClassVar[dict[str, str]] = {}
+
     def __init__(self, params: dict[str, Any]) -> None:
         self._params = deepcopy(params)
         self._services: StrategyServices | None = None
