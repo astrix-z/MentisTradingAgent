@@ -999,6 +999,15 @@ async def read_catalog(redis: Redis) -> CompiledCatalog | None:
     raw = await redis.get(REDIS_STRATEGIES_KEY)
     if not raw:
         return None
+    return compile_published(raw)
+
+
+def compile_published(raw: str) -> CompiledCatalog:
+    """Parse and compile a published document, cached by its raw text.
+
+    Raises:
+        CatalogError: the document is unusable.
+    """
     cached = _CACHE.get(raw)
     if cached is not None:
         return cached
@@ -1029,6 +1038,7 @@ __all__ = [
     "PresetRecord",
     "PresetsParse",
     "compile_catalog",
+    "compile_published",
     "json_safe_errors",
     "read_catalog",
 ]
