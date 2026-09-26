@@ -13,7 +13,7 @@ import asyncio
 import json
 import math
 from decimal import Decimal, Inexact, localcontext
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -31,6 +31,7 @@ from agent.protocol import (
 )
 from agent.strategies import STRATEGIES
 from agent.strategies.base import Strategy, StrategyServices
+from agent.strategies.tripple_screen.presets import BUILTIN_PRESETS
 from agent.strategies.tripple_screen.settings import TripleScreenSettings
 
 PARAMS_ENTRY = describe_strategy("tripple_screen", STRATEGIES["tripple_screen"])
@@ -219,6 +220,51 @@ def test_a_bad_legacy_map_fails_at_publish_time(legacy_keys: dict[str, str]) -> 
         )
 
 
+def test_builtin_presets_are_full_valid_snapshots() -> None:
+    """Default is the agent's own defaults; Fast passes the model and the rules."""
+    props = PARAMS_ENTRY["settings_schema"]["properties"]
+    editable = {name for name, prop in props.items() if "const" not in prop}
+    assert "volume_window" not in editable
+    published = {preset["name"]: preset["params"] for preset in PARAMS_ENTRY["presets"]}
+    assert list(published) == ["Default", "Fast"]
+    for name, params in published.items():
+        assert set(params) == editable, name
+        assert params == BUILTIN_PRESETS[name], "published in JSON form, unchanged"
+        assert not model_rejects(params), name
+        assert reference_check(params) == [], name
+    assert TripleScreenSettings.model_validate(published["Default"]) == (
+        TripleScreenSettings()
+    )
+    fast = TripleScreenSettings.model_validate(published["Fast"])
+    assert (fast.tide_interval, fast.wave_interval, fast.ripple_interval) == (
+        "1h",
+        "15m",
+        "5m",
+    )
+
+
+@pytest.mark.parametrize(
+    ("presets", "expected"),
+    [
+        ({"P": {}}, "exactly the non-const parameters"),
+        ({"P": {"thing": 1, "fixed": "x"}}, "exactly the non-const parameters"),
+        ({"P": {"thing": 0}}, "invalid"),
+        ({"P": {"thing": 1}, " p ": {"thing": 2}}, "unique"),
+    ],
+)
+def test_a_bad_builtin_preset_fails_at_publish_time(
+    presets: dict[str, Any], expected: str
+) -> None:
+    class _Settings(BaseModel):
+        thing: int = Field(default=1, gt=0)
+        fixed: Literal["x"] = "x"
+
+    with pytest.raises(CatalogError, match=expected):
+        describe_strategy(
+            "dummy", _dummy(settings_model=_Settings, settings_presets=presets)
+        )
+
+
 def test_no_constraints_when_a_strategy_has_no_settings() -> None:
     class _Bare(Strategy):
         async def on_start(self, services: StrategyServices) -> None: ...
@@ -229,6 +275,7 @@ def test_no_constraints_when_a_strategy_has_no_settings() -> None:
     assert entry["settings_schema"] is None
     assert entry["constraints"] == []
     assert entry["legacy_keys"] == {}
+    assert entry["presets"] == []
     assert entry["label"] == "bare"
 
 

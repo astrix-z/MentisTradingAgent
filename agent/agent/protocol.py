@@ -27,7 +27,8 @@ Redis restart cannot leave the backend without it::
           "description": "...",
           "settings_schema": {...},   # JSON Schema 2020-12 for `params`
           "constraints": [ ... ],     # cross-field rules, see below
-          "legacy_keys": {"<old>": "<new>"}  # renamed parameters
+          "legacy_keys": {"<old>": "<new>"},  # renamed parameters
+          "presets": [{"name": "...", "params": {...}}]  # built-in presets
         }
       ]
     }
@@ -39,7 +40,7 @@ parameters even though the agent itself tolerates them when reading a command
 (``TripleScreenSettings.from_params`` filters to known keys, which is what lets
 a payload carry shared keys).
 
-Three things JSON Schema cannot express travel beside it:
+Four things JSON Schema cannot express travel beside it:
 
 * ``constraints`` — cross-field rules as a small, strategy-agnostic AST, so the
   backend and the UI enforce the *same* rule and render the *same* message
@@ -49,7 +50,10 @@ Three things JSON Schema cannot express travel beside it:
 * ``legacy_keys`` — renamed parameters, old name -> new name. The schema has
   only the new names; the agent still accepts the old ones (a runtime snapshot
   or a queued command may carry them), the backend names the new one when it
-  rejects an old one, and the UI reads old names from saved params.
+  rejects an old one, and the UI reads old names from saved params;
+* ``presets`` — built-in presets, each a full snapshot of the non-const
+  parameters in JSON form (decimals as strings). Optional for consumers: an
+  older agent simply has none, so ``CATALOG_VERSION`` stays 1.
 
 Constraint grammar
 ------------------
@@ -300,12 +304,15 @@ def describe_strategy(name: str, cls: type[Strategy]) -> dict[str, Any]:
         "settings_schema": None,
         "constraints": [],
         "legacy_keys": {},
+        "presets": [],
     }
     if model is None:
         if cls.settings_constraints:
             raise CatalogError(f"{where}: constraints without a settings model")
         if cls.settings_legacy_keys:
             raise CatalogError(f"{where}: legacy keys without a settings model")
+        if cls.settings_presets:
+            raise CatalogError(f"{where}: presets without a settings model")
         return entry
     schema = _settings_schema(model, where=where, lookups=cls.settings_lookups)
     scalars, arrays = _addressable_fields(schema)
@@ -327,7 +334,47 @@ def describe_strategy(name: str, cls: type[Strategy]) -> dict[str, Any]:
     entry["settings_schema"] = schema
     entry["constraints"] = [dict(rule) for rule in cls.settings_constraints]
     entry["legacy_keys"] = dict(cls.settings_legacy_keys)
+    entry["presets"] = _presets(cls, model, schema, where=where)
     return entry
+
+
+def _presets(
+    cls: type[Strategy], model: type[Any], schema: dict[str, Any], *, where: str
+) -> list[dict[str, Any]]:
+    """Published built-in presets, each checked to be a full valid snapshot.
+
+    A preset must name exactly the non-const parameters (a const one is fixed
+    by the schema, a missing one would be filled by a default and silently
+    change with it) and must pass the settings model. Params are published as
+    the model dumps them in JSON mode, so every consumer reads the same form.
+    """
+    properties = schema.get("properties") or {}
+    editable = {name for name, prop in properties.items() if "const" not in prop}
+    published: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for name, params in cls.settings_presets.items():
+        label = f"{where} preset {name!r}"
+        identity = name.strip().lower()
+        if not identity or identity in seen:
+            raise CatalogError(f"{label}: names must be non-empty and unique")
+        seen.add(identity)
+        keys = set(params)
+        if keys != editable:
+            raise CatalogError(
+                f"{label}: must set exactly the non-const parameters; "
+                f"missing {sorted(editable - keys)}, extra {sorted(keys - editable)}"
+            )
+        try:
+            dumped = model.model_validate(params).model_dump(mode="json")
+        except ValueError as exc:
+            raise CatalogError(f"{label}: invalid: {exc}") from exc
+        published.append(
+            {
+                "name": name,
+                "params": {key: dumped[key] for key in properties if key in editable},
+            }
+        )
+    return published
 
 
 def _merge_lookups() -> dict[str, dict[str, int]]:

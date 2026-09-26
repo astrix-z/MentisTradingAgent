@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "schema_hash": "483dcede3234b99c61c076b180d42e385b288c3a27f9d981aa2cefe1980e6ee5",
-  "published_at": "2026-09-26T03:49:45.453681+00:00",
+  "schema_hash": "8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8",
+  "published_at": "2026-09-26T08:52:00.516307+00:00",
   "lookups": {
     "intervals_ms": {
       "1s": 1000,
@@ -452,7 +452,71 @@
       "legacy_keys": {
         "swing_low_h1_n": "swing_low_wave_n",
         "trail_m15_n": "trail_ripple_n"
-      }
+      },
+      "presets": [
+        {
+          "name": "Default",
+          "params": {
+            "quote_asset": "USDT",
+            "tide_interval": "4h",
+            "wave_interval": "1h",
+            "ripple_interval": "15m",
+            "ema_tide_periods": [
+              5,
+              13,
+              34
+            ],
+            "stochastic_k_period": 5,
+            "stochastic_d_period": 3,
+            "stochastic_slow_period": 3,
+            "fi_ema_period": 2,
+            "oversold_threshold": "20",
+            "swing_low_wave_n": 2,
+            "trail_ripple_n": 2,
+            "stop_buffer_pct": "0.1",
+            "min_stop_distance_pct": "1",
+            "tp_pct": "10",
+            "trail_cap_pct": "4",
+            "max_hold_hours": "8",
+            "cooldown_minutes": 60,
+            "signal_validity_minutes": 15,
+            "rest_concurrency": 3,
+            "ws_top_n": 30,
+            "kline_window": 1000
+          }
+        },
+        {
+          "name": "Fast",
+          "params": {
+            "quote_asset": "USDT",
+            "tide_interval": "1h",
+            "wave_interval": "15m",
+            "ripple_interval": "5m",
+            "ema_tide_periods": [
+              5,
+              13,
+              34
+            ],
+            "stochastic_k_period": 5,
+            "stochastic_d_period": 3,
+            "stochastic_slow_period": 3,
+            "fi_ema_period": 2,
+            "oversold_threshold": "20",
+            "swing_low_wave_n": 2,
+            "trail_ripple_n": 2,
+            "stop_buffer_pct": "0.1",
+            "min_stop_distance_pct": "1",
+            "tp_pct": "5",
+            "trail_cap_pct": "1",
+            "max_hold_hours": "4",
+            "cooldown_minutes": 60,
+            "signal_validity_minutes": 5,
+            "rest_concurrency": 3,
+            "ws_top_n": 30,
+            "kline_window": 1000
+          }
+        }
+      ]
     }
   ],
   "execution": {

@@ -35,8 +35,9 @@ import json
 import logging
 import math
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from decimal import Decimal, Inexact, InvalidOperation, localcontext
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     AfterValidator,
@@ -509,6 +510,57 @@ def _check_rule(rule: Any) -> None:
         raise CatalogError("rule needs a non-empty message")
 
 
+# --- Built-in presets --------------------------------------------------------
+
+#: Same rule as a preset name in the API (plan §4.3.4): trimmed, 1–64 chars.
+PRESET_NAME_MAX = 64
+
+PresetStatus = Literal["accepted", "rejected", "unreadable", "duplicate_name"]
+
+
+@dataclass(frozen=True)
+class PresetRecord:
+    """One entry of a strategy's published ``presets`` list, as parsed."""
+
+    index: int
+    #: Trimmed name, or ``None`` when the entry has no string name.
+    name: str | None
+    status: PresetStatus
+    #: Params after ``legacy_keys`` translation; ``None`` if unreadable.
+    params: dict[str, Any] | None = None
+    #: Why it was not accepted (validation errors), for logs.
+    reasons: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PresetsParse:
+    """What a strategy's ``presets`` metadata amounts to (plan §4.2).
+
+    ``absent``: an older agent publishes none. ``malformed``: not a list,
+    nothing accepted. ``list``: one record per entry. Any parse error makes the
+    list non-authoritative (no retirement) and the sync status ``partial``.
+    """
+
+    form: Literal["absent", "malformed", "list"]
+    records: list[PresetRecord] = field(default_factory=list)
+
+    @property
+    def accepted(self) -> list[PresetRecord]:
+        return [record for record in self.records if record.status == "accepted"]
+
+    @property
+    def errors(self) -> list[dict[str, Any]]:
+        return [
+            {"index": record.index, "name": record.name, "type": record.status}
+            for record in self.records
+            if record.status != "accepted"
+        ]
+
+    @property
+    def has_errors(self) -> bool:
+        return self.form == "malformed" or bool(self.errors)
+
+
 # --- Compiled catalog -------------------------------------------------------
 
 
@@ -573,6 +625,105 @@ class CompiledStrategy:
                 f"{', '.join(self._interval_fields)} need an intervals_ms lookup"
             )
         self._check_default_domain()
+        self.presets = self._parse_presets(entry.get("presets"))
+
+    def _parse_presets(self, raw: Any) -> PresetsParse:
+        """Parse ``presets`` in isolation: a defect there never fails the catalog.
+
+        Everything that goes wrong is logged and turned into a record status;
+        Start validation and the rest of the catalog are unaffected.
+        """
+        try:
+            parsed = self._presets_from(raw)
+        except Exception:  # isolation is the contract: log, never raise
+            logger.exception("strategy %r: cannot parse presets", self.name)
+            return PresetsParse(form="malformed")
+        for error in parsed.errors:
+            logger.warning(
+                "strategy %r: built-in preset not accepted: %s", self.name, error
+            )
+        if parsed.form == "malformed":
+            logger.warning("strategy %r: presets is not a list: %r", self.name, raw)
+        return parsed
+
+    def _presets_from(self, raw: Any) -> PresetsParse:
+        if raw is None:
+            return PresetsParse(form="absent")
+        if not isinstance(raw, list):
+            return PresetsParse(form="malformed")
+        records = [self._preset_record(index, entry) for index, entry in enumerate(raw)]
+        # One identity more than once rejects the whole group, accepted or not:
+        # none of them may overwrite the stored row (plan §4.2).
+        counts: dict[str, int] = {}
+        for record in records:
+            if record.status != "unreadable" and record.name is not None:
+                identity = record.name.lower()
+                counts[identity] = counts.get(identity, 0) + 1
+        return PresetsParse(
+            form="list",
+            records=[
+                PresetRecord(
+                    index=record.index,
+                    name=record.name,
+                    status="duplicate_name",
+                    params=record.params,
+                    reasons=record.reasons,
+                )
+                if record.status != "unreadable"
+                and record.name is not None
+                and counts[record.name.lower()] > 1
+                else record
+                for record in records
+            ],
+        )
+
+    def _preset_record(self, index: int, entry: Any) -> PresetRecord:
+        """Envelope first (name, params object), then the preset itself."""
+        if not isinstance(entry, dict):
+            return PresetRecord(index=index, name=None, status="unreadable")
+        raw_name = entry.get("name")
+        name = raw_name.strip() if isinstance(raw_name, str) else None
+        params = entry.get("params")
+        if (
+            name is None
+            or not 1 <= len(name) <= PRESET_NAME_MAX
+            or not isinstance(params, dict)
+        ):
+            return PresetRecord(index=index, name=name, status="unreadable")
+        moved, reasons = self.apply_legacy_keys(params)
+        editable = self.editable_fields()
+        missing, extra = editable - moved.keys(), moved.keys() - editable
+        if missing or extra:
+            # A full snapshot of exactly the editable parameters: a missing one
+            # would be filled by a default and change with it; a const one is
+            # the schema's to fix.
+            reasons.append(
+                {
+                    "msg": f"missing {sorted(missing)}, extra {sorted(extra)}",
+                    "type": "incomplete_preset",
+                }
+            )
+        if not reasons:
+            try:
+                reasons = self.validate(moved)
+            except CatalogError as exc:
+                reasons = [{"msg": str(exc), "type": "catalog_error"}]
+        return PresetRecord(
+            index=index,
+            name=name,
+            status="rejected" if reasons else "accepted",
+            params=moved,
+            reasons=reasons,
+        )
+
+    def editable_fields(self) -> set[str]:
+        """The non-const parameters: what a preset must set, exactly."""
+        properties = (self.settings_schema or {}).get("properties") or {}
+        return {
+            name
+            for name, prop in properties.items()
+            if isinstance(prop, dict) and "const" not in prop
+        }
 
     def _check_default_domain(self) -> None:
         """A numeric default outside the domain is a catalog defect, found now.
@@ -855,6 +1006,8 @@ __all__ = [
     "CatalogError",
     "CompiledCatalog",
     "CompiledStrategy",
+    "PresetRecord",
+    "PresetsParse",
     "compile_catalog",
     "json_safe_errors",
     "read_catalog",

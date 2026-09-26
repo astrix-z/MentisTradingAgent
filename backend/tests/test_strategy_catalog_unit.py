@@ -706,3 +706,147 @@ def test_apply_legacy_keys_compares_after_strict_validation() -> None:
     moved, errors = strategy.apply_legacy_keys({"size": "7", "window": 7})
     assert (moved, errors) == ({"window": "7"}, [])
     assert [e["type"] for e in strategy.validate(moved)] == ["int_type"]
+
+
+# --- Built-in presets: isolated parse (plan §4.2, PRESET-04) -----------------
+
+GOOD = {"interval": "1h", "window": 10, "ratio": "1.5", "periods": [1, 2]}
+
+
+def with_presets(presets: Any, **properties: Any) -> Any:
+    document = with_properties(**properties)
+    document["strategies"][0]["presets"] = presets
+    document["strategies"][0]["constraints"] = [
+        rule(
+            cmp="gte",
+            lhs={"field": "window"},
+            rhs={"const": 5},
+            message="window must be at least {rhs}",
+        )
+    ]
+    return compile_catalog(document).strategy("unit_strategy")
+
+
+def statuses(strategy: Any) -> list[tuple[int, str | None, str]]:
+    return [(r.index, r.name, r.status) for r in strategy.presets.records]
+
+
+def test_a_catalog_without_presets_reads_as_absent() -> None:
+    strategy = compiled()
+    assert strategy.presets.form == "absent"
+    assert strategy.presets.records == []
+    assert not strategy.presets.has_errors
+
+
+def test_a_bad_preset_beside_a_good_one_leaves_catalog_and_start_working() -> None:
+    strategy = with_presets(
+        [
+            {"name": "Good", "params": GOOD},
+            {"name": "Bad", "params": {**GOOD, "window": 3}},  # breaks the rule
+        ]
+    )
+    assert statuses(strategy) == [(0, "Good", "accepted"), (1, "Bad", "rejected")]
+    assert [r.params for r in strategy.presets.accepted] == [GOOD]
+    assert strategy.presets.errors == [{"index": 1, "name": "Bad", "type": "rejected"}]
+    assert strategy.presets.has_errors
+    assert strategy.validate({}) == []  # Start still validates
+
+
+@pytest.mark.parametrize("presets", ["oops", {"name": "Good"}, 5])
+def test_presets_that_are_not_a_list_are_malformed(presets: Any) -> None:
+    strategy = with_presets(presets)
+    assert strategy.presets.form == "malformed"
+    assert strategy.presets.accepted == []
+    assert strategy.presets.has_errors
+    assert strategy.validate({}) == []
+
+
+def test_a_preset_must_be_a_full_snapshot_without_const() -> None:
+    strategy = with_presets(
+        [
+            {"name": "Empty", "params": {}},
+            {"name": "Partial", "params": {"window": 10}},
+            {"name": "Const", "params": {**GOOD, "fixed": "x"}},
+            {"name": "Good", "params": GOOD},
+        ],
+        fixed={"type": "string", "const": "x", "default": "x"},
+    )
+    assert statuses(strategy) == [
+        (0, "Empty", "rejected"),
+        (1, "Partial", "rejected"),
+        (2, "Const", "rejected"),
+        (3, "Good", "accepted"),
+    ]
+
+
+def test_an_unreadable_entry_is_reported_by_index() -> None:
+    strategy = with_presets([{"name": "Good", "params": GOOD}, None])
+    assert statuses(strategy) == [(0, "Good", "accepted"), (1, None, "unreadable")]
+    assert strategy.presets.errors == [{"index": 1, "name": None, "type": "unreadable"}]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"name": "x" * 65, "params": GOOD},
+        {"name": "   ", "params": GOOD},
+        {"name": 5, "params": GOOD},
+        {"name": "NoParams"},
+        {"name": "ListParams", "params": [1]},
+    ],
+)
+def test_an_envelope_defect_is_unreadable_and_good_ones_stay(entry: Any) -> None:
+    strategy = with_presets([entry, {"name": "Good", "params": GOOD}])
+    assert [r.status for r in strategy.presets.records] == ["unreadable", "accepted"]
+
+
+def test_a_64_character_name_is_fine_and_trimmed() -> None:
+    strategy = with_presets([{"name": "  " + "x" * 64 + " ", "params": GOOD}])
+    assert statuses(strategy) == [(0, "x" * 64, "accepted")]
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        {"name": "fast", "params": GOOD},  # same identity, both valid
+        {"name": " FAST ", "params": {**GOOD, "window": 3}},  # accepted + rejected
+    ],
+)
+def test_a_repeated_identity_rejects_the_whole_group(second: Any) -> None:
+    strategy = with_presets(
+        [
+            {"name": "Fast", "params": GOOD},
+            second,
+            {"name": "Default", "params": GOOD},
+        ]
+    )
+    assert [r.status for r in strategy.presets.records] == [
+        "duplicate_name",
+        "duplicate_name",
+        "accepted",
+    ]
+
+
+def test_a_preset_with_an_old_parameter_name_is_translated() -> None:
+    document = with_properties()
+    entry = document["strategies"][0]
+    entry["legacy_keys"] = {"size": "window"}
+    params = {key: value for key, value in GOOD.items() if key != "window"}
+    entry["presets"] = [{"name": "Old", "params": {**params, "size": 10}}]
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    assert [r.params for r in strategy.presets.accepted] == [GOOD]
+
+
+def test_an_unexpected_parse_failure_is_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core import strategy_catalog
+
+    def boom(*_: Any) -> Any:
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(strategy_catalog.CompiledStrategy, "_preset_record", boom)
+    strategy = with_presets([{"name": "Good", "params": GOOD}])
+    assert strategy.presets.form == "malformed"
+    assert strategy.validate({}) == []

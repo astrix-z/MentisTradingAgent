@@ -31,6 +31,7 @@ from agent.strategies.tripple_screen.indicators import (
     sma_of_optional,
     stochastic_k_series,
 )
+from agent.strategies.tripple_screen.presets import BUILTIN_PRESETS
 from agent.strategies.tripple_screen.schema import CONSTRAINTS, LOOKUPS
 from agent.strategies.tripple_screen.settings import (
     LEGACY_KEYS,
@@ -51,6 +52,7 @@ class TripleScreenStrategy(Strategy):
     settings_constraints = CONSTRAINTS
     settings_lookups = LOOKUPS
     settings_legacy_keys = LEGACY_KEYS
+    settings_presets = BUILTIN_PRESETS
 
     def __init__(self, params: dict[str, Any]) -> None:
         super().__init__(params)

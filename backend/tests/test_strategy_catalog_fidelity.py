@@ -22,6 +22,7 @@ import pytest
 agent_protocol = pytest.importorskip("agent.protocol")
 agent_strategies = pytest.importorskip("agent.strategies")
 agent_settings = pytest.importorskip("agent.strategies.tripple_screen.settings")
+agent_presets = pytest.importorskip("agent.strategies.tripple_screen.presets")
 catalog_module = pytest.importorskip("app.core.strategy_catalog")
 
 TripleScreenSettings = agent_settings.TripleScreenSettings
@@ -149,6 +150,14 @@ def test_an_old_ui_payload_is_refused_with_a_reload_hint() -> None:
         "parameter 'swing_low_h1_n' was renamed to 'swing_low_wave_n'; reload the page",
         "parameter 'trail_m15_n' was renamed to 'trail_ripple_n'; reload the page",
     ]
+
+
+def test_backend_accepts_the_agents_builtin_presets() -> None:
+    """PRESET-04: Default and Fast arrive whole and pass the backend pipeline."""
+    presets = agent_presets.BUILTIN_PRESETS
+    assert STRATEGY.presets.form == "list"
+    assert not STRATEGY.presets.has_errors
+    assert {r.name: r.params for r in STRATEGY.presets.accepted} == presets
 
 
 def test_backend_reports_the_agents_own_message() -> None:

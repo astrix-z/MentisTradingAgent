@@ -278,6 +278,11 @@ class Strategy(abc.ABC):
     #: rejected old name and the UI can read old names from saved params.
     settings_legacy_keys: ClassVar[dict[str, str]] = {}
 
+    #: Built-in presets, name -> full snapshot of the non-const parameters in
+    #: JSON form. Published in the catalog; the backend keeps them as built-in
+    #: presets users can pick (presets plan §4.2).
+    settings_presets: ClassVar[dict[str, dict[str, Any]]] = {}
+
     def __init__(self, params: dict[str, Any]) -> None:
         self._params = deepcopy(params)
         self._services: StrategyServices | None = None
