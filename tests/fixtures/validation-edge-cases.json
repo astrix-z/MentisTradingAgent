@@ -2045,6 +2045,82 @@
       "intentional_difference": null
     },
     {
+      "id": "decimal-nan-literal",
+      "note": "литерал NaN (json.loads его принимает) в decimal-поле: type на всех слоях, не 500",
+      "ui_draft": null,
+      "params_patch": null,
+      "params_raw": "{\"quote_asset\": \"USDT\", \"tide_interval\": \"4h\", \"wave_interval\": \"1h\", \"ripple_interval\": \"15m\", \"ema_tide_periods\": [5, 13, 34], \"stochastic_k_period\": 5, \"stochastic_d_period\": 3, \"stochastic_slow_period\": 3, \"fi_ema_period\": 2, \"oversold_threshold\": \"20\", \"swing_low_wave_n\": 2, \"trail_ripple_n\": 2, \"stop_buffer_pct\": \"0.1\", \"min_stop_distance_pct\": \"1\", \"tp_pct\": NaN, \"trail_cap_pct\": \"4\", \"max_hold_hours\": \"8\", \"cooldown_minutes\": 60, \"signal_validity_minutes\": 15, \"rest_concurrency\": 3, \"ws_top_n\": 30, \"kline_window\": 1000}",
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
       "id": "int-numeric-string",
       "note": "\"5\" в целом поле",
       "ui_draft": null,

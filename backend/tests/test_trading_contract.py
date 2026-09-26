@@ -688,6 +688,32 @@ def test_execution_settings_are_strict_too(
     assert not redis.publications
 
 
+@pytest.mark.parametrize(
+    "literal",
+    [
+        '{"tp_pct": NaN}',
+        '{"tp_pct": Infinity}',
+        '{"ema_tide_periods": [5, 13, Infinity]}',
+    ],
+)
+def test_non_finite_literals_are_a_422_not_a_500(
+    client: TestClient,
+    redis: MemoryRedis,
+    literal: str,
+) -> None:
+    """R74: Python's JSON parser accepts NaN/Infinity; the answer must be a 422."""
+    body = json.dumps({**START, "params": {}}).replace(
+        '"params": {}', f'"params": {literal}'
+    )
+    response = client.post(
+        "/api/v1/trading/start/",
+        content=body,
+        headers={**headers(client), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert not redis.publications
+
+
 def test_an_integer_too_long_to_parse_is_refused_without_enqueue(
     client: TestClient,
     redis: MemoryRedis,

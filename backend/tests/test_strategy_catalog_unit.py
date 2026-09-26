@@ -693,8 +693,56 @@ def test_an_interval_field_without_its_lookup_fails_at_compile_time() -> None:
     ],
 )
 def test_a_default_outside_the_domain_fails_at_compile_time(prop: Any) -> None:
-    with pytest.raises(CatalogError, match="outside the numeric domain"):
+    with pytest.raises(CatalogError, match="invalid defaults: big"):
         compile_catalog(with_properties(big=prop))
+
+
+@pytest.mark.parametrize(
+    "prop",
+    [
+        {"type": "integer", "default": "5"},  # wrong type
+        {"type": "integer", "default": 0, "exclusiveMinimum": 0},  # out of bounds
+    ],
+)
+def test_any_invalid_default_fails_at_compile_time(prop: Any) -> None:
+    """R75: not only the domain — every default must pass its own field."""
+    with pytest.raises(CatalogError, match="invalid defaults: bad"):
+        compile_catalog(with_properties(bad=prop))
+
+
+def test_a_field_without_a_default_is_not_a_catalog_defect() -> None:
+    strategy = compile_catalog(with_properties(needed={"type": "integer"})).strategy(
+        "unit_strategy"
+    )
+    assert strategy is not None
+    assert [e["type"] for e in strategy.validate({})] == ["missing"]
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_a_numeric_array_rejects_non_finite_items(value: float) -> None:
+    """R74: array items share the model's allow_inf_nan=False."""
+    document = with_properties(
+        w={
+            "type": "array",
+            "default": [1.0, 2.0],
+            "minItems": 2,
+            "maxItems": 2,
+            "prefixItems": [{"type": "number"}, {"type": "number"}],
+        }
+    )
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    assert strategy.validate({"w": [1.0, 2.0]}) == []
+    assert [e["type"] for e in strategy.validate({"w": [1.0, value]})] == [
+        "finite_number"
+    ]
+
+
+def test_non_finite_input_is_reported_as_plain_json() -> None:
+    """R74: the error must survive a strict JSON writer (else a 500)."""
+    errors = compiled().validate({"ratio": float("nan"), "periods": [1, float("inf")]})
+    json.dumps(errors, allow_nan=False)
+    assert {e["type"] for e in errors} == {"finite_number", "int_type"}
 
 
 def test_apply_legacy_keys_compares_after_strict_validation() -> None:

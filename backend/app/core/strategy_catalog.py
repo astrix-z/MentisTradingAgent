@@ -113,22 +113,34 @@ def json_safe_errors(exc: ValidationError) -> list[dict[str, Any]]:
     exception for a custom validator's ``ValueError``, and the actual ``Decimal``
     bounds for a Decimal field. Neither survives JSON, and an ``HTTPException``
     detail is not passed through ``jsonable_encoder`` the way FastAPI's own 422
-    handling is, so both are stringified here.
+    handling is, so both are stringified here. So is a non-finite float in the
+    ``input`` or the context: the request body may carry ``NaN``/``Infinity``
+    (Python's JSON parser accepts them), and the response writer does not.
     """
     errors: list[dict[str, Any]] = []
     for raw_error in exc.errors(include_url=False):
         error: dict[str, Any] = dict(raw_error)
         error["loc"] = list(raw_error.get("loc") or ())
+        if "input" in error:
+            error["input"] = _plain(error["input"])
         ctx = error.get("ctx")
         if ctx:
-            error["ctx"] = {
-                key: value
-                if value is None or isinstance(value, (str, int, float, bool))
-                else str(value)
-                for key, value in ctx.items()
-            }
+            error["ctx"] = {key: _plain(value) for key, value in ctx.items()}
         errors.append(error)
     return errors
+
+
+def _plain(value: Any) -> Any:
+    """``value`` as strict JSON: containers kept, anything else as a string."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    return str(value)
 
 
 # --- Schema -> pydantic model ----------------------------------------------
@@ -318,7 +330,11 @@ def _array_annotation(prefix: list[Any], where: str) -> Any:
     dynamically built type. Length is pinned in the same annotation so the whole
     array rule lives in one place.
     """
-    item = TypeAdapter(_item_annotation(prefix[0], f"{where}[]"))
+    # Items get the model's own rule: no NaN/Infinity in a numeric array.
+    item = TypeAdapter(
+        _item_annotation(prefix[0], f"{where}[]"),
+        config=ConfigDict(allow_inf_nan=False),
+    )
     length = len(prefix)
 
     def check(values: list[Any]) -> list[Any]:
@@ -624,7 +640,7 @@ class CompiledStrategy:
                 f"strategy {self.name!r}: interval fields "
                 f"{', '.join(self._interval_fields)} need an intervals_ms lookup"
             )
-        self._check_default_domain()
+        self._check_defaults()
         self.presets = self._parse_presets(entry.get("presets"))
 
     def _parse_presets(self, raw: Any) -> PresetsParse:
@@ -725,27 +741,29 @@ class CompiledStrategy:
             if isinstance(prop, dict) and "const" not in prop
         }
 
-    def _check_default_domain(self) -> None:
-        """A numeric default outside the domain is a catalog defect, found now.
-
-        Otherwise every Start that omits the field would get ``too_large`` on
-        it, a catalog defect dressed up as the user's error.
+    def _check_defaults(self) -> None:
+        """Every published default must pass its own field: a catalog defect
+        found now, not dressed up as the user's error on each Start that omits
+        the field (type, bounds and the numeric domain alike). A field without
+        a default is the caller's to set and is not checked here.
         """
-        for name, default in self._defaults.items():
-            values = default if isinstance(default, list) else [default]
-            for value in values:
-                if isinstance(value, str) and not self._numeric_field(name):
-                    continue
-                number = _as_decimal(value)
-                if number is not None and not in_domain(number):
-                    raise CatalogError(
-                        f"strategy {self.name!r}: default of {name!r} "
-                        f"({value!r}) is outside the numeric domain"
+        if self._model is None:
+            return
+        try:
+            self._model.model_validate({})
+        except ValidationError as exc:
+            defects = [
+                error
+                for error in exc.errors(include_url=False)
+                if error["type"] != "missing"
+            ]
+            if defects:
+                raise CatalogError(
+                    f"strategy {self.name!r}: invalid defaults: "
+                    + "; ".join(
+                        f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in defects
                     )
-
-    def _numeric_field(self, name: str) -> bool:
-        prop = ((self.settings_schema or {}).get("properties") or {}).get(name)
-        return isinstance(prop, dict) and "anyOf" in prop
+                ) from exc
 
     def validate(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Errors for a Start's ``params``, through the pipeline of plan §4.3.5.
