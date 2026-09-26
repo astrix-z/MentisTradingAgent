@@ -1,16 +1,19 @@
 """PRESET-05b without a database: the idempotency key and the version guard."""
 
 import copy
-import hashlib
+import inspect
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
-from app.core import builtin_presets, strategy_catalog
+import pydantic
+import pytest
+
+from app.core import builtin_presets
 from app.core.builtin_presets import (
     PIPELINE_SOURCE_SHA256,
     PRESETS_PIPELINE_VERSION,
     content_hash,
+    pipeline_source_hash,
 )
 
 
@@ -18,17 +21,24 @@ def test_the_pipeline_version_follows_the_parse_and_pipeline_source() -> None:
     """Plan §4.3.2: a rule change without a version bump would keep old
     ``rejected`` records forever, since an unchanged key is never re-parsed.
 
-    If this fails, ``strategy_catalog.py`` changed: raise
-    ``PRESETS_PIPELINE_VERSION`` and add its hash as a new entry.
+    If this fails, the parse or the pipeline changed (``strategy_catalog.py``
+    or ``_regroup_by_database``): raise ``PRESETS_PIPELINE_VERSION`` and add
+    ``pipeline_source_hash()`` as its entry.
     """
-    source = Path(strategy_catalog.__file__).read_bytes()
     assert sorted(PIPELINE_SOURCE_SHA256) == list(
         range(1, PRESETS_PIPELINE_VERSION + 1)
     )
-    assert PIPELINE_SOURCE_SHA256[PRESETS_PIPELINE_VERSION] == (
-        hashlib.sha256(source).hexdigest()
-    )
+    assert PIPELINE_SOURCE_SHA256[PRESETS_PIPELINE_VERSION] == pipeline_source_hash()
     assert len(set(PIPELINE_SOURCE_SHA256.values())) == len(PIPELINE_SOURCE_SHA256)
+
+
+def test_the_regrouping_is_part_of_the_guarded_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R90: the database regrouping decides errors too."""
+    before = pipeline_source_hash()
+    monkeypatch.setattr(inspect, "getsource", lambda _: "def changed(): ...")
+    assert pipeline_source_hash() != before
 
 
 DOCUMENT: dict[str, Any] = {
@@ -75,7 +85,9 @@ def test_every_parse_input_is_part_of_the_key() -> None:
         assert key_of(other) != key_of(DOCUMENT)
 
 
-def test_the_pipeline_version_is_part_of_the_key(monkeypatch: Any) -> None:
+def test_the_pipeline_version_is_part_of_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     before = key_of(DOCUMENT)
     monkeypatch.setattr(
         builtin_presets, "PRESETS_PIPELINE_VERSION", PRESETS_PIPELINE_VERSION + 1
@@ -88,3 +100,17 @@ def test_the_key_ignores_key_order() -> None:
     entry = reordered["strategies"][0]
     reordered["strategies"][0] = dict(reversed(list(entry.items())))
     assert key_of(reordered) == key_of(DOCUMENT)
+
+
+def test_another_pydantic_is_part_of_the_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R90: the compiled model and its error types come from pydantic."""
+    before = key_of(DOCUMENT)
+    monkeypatch.setattr(pydantic, "VERSION", "0.0.0")
+    assert key_of(DOCUMENT) != before
+
+
+def test_a_lone_surrogate_does_not_break_the_key() -> None:
+    """R89: ``json.loads`` accepts ``"\\ud800"``; the key must not fail on it."""
+    other = copy.deepcopy(DOCUMENT)
+    other["strategies"][0]["presets"][0]["name"] = "\ud800"
+    assert key_of(other) != key_of(DOCUMENT)

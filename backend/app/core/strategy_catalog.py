@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal, Inexact, InvalidOperation, localcontext
@@ -531,6 +532,24 @@ def _check_rule(rule: Any) -> None:
 #: Same rule as a preset name in the API (plan §4.3.4): trimmed, 1–64 chars.
 PRESET_NAME_MAX = 64
 
+
+def preset_name(raw: Any) -> str | None:
+    """The trimmed name if it passes the envelope (plan §4.2), else ``None``.
+
+    A string of 1–64 characters after trim, with no control character
+    (PostgreSQL's ``text`` cannot hold NUL) and no lone surrogate (it cannot
+    be encoded). One rule for the agent, this parse and the API (§4.3.4).
+    """
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    if not 1 <= len(name) <= PRESET_NAME_MAX:
+        return None
+    if any(unicodedata.category(char) in ("Cc", "Cs") for char in name):
+        return None
+    return name
+
+
 PresetStatus = Literal["accepted", "rejected", "unreadable", "duplicate_name"]
 
 
@@ -701,10 +720,8 @@ class CompiledStrategy:
         """Envelope first (name, params object), then the preset itself."""
         if not isinstance(entry, dict):
             return PresetRecord(index=index, name=None, status="unreadable")
-        raw_name = entry.get("name")
-        name = raw_name.strip() if isinstance(raw_name, str) else None
-        if name is not None and not 1 <= len(name) <= PRESET_NAME_MAX:
-            name = None  # reported as null: only a valid name is an identity
+        # Reported as null unless valid: only a valid name is an identity.
+        name = preset_name(entry.get("name"))
         params = entry.get("params")
         if name is None or not isinstance(params, dict):
             return PresetRecord(index=index, name=name, status="unreadable")
@@ -1040,5 +1057,6 @@ __all__ = [
     "compile_catalog",
     "compile_published",
     "json_safe_errors",
+    "preset_name",
     "read_catalog",
 ]

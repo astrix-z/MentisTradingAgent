@@ -90,6 +90,7 @@ import hashlib
 import json
 import logging
 import sys
+import unicodedata
 from datetime import UTC, datetime
 from typing import Any
 
@@ -359,9 +360,17 @@ def _presets(
     for name, params in cls.settings_presets.items():
         label = f"{where} preset {name!r}"
         # The backend's envelope (plan §4.2): a string of 1–64 characters after
-        # trim. Anything else it would mark unreadable for good.
-        if not isinstance(name, str) or not 1 <= len(name.strip()) <= PRESET_NAME_MAX:
-            raise CatalogError(f"{label}: name must be 1-{PRESET_NAME_MAX} characters")
+        # trim, without control characters or lone surrogates. Anything else
+        # it would mark unreadable for good.
+        if (
+            not isinstance(name, str)
+            or not 1 <= len(name.strip()) <= PRESET_NAME_MAX
+            or any(unicodedata.category(char) in ("Cc", "Cs") for char in name.strip())
+        ):
+            raise CatalogError(
+                f"{label}: name must be 1-{PRESET_NAME_MAX} characters "
+                "without control characters"
+            )
         identity = name.strip().lower()
         if identity in seen:
             raise CatalogError(f"{label}: names must be unique")

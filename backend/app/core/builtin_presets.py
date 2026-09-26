@@ -18,23 +18,31 @@ Nothing is cached in the process: whether there is work to do is decided by the
 locked row alone, so every worker converges on what Redis holds now. A failure
 (Redis, database, an unusable catalog) rolls everything back and is retried on
 the next call; it never blocks a Start.
+
+The sync is **blocking** on purpose (R87): it holds a row lock while it reads
+Redis, and a coroutine that waited for that lock with a synchronous session
+would stall its whole event loop — two requests in one worker would deadlock.
+Call it from a sync route (FastAPI runs those in its threadpool) or through
+``run_in_threadpool``, with the blocking client of ``get_sync_redis()``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
+import inspect
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from pathlib import Path
+from typing import Any, Literal, cast
 
-from redis.asyncio import Redis
-from redis.exceptions import RedisError
+import pydantic
+import pydantic_core
+from redis import Redis
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session
 
+from app.core import strategy_catalog
 from app.core.strategy_catalog import (
     REDIS_STRATEGIES_KEY,
     CatalogError,
@@ -48,19 +56,20 @@ logger = logging.getLogger(__name__)
 #: (the parse of plan §4.2 and the pipeline of §4.3.5). Part of the idempotency
 #: key: raising it re-parses an unchanged list, so a preset rejected by old
 #: rules is not stuck. Raise it whenever those rules change.
-PRESETS_PIPELINE_VERSION = 1
+PRESETS_PIPELINE_VERSION = 2
 
-#: sha256 of ``strategy_catalog.py`` (the parse and the pipeline live there)
-#: for each pipeline version. A test fails when the file no longer matches the
-#: current version's entry: then add a new version with the new hash rather
-#: than editing an old entry.
+#: ``pipeline_source_hash()`` for each pipeline version. A test fails when the
+#: source no longer matches the current version's entry: then add a new
+#: version with the new hash rather than editing an old entry.
 PIPELINE_SOURCE_SHA256: dict[int, str] = {
     1: "80a1c6b0ef063270ad18d05db611e9da1a263e96723ef136c1ae2881a7006da1",
+    2: "355d43db1d124fcd9e22909bbf296e8d3c9e747bb649983b2750d5102e9a5e4e",
 }
 
-#: How long a Redis read may hold the lock: a hung Redis must not queue every
-#: worker's ``GET presets/`` behind this row.
-REDIS_READ_TIMEOUT_S = 2.0
+#: How long the sync waits for the lock row (or any row lock) before giving
+#: up as ``failed``: a stuck holder must not pile up every worker's request.
+#: The Redis read under the lock is bounded by the client's own timeout.
+LOCK_TIMEOUT = "5s"
 
 SyncResult = Literal[
     "noop",  # the locked row already reflects this catalog
@@ -70,10 +79,6 @@ SyncResult = Literal[
     "malformed",  # presets is not a list
     "failed",  # Redis, the database or the catalog failed; nothing changed
 ]
-
-
-#: What a sync survives: logged, rolled back, retried by the next call.
-_SYNC_FAILURES = (RedisError, TimeoutError, SQLAlchemyError, CatalogError)
 
 
 @dataclass(frozen=True)
@@ -89,7 +94,8 @@ def content_hash(document: dict[str, Any], entry: dict[str, Any]) -> str:
 
     ``published_at`` and ``schema_hash`` are left out, so a republished
     unchanged catalog is a ``noop``; a changed schema, rule, legacy key, lookup
-    or pipeline version re-parses an unchanged ``presets``.
+    or pipeline version re-parses an unchanged ``presets``. So does another
+    pydantic: the compiled model and its error types come from it (R90).
     """
     inputs = {
         "presets": entry.get("presets"),
@@ -98,24 +104,36 @@ def content_hash(document: dict[str, Any], entry: dict[str, Any]) -> str:
         "legacy_keys": entry.get("legacy_keys"),
         "lookups": document.get("lookups"),
         "pipeline_version": PRESETS_PIPELINE_VERSION,
+        "pydantic": [pydantic.VERSION, pydantic_core.__version__],
     }
-    canonical = json.dumps(
-        inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
+    # ASCII escapes: a lone surrogate in the document must not fail encoding.
+    canonical = json.dumps(inputs, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-async def sync_builtin_presets(
-    session: Session, redis: Redis, strategy: str
-) -> SyncOutcome:
-    """Run one sync of ``strategy``'s built-in presets (plan §4.3.2).
+def pipeline_source_hash() -> str:
+    """sha256 of the code that decides what a ``presets`` list parses to.
+
+    All of ``strategy_catalog.py`` (the parse of §4.2 and the pipeline of
+    §4.3.5) plus the database regrouping here, which also turns records into
+    errors (R90).
+    """
+    digest = hashlib.sha256(Path(strategy_catalog.__file__).read_bytes())
+    digest.update(inspect.getsource(_regroup_by_database).encode())
+    return digest.hexdigest()
+
+
+def sync_builtin_presets(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
+    """Run one sync of ``strategy``'s built-in presets (plan §4.3.2). Blocking.
 
     Owns the session's transaction: call it with no pending work, and read the
     presets for a response only after it returns (commit or rollback done).
+    Any failure is logged and reported as ``failed``: a sync never fails the
+    request that triggered it.
     """
     try:
-        outcome = await _sync(session, redis, strategy)
-    except _SYNC_FAILURES:
+        outcome = _sync(session, redis, strategy)
+    except Exception:
         session.rollback()
         logger.exception("strategy %r: built-in preset sync failed", strategy)
         return SyncOutcome("failed")
@@ -129,8 +147,10 @@ async def sync_builtin_presets(
     return outcome
 
 
-async def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
-    # 1. The lock row; every worker's sync of this strategy queues behind it.
+def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
+    # 1. The lock row; every worker's sync of this strategy queues behind it,
+    # but not for longer than LOCK_TIMEOUT.
+    session.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
     session.execute(
         text(
             "INSERT INTO strategy_builtin_sync (strategy, content_hash, status) "
@@ -151,9 +171,8 @@ async def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
     )
 
     # 2. What Redis holds now, read under the lock, and its key.
-    raw = await asyncio.wait_for(
-        redis.get(REDIS_STRATEGIES_KEY), timeout=REDIS_READ_TIMEOUT_S
-    )
+    # The blocking client with decode_responses returns the text itself.
+    raw = cast("str | None", redis.get(REDIS_STRATEGIES_KEY))
     if not raw:
         return SyncOutcome("no_catalog")
     try:
@@ -244,7 +263,10 @@ async def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
 def _strategy_entry(document: Any, strategy: str) -> dict[str, Any] | None:
     if not isinstance(document, dict):
         raise CatalogError("published catalog must be a JSON object")
-    for entry in document.get("strategies") or []:
+    strategies = document.get("strategies")
+    if not isinstance(strategies, list):
+        raise CatalogError("catalog strategies must be a list")
+    for entry in strategies:
         if isinstance(entry, dict) and entry.get("name") == strategy:
             return entry
     return None
@@ -294,8 +316,9 @@ def _regroup_by_database(session: Session, parsed: PresetsParse) -> PresetsParse
 __all__ = [
     "PIPELINE_SOURCE_SHA256",
     "PRESETS_PIPELINE_VERSION",
-    "REDIS_READ_TIMEOUT_S",
+    "LOCK_TIMEOUT",
     "SyncOutcome",
     "content_hash",
+    "pipeline_source_hash",
     "sync_builtin_presets",
 ]

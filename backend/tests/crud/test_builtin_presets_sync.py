@@ -7,11 +7,16 @@ index, reads after a concurrent insert, ``lower()`` of the index.
 
 import asyncio
 import json
+import socket
 import threading
+import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
+import redis as redis_lib
+from fastapi.concurrency import run_in_threadpool
 from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlmodel import Session, col, delete, select
@@ -19,6 +24,7 @@ from sqlmodel import Session, col, delete, select
 from app.core import builtin_presets, strategy_catalog
 from app.core.builtin_presets import SyncOutcome, sync_builtin_presets
 from app.core.db import engine
+from app.core.redis_client import SYNC_REDIS_TIMEOUT_S, get_sync_redis
 from app.models import StrategyBuiltinSync, StrategyPreset
 
 STRATEGY = "sync_test_strategy"
@@ -86,20 +92,18 @@ class FakeRedis:
     def publish(self, doc: dict[str, Any]) -> None:
         self.raw = json.dumps(doc)
 
-    async def get(self, key: str) -> str | None:
+    def get(self, key: str) -> str | None:
         assert key == strategy_catalog.REDIS_STRATEGIES_KEY
         raw = self.raw
         if self.on_get is not None:
-            result = self.on_get()
-            if asyncio.iscoroutine(result):
-                await result
+            self.on_get()
         return raw
 
 
 def sync(redis: FakeRedis) -> SyncOutcome:
     """One sync in its own session, as one request of one worker."""
     with Session(engine) as session:
-        return asyncio.run(sync_builtin_presets(session, redis, STRATEGY))  # type: ignore[arg-type]
+        return sync_builtin_presets(session, redis, STRATEGY)  # type: ignore[arg-type]
 
 
 def rows() -> dict[str, StrategyPreset]:
@@ -192,6 +196,27 @@ def test_what_is_applied_is_what_redis_holds_under_the_lock() -> None:
     redis.publish(document(changed))
     sync(redis)
     assert rows()["Fast"].params["window"] == 7
+
+
+def test_a_catalog_regaining_fast_before_the_sync_does_not_hide_it() -> None:
+    redis = FakeRedis(document(BOTH))
+    sync(redis)
+    redis.publish(document([BOTH[0]]))  # Fast gone...
+    redis.publish(document(BOTH))  # ...and back before anyone synced
+    assert sync(redis).result == "noop"
+    assert rows()["Fast"].retired_at is None
+
+
+def test_a_changed_schema_reparses_an_unchanged_list() -> None:
+    presets = [BOTH[0], {"name": "Fast", "params": {**FAST, "window": 50}}]
+    narrow = document(presets)
+    narrow["strategies"][0]["settings_schema"]["properties"]["window"]["maximum"] = 20
+    redis = FakeRedis(narrow)
+    assert sync(redis).errors == [{"index": 1, "name": "Fast", "type": "rejected"}]
+    redis.publish(document(presets))  # same presets; only the schema widened
+    outcome = sync(redis)
+    assert (outcome.result, outcome.status) == ("applied", "ok")
+    assert rows()["Fast"].params["window"] == 50
 
 
 def test_a_to_b_to_a_across_workers_ends_at_a() -> None:
@@ -412,6 +437,23 @@ def test_a_user_row_with_a_builtin_name_is_kept_until_it_goes() -> None:
     assert found["Default"].updated_at == default_updated  # good rows untouched
 
 
+def test_a_deleted_user_row_makes_way_for_the_builtin() -> None:
+    add_user_preset("Fast")
+    redis = FakeRedis(document(BOTH))
+    assert sync(redis).status == "partial"
+    with Session(engine) as session:
+        session.execute(
+            delete(StrategyPreset).where(
+                col(StrategyPreset.strategy) == STRATEGY,
+                col(StrategyPreset.name) == "Fast",
+            )
+        )
+        session.commit()
+    outcome = sync(redis)
+    assert (outcome.status, outcome.errors) == ("ok", [])
+    assert rows()["Fast"].is_builtin
+
+
 def test_a_user_row_inserted_during_the_sync_is_a_conflict() -> None:
     """A user's POST that commits after the sync began, before its upsert."""
     redis = FakeRedis(document(BOTH))
@@ -453,27 +495,78 @@ def test_a_database_error_changes_nothing_and_the_next_sync_works(
     assert sync(redis).result == "applied"
 
 
-def test_a_hung_redis_releases_the_lock_after_the_timeout(
+def test_the_blocking_client_bounds_every_read() -> None:
+    options = get_sync_redis().connection_pool.connection_kwargs
+    assert options["socket_timeout"] == SYNC_REDIS_TIMEOUT_S == 2.0
+    assert options["socket_connect_timeout"] == SYNC_REDIS_TIMEOUT_S
+
+
+def test_a_hung_redis_releases_the_lock_after_the_timeout() -> None:
+    """A real client against a server that accepts and never answers."""
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = server.getsockname()[1]
+        hung = redis_lib.Redis(
+            port=port, socket_timeout=0.3, socket_connect_timeout=0.3
+        )
+        started = time.monotonic()
+        with Session(engine) as session:
+            assert sync_builtin_presets(session, hung, STRATEGY).result == "failed"
+        assert time.monotonic() - started < 5
+        hung.close()
+    assert state() is None  # rolled back: the lock is free
+    assert sync(FakeRedis(document(BOTH))).result == "applied"
+
+
+def test_a_held_lock_is_waited_for_only_up_to_the_lock_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(builtin_presets, "REDIS_READ_TIMEOUT_S", 0.2)
     redis = FakeRedis(document(BOTH))
-    redis.on_get = lambda: asyncio.sleep(30)
-    assert sync(redis).result == "failed"
-    redis.on_get = None
-    assert sync(redis).result == "applied"
+    sync(redis)
+    redis.publish(document([BOTH[0]]))
+    monkeypatch.setattr(builtin_presets, "LOCK_TIMEOUT", "200ms")
+    with holding_the_lock(redis) as release:
+        started = time.monotonic()
+        assert sync(FakeRedis(document(BOTH))).result == "failed"
+        assert time.monotonic() - started < 3
+        release()
 
 
-def test_an_unusable_catalog_is_a_failure_not_an_exception() -> None:
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "{not json",
+        "[]",
+        json.dumps({"strategies": 5}),  # R89: was a TypeError
+        json.dumps({"strategies": "abc"}),
+        "[" * 100_000 + "]" * 100_000,  # RecursionError in json
+    ],
+)
+def test_an_unusable_catalog_is_a_failure_not_an_exception(raw: str) -> None:
     redis = FakeRedis(None)
-    redis.raw = "{not json"
+    redis.raw = raw
     assert sync(redis).result == "failed"
-    redis.raw = None
-    assert sync(redis).result == "no_catalog"
     assert state() is None
 
 
-def test_four_concurrent_first_syncs_write_one_row_per_name() -> None:
+def test_no_catalog_changes_nothing() -> None:
+    assert sync(FakeRedis(None)).result == "no_catalog"
+    assert sync(FakeRedis(document(BOTH) | {"strategies": []})).result == "no_catalog"
+    assert state() is None
+
+
+@pytest.mark.parametrize("bad", ["X\u0000", "\ud800", "Tab\there"])
+def test_a_name_postgres_cannot_hold_is_unreadable_and_isolated(bad: str) -> None:
+    """R89: one such entry must not cancel the sync of the good ones."""
+    outcome = sync(FakeRedis(document([*BOTH, {"name": bad, "params": FAST}])))
+    assert (outcome.result, outcome.status) == ("applied", "partial")
+    assert outcome.errors == [{"index": 2, "name": None, "type": "unreadable"}]
+    assert set(rows()) == {"Default", "Fast"}
+
+
+def test_four_first_requests_at_once_give_one_row_per_name() -> None:
+    """Serialisation on an empty table comes from the lock row's insert."""
     redis = FakeRedis(document(BOTH))
     start = threading.Barrier(4)
     outcomes: list[SyncOutcome] = []
@@ -526,10 +619,76 @@ def test_the_first_inserter_rolling_back_lets_the_next_one_sync() -> None:
     assert set(rows()) == {"Default", "Fast"}
 
 
+@contextmanager
+def holding_the_lock(redis: FakeRedis) -> Iterator[Callable[[], None]]:
+    """A worker inside its sync, holding the existing lock row, until released."""
+    inside, release = threading.Event(), threading.Event()
+    calls = 0
+
+    def hold() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            inside.set()
+            release.wait(timeout=30)
+
+    redis.on_get = hold
+    results: list[SyncOutcome] = []
+    holder = threading.Thread(target=lambda: results.append(sync(redis)))
+    holder.start()
+    assert inside.wait(timeout=30)
+    try:
+        yield release.set
+    finally:
+        release.set()
+        holder.join(timeout=30)
+        redis.on_get = None
+
+
+def test_a_sync_waits_for_the_lock_on_an_existing_row() -> None:
+    """R88: with the row in place, only FOR UPDATE serialises two workers."""
+    redis = FakeRedis(document(BOTH))
+    sync(redis)
+    redis.publish(
+        document([BOTH[0], {"name": "Fast", "params": {**FAST, "window": 6}}])
+    )
+    with holding_the_lock(redis) as release:
+        waiter: list[SyncOutcome] = []
+        second = threading.Thread(target=lambda: waiter.append(sync(redis)))
+        second.start()
+        second.join(timeout=0.5)
+        assert second.is_alive()  # waits on FOR UPDATE, has not read Redis
+        release()
+        second.join(timeout=30)
+    assert [o.result for o in waiter] == ["noop"]  # saw the holder's commit
+    assert rows()["Fast"].params["window"] == 6
+
+
+def test_two_syncs_in_one_event_loop_both_finish() -> None:
+    """R87: an async route hands the blocking sync to a thread; two requests in
+    one worker's loop must not deadlock on the lock row."""
+    redis = FakeRedis(document(BOTH))
+    sync(redis)
+    redis.publish(
+        document([BOTH[0], {"name": "Fast", "params": {**FAST, "window": 7}}])
+    )
+    redis.on_get = lambda: time.sleep(0.3)  # hold the lock across the read
+
+    def request() -> SyncOutcome:
+        with Session(engine) as session:
+            return sync_builtin_presets(session, redis, STRATEGY)  # type: ignore[arg-type]
+
+    async def two_requests() -> list[SyncOutcome]:
+        return list(
+            await asyncio.gather(run_in_threadpool(request), run_in_threadpool(request))
+        )
+
+    outcomes = asyncio.run(asyncio.wait_for(two_requests(), timeout=20))
+    assert sorted(o.result for o in outcomes) == ["applied", "noop"]
+
+
 def test_the_sync_owns_its_transaction() -> None:
     """``items`` are read after the sync: nothing is left open or pending."""
     with Session(engine) as session:
-        asyncio.run(
-            sync_builtin_presets(session, FakeRedis(document(BOTH)), STRATEGY)  # type: ignore[arg-type]
-        )
+        sync_builtin_presets(session, FakeRedis(document(BOTH)), STRATEGY)  # type: ignore[arg-type]
         assert not session.in_transaction()

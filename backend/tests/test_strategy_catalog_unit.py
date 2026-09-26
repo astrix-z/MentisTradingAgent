@@ -861,6 +861,9 @@ def test_an_envelope_defect_is_unreadable_and_good_ones_stay(entry: Any) -> None
         ({"name": "x" * 65, "params": GOOD}, None),
         ({"name": "   ", "params": GOOD}, None),
         ({"name": 5, "params": GOOD}, None),
+        ({"name": "X\u0000", "params": GOOD}, None),  # R89: PostgreSQL text
+        ({"name": "Tab\there", "params": GOOD}, None),
+        ({"name": "\ud800", "params": GOOD}, None),  # a lone surrogate
         ({"name": " NoParams ", "params": None}, "NoParams"),
     ],
 )
