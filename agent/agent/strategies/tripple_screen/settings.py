@@ -18,6 +18,7 @@ from agent.common.intervals import interval_ms
 PositiveInt = Annotated[int, Field(gt=0)]
 
 TRAIL_CAP_MESSAGE = "trailing stop cap % must be below take profit %"
+TIMEFRAME_MESSAGE = "timeframes must satisfy tide > wave > ripple"
 
 
 class TripleScreenSettings(BaseModel):
@@ -104,8 +105,9 @@ class TripleScreenSettings(BaseModel):
             interval_ms(value)
             for value in (self.tide_interval, self.wave_interval, self.ripple_interval)
         )
-        if tide != 4 * wave or wave != 4 * ripple:
-            raise ValueError("timeframes must have tide:wave:ripple ratio 16:4:1")
+        # Only the order is required (owner decision D1): pairs need not divide.
+        if not tide > wave > ripple:
+            raise ValueError(TIMEFRAME_MESSAGE)
         if not self.trail_cap_pct < self.tp_pct:
             raise ValueError(TRAIL_CAP_MESSAGE)
         needed = max(

@@ -19,10 +19,12 @@ from typing import Any
 from binance_sdk_spot.rest_api.models import KlinesIntervalEnum
 
 from agent.common.intervals import interval_ms
-from agent.strategies.tripple_screen.settings import TRAIL_CAP_MESSAGE
+from agent.strategies.tripple_screen.settings import (
+    TIMEFRAME_MESSAGE,
+    TRAIL_CAP_MESSAGE,
+)
 
 EMA_MESSAGE = "EMA tide periods must be three strictly increasing positive periods"
-RATIO_MESSAGE = "timeframes must have tide:wave:ripple ratio 16:4:1"
 
 
 def _intervals_ms() -> dict[str, int]:
@@ -69,28 +71,16 @@ CONSTRAINTS: list[dict[str, Any]] = [
         "message": EMA_MESSAGE,
     },
     {
-        "cmp": "eq",
+        "cmp": "gt",
         "lhs": {"lookup": "intervals_ms", "field": "tide_interval"},
-        "rhs": {
-            "op": "mul",
-            "args": [
-                {"const": 4},
-                {"lookup": "intervals_ms", "field": "wave_interval"},
-            ],
-        },
-        "message": RATIO_MESSAGE,
+        "rhs": {"lookup": "intervals_ms", "field": "wave_interval"},
+        "message": TIMEFRAME_MESSAGE,
     },
     {
-        "cmp": "eq",
+        "cmp": "gt",
         "lhs": {"lookup": "intervals_ms", "field": "wave_interval"},
-        "rhs": {
-            "op": "mul",
-            "args": [
-                {"const": 4},
-                {"lookup": "intervals_ms", "field": "ripple_interval"},
-            ],
-        },
-        "message": RATIO_MESSAGE,
+        "rhs": {"lookup": "intervals_ms", "field": "ripple_interval"},
+        "message": TIMEFRAME_MESSAGE,
     },
     {
         # max(slow + 1, k + d, k + d + slow - 2, fi + 2, swing_low, trail, 2)

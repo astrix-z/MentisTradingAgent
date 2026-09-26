@@ -828,10 +828,10 @@ test("invalid numeric, list and domain values block Start without sending a requ
   expect(api.posts).toEqual([])
   await page.getByLabel("EMA tide periods").fill("5, 13, 34")
 
-  // Domain rule: tide:wave:ripple ratio must be 16:4:1.
-  await page.getByLabel("Wave interval").fill("2h")
+  // Domain rule: timeframes must satisfy tide > wave > ripple.
+  await page.getByLabel("Wave interval").fill("4h")
   await page.getByRole("button", { name: "Start", exact: true }).click()
-  await expect(page.getByText(/ratio 16:4:1/)).toBeVisible()
+  await expect(page.getByText(/tide > wave > ripple/)).toBeVisible()
   expect(api.posts).toEqual([])
 })
 

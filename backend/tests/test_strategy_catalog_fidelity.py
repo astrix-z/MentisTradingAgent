@@ -67,6 +67,11 @@ def test_backend_accepts_every_declared_default() -> None:
         {"kline_window": 35},
         {"ema_tide_periods": [5, 13, 34]},
         {"tide_interval": "8h", "wave_interval": "2h", "ripple_interval": "30m"},
+        # Only the order is required (D1): non-multiple and day/week scales.
+        {"tide_interval": "1h", "wave_interval": "15m", "ripple_interval": "5m"},
+        {"tide_interval": "12h", "wave_interval": "6h", "ripple_interval": "4h"},
+        {"tide_interval": "1w", "wave_interval": "1d", "ripple_interval": "4h"},
+        {"wave_interval": "2h"},
         {"rest_concurrency": 5, "cooldown_minutes": 0},
         {"trail_cap_pct": 0},
         {"trail_cap_pct": "3", "tp_pct": "3.5"},
@@ -92,8 +97,9 @@ def test_backend_and_agent_accept_the_same_parameters(params: dict[str, Any]) ->
         {"ema_tide_periods": [0, 13, 34]},
         # Cross-field rules, from the published constraints.
         {"ema_tide_periods": [34, 13, 5]},
-        {"wave_interval": "2h"},
-        {"ripple_interval": "5m"},
+        {"wave_interval": "4h"},  # tide == wave
+        {"tide_interval": "30m"},  # tide < wave
+        {"ripple_interval": "1h"},  # wave == ripple
         {"kline_window": 34},
         {"stochastic_k_period": 1000},
         # The trailing cap must stay below the take-profit (spec §7.4).
@@ -137,10 +143,10 @@ def test_backend_reports_the_agents_own_message() -> None:
 
 
 def test_a_repeated_rule_message_is_reported_once() -> None:
-    """The ratio chain is two comparisons sharing one message; say it once."""
-    errors = STRATEGY.validate({"wave_interval": "2h"})
+    """The order chain is two comparisons sharing one message; say it once."""
+    errors = STRATEGY.validate({"tide_interval": "15m", "ripple_interval": "4h"})
     assert [error["msg"] for error in errors] == [
-        "timeframes must have tide:wave:ripple ratio 16:4:1"
+        "timeframes must satisfy tide > wave > ripple"
     ]
 
 

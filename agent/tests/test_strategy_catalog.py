@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
+from decimal import Decimal, Inexact, localcontext
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -42,13 +42,15 @@ class RuleFailed(Exception):
     """One published constraint could not be evaluated for this payload."""
 
 
-def _number(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+def _number(value: Any) -> Decimal:
+    # Exact, never float: the reference must not share a rounding bug with the
+    # evaluator it checks (large integers, long decimals).
+    if isinstance(value, bool) or not isinstance(value, (int, str, Decimal)):
         raise RuleFailed(f"not a number: {value!r}")
-    return float(value)
+    return Decimal(value)
 
 
-def _eval_expr(expr: dict[str, Any], values: dict[str, Any], lookups: Any) -> float:
+def _eval_expr(expr: dict[str, Any], values: dict[str, Any], lookups: Any) -> Decimal:
     if "const" in expr:
         return _number(expr["const"])
     if "lookup" in expr:
@@ -66,9 +68,12 @@ def _eval_expr(expr: dict[str, Any], values: dict[str, Any], lookups: Any) -> fl
     args = [_eval_expr(arg, values, lookups) for arg in expr["args"]]
     op = expr["op"]
     if op == "add":
-        return math.fsum(args)
+        return sum(args, Decimal(0))
     if op == "mul":
-        return math.prod(args)
+        product = Decimal(1)
+        for arg in args:
+            product *= arg
+        return product
     if op == "max":
         return max(args)
     if op == "sub":
@@ -104,8 +109,12 @@ def reference_check(params: dict[str, Any]) -> list[str]:
     failures: list[str] = []
     for rule in PARAMS_ENTRY["constraints"]:
         try:
-            lhs = _eval_expr(rule["lhs"], values, lookups)
-            rhs = _eval_expr(rule["rhs"], values, lookups)
+            with localcontext() as context:
+                # Far beyond any test value, and loud if that ever stops holding.
+                context.prec = 1000
+                context.traps[Inexact] = True
+                lhs = _eval_expr(rule["lhs"], values, lookups)
+                rhs = _eval_expr(rule["rhs"], values, lookups)
         except RuleFailed:
             failures.append(rule["message"])
             continue
@@ -196,8 +205,13 @@ def test_no_constraints_when_a_strategy_has_no_settings() -> None:
         {},  # every default
         {"ema_tide_periods": [5, 13, 34]},
         {"kline_window": 35},  # exactly the required minimum
-        # The ratio rule admits other scales than the default 4h/1h/15m.
+        # Only the order tide > wave > ripple is required (D1), at any scale.
         {"tide_interval": "8h", "wave_interval": "2h", "ripple_interval": "30m"},
+        {"tide_interval": "1h", "wave_interval": "15m", "ripple_interval": "5m"},
+        {"tide_interval": "6h", "wave_interval": "4h", "ripple_interval": "1h"},
+        {"tide_interval": "12h", "wave_interval": "6h", "ripple_interval": "4h"},
+        {"tide_interval": "1w", "wave_interval": "1d", "ripple_interval": "4h"},
+        {"wave_interval": "2h"},  # 4h > 2h > 15m: no longer a ratio violation
         {"tp_pct": "12"},  # Decimal as a string
     ],
 )
@@ -211,8 +225,17 @@ def test_published_rules_accept_what_the_model_accepts(params: dict[str, Any]) -
     [
         {"ema_tide_periods": [34, 13, 5]},  # decreasing
         {"ema_tide_periods": [5, 5, 34]},  # not strictly increasing
-        {"wave_interval": "2h"},  # breaks the 16:4:1 ratio
-        {"ripple_interval": "5m"},  # breaks the 16:4:1 ratio
+        {"wave_interval": "4h"},  # tide == wave
+        {"tide_interval": "30m"},  # tide < wave
+        {"ripple_interval": "1h"},  # wave == ripple
+        {"ripple_interval": "2h"},  # ripple > wave
+        # Exact arithmetic: float would round the required window down to 1e28.
+        {
+            "stochastic_k_period": 10**28,
+            "stochastic_d_period": 1,
+            "stochastic_slow_period": 3,
+            "kline_window": 10**28,
+        },
         {"kline_window": 34},  # one below the required window
         {"stochastic_k_period": 1000},  # pushes the required window above 1000
     ],
@@ -230,11 +253,12 @@ def test_kline_window_message_reports_the_real_minimum() -> None:
     ]
 
 
-def test_ratio_failure_message_is_the_published_one() -> None:
-    # Both ratio rules trip, and both carry the same published message.
-    assert set(reference_check({"wave_interval": "2h"})) == {
-        "timeframes must have tide:wave:ripple ratio 16:4:1"
-    }
+def test_timeframe_order_failure_message_is_the_published_one() -> None:
+    # 15m / 1h / 4h trips both order rules; both carry the same published message.
+    failures = reference_check({"tide_interval": "15m", "ripple_interval": "4h"})
+    assert failures == ["timeframes must satisfy tide > wave > ripple"] * 2
+    with pytest.raises(ValueError, match=r"tide > wave > ripple"):
+        TripleScreenSettings.from_params({"tide_interval": "1h"})
 
 
 # --- Publishing -------------------------------------------------------------

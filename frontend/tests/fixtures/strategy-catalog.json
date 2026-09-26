@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "schema_hash": "b6181e9e8555bcecc8659f86485a74acbcf6d377bbcedac0fe38cef41180c672",
-  "published_at": "2026-09-25T16:26:35.639566+00:00",
+  "schema_hash": "c8984cc8c17b6e151ea7dc092895b482c34d89d9344adfb489de95bb4f294cc5",
+  "published_at": "2026-09-25T17:07:21.234123+00:00",
   "lookups": {
     "intervals_ms": {
       "1s": 1000,
@@ -346,44 +346,28 @@
           "message": "EMA tide periods must be three strictly increasing positive periods"
         },
         {
-          "cmp": "eq",
+          "cmp": "gt",
           "lhs": {
             "lookup": "intervals_ms",
             "field": "tide_interval"
           },
           "rhs": {
-            "op": "mul",
-            "args": [
-              {
-                "const": 4
-              },
-              {
-                "lookup": "intervals_ms",
-                "field": "wave_interval"
-              }
-            ]
+            "lookup": "intervals_ms",
+            "field": "wave_interval"
           },
-          "message": "timeframes must have tide:wave:ripple ratio 16:4:1"
+          "message": "timeframes must satisfy tide > wave > ripple"
         },
         {
-          "cmp": "eq",
+          "cmp": "gt",
           "lhs": {
             "lookup": "intervals_ms",
             "field": "wave_interval"
           },
           "rhs": {
-            "op": "mul",
-            "args": [
-              {
-                "const": 4
-              },
-              {
-                "lookup": "intervals_ms",
-                "field": "ripple_interval"
-              }
-            ]
+            "lookup": "intervals_ms",
+            "field": "ripple_interval"
           },
-          "message": "timeframes must have tide:wave:ripple ratio 16:4:1"
+          "message": "timeframes must satisfy tide > wave > ripple"
         },
         {
           "cmp": "gte",
