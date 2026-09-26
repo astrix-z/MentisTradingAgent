@@ -661,6 +661,51 @@ def test_start_errors_point_at_body_params(
     assert not redis.publications
 
 
+@pytest.mark.parametrize(
+    ("execution", "field", "kind"),
+    [
+        ({"enabled": "true"}, "enabled", "bool_type"),
+        ({"enabled": 1}, "enabled", "bool_type"),
+    ],
+)
+def test_execution_settings_are_strict_too(
+    client: TestClient,
+    redis: MemoryRedis,
+    execution: dict[str, Any],
+    field: str,
+    kind: str,
+) -> None:
+    """R69: the compiler is shared, so execution gets the same wire types."""
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "execution": execution},
+        headers=headers(client),
+    )
+    assert response.status_code == 422
+    assert [(e["loc"], e["type"]) for e in response.json()["detail"]] == [
+        (["body", "execution", field], kind)
+    ]
+    assert not redis.publications
+
+
+def test_an_integer_too_long_to_parse_is_refused_without_enqueue(
+    client: TestClient,
+    redis: MemoryRedis,
+) -> None:
+    """R70: 4301 digits exceed Python's int parsing limit; the body is a 400."""
+    body = json.dumps({**START, "params": {"kline_window": 0}}).replace(
+        '"kline_window": 0', '"kline_window": ' + "9" * 4301
+    )
+    response = client.post(
+        "/api/v1/trading/start/",
+        content=body,
+        headers={**headers(client), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
 def test_a_renamed_parameter_is_refused_with_a_reload_hint(
     client: TestClient,
     redis: MemoryRedis,

@@ -99,18 +99,16 @@ def params_text(case: dict[str, Any]) -> str:
 def category(error: dict[str, Any]) -> tuple[str, str | None]:
     """Map one 422 ``detail`` item to the fixture's ``(category, field)`` pair."""
     loc = list(error.get("loc") or [])
-    # ["body", "params", <field>] or the compiled model's bare [<field>];
-    # ["body", <position>] (broken JSON) has no field. Any other body location
-    # is an error in the wrapper (symbols, network, ...), not in params: the
-    # cases never expect one, so it fails the runner instead of reading as a
-    # field-less rule error.
-    if loc[:1] == ["body"]:
-        if loc[1:2] == ["params"]:
-            loc = loc[2:]
-        elif len(loc) == 2 and isinstance(loc[1], int):
-            loc = []
-        else:
-            raise AssertionError(f"error outside params: {error}")
+    # A Start reports params errors under ["body", "params", ...] (plan
+    # §4.3.4); ["body", <position>] (broken JSON) has no field. Anything else —
+    # a bare [<field>] or an error in the wrapper (symbols, network, ...) —
+    # fails the runner instead of reading as a matching error.
+    if loc[:2] == ["body", "params"]:
+        loc = loc[2:]
+    elif len(loc) == 2 and loc[0] == "body" and isinstance(loc[1], int):
+        loc = []
+    else:
+        raise AssertionError(f"error outside body.params: {error}")
     field = loc[0] if loc and isinstance(loc[0], str) else None
     kind = error["type"]
     if kind in ERROR_MAP["types"]:

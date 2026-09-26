@@ -638,3 +638,71 @@ def test_apply_legacy_keys_moves_and_compares_after_validation() -> None:
     moved, errors = strategy.apply_legacy_keys({"size": 0, "window": 7})
     assert (moved, errors) == ({"window": 0}, [])
     assert [e["type"] for e in strategy.validate(moved)] == ["greater_than"]
+
+
+@pytest.mark.parametrize(
+    ("value", "kind"),
+    [
+        (True, "float_type"),
+        ("5", "float_type"),
+        (1e-300, "too_large"),
+        (1e300, "too_large"),
+    ],
+)
+def test_a_number_field_is_strict_and_in_the_domain(value: Any, kind: str) -> None:
+    """R66: a float field must not reach the rules with 1e-300 (that was a 503)."""
+    document = with_properties(x={"type": "number", "default": 1.0})
+    document["strategies"][0]["constraints"] = [
+        rule(
+            cmp="gt",
+            lhs={"op": "add", "args": [{"field": "x"}, {"const": 1}]},
+            rhs={"const": 0},
+            message="x must be above -1",
+        )
+    ]
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    assert strategy.validate({"x": 2}) == []
+    assert strategy.validate({"x": 2.5}) == []
+    assert [error["type"] for error in strategy.validate({"x": value})] == [kind]
+
+
+def test_an_interval_field_without_its_lookup_fails_at_compile_time() -> None:
+    """R67: not a 503 on every Start of a catalog that reads as available."""
+    document = with_properties(tide=interval_field())
+    document["lookups"] = {}
+    with pytest.raises(CatalogError, match="need an intervals_ms lookup"):
+        compile_catalog(document)
+
+
+@pytest.mark.parametrize(
+    "prop",
+    [
+        {"type": "integer", "default": 10**70},
+        {
+            "anyOf": [{"type": "number"}, {"type": "string"}],
+            "default": "1e70",
+        },
+        {
+            "type": "array",
+            "default": [1, 10**70],
+            "minItems": 2,
+            "maxItems": 2,
+            "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+        },
+    ],
+)
+def test_a_default_outside_the_domain_fails_at_compile_time(prop: Any) -> None:
+    with pytest.raises(CatalogError, match="outside the numeric domain"):
+        compile_catalog(with_properties(big=prop))
+
+
+def test_apply_legacy_keys_compares_after_strict_validation() -> None:
+    """R68: unlike the lax agent, "7" beside 7 is the field's type error."""
+    document = payload()
+    document["strategies"][0]["legacy_keys"] = {"size": "window"}
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    moved, errors = strategy.apply_legacy_keys({"size": "7", "window": 7})
+    assert (moved, errors) == ({"window": "7"}, [])
+    assert [e["type"] for e in strategy.validate(moved)] == ["int_type"]

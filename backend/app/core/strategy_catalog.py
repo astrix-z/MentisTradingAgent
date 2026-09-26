@@ -76,13 +76,14 @@ _BOUNDS = {
     "maximum": "le",
 }
 # Strict where the wire type is unambiguous (plan §4.3.5 step 1): an integer
-# field takes only a JSON integer — not a bool, a string or 5.0 — and a string
+# field takes only a JSON integer — not a bool, a string or 5.0 — a number
+# field a JSON number (integer or not, never a bool or a string), and a string
 # or boolean field only its own type. Decimal fields (``anyOf`` number/string)
 # stay lax on purpose: they take a JSON number or a decimal string.
 _PRIMITIVES: dict[str, Any] = {
     "string": Annotated[str, Strict()],
     "integer": Annotated[int, Strict()],
-    "number": float,
+    "number": Annotated[float, Strict()],
     "boolean": Annotated[bool, Strict()],
 }
 
@@ -225,6 +226,8 @@ def _leaf(schema: dict[str, Any], where: str) -> tuple[Any, dict[str, Any]]:
     base = _primitive(schema, where)
     if schema.get("type") == "integer":
         base = Annotated[base, _domain(int)]
+    elif schema.get("type") == "number":
+        base = Annotated[base, _domain(int, float)]
     return base, schema
 
 
@@ -554,7 +557,7 @@ class CompiledStrategy:
         }
         if self._model is None and self.constraints:
             raise CatalogError(f"strategy {self.name!r}: constraints without settings")
-        self._interval_fields = [
+        self._interval_fields: list[str] = [
             name
             for name, prop in (
                 (self.settings_schema or {}).get("properties") or {}
@@ -562,6 +565,36 @@ class CompiledStrategy:
             if isinstance(prop, dict)
             and (prop.get("ui") or {}).get("widget") == "interval"
         ]
+        if self._interval_fields and not isinstance(
+            self.lookups.get("intervals_ms"), dict
+        ):
+            raise CatalogError(
+                f"strategy {self.name!r}: interval fields "
+                f"{', '.join(self._interval_fields)} need an intervals_ms lookup"
+            )
+        self._check_default_domain()
+
+    def _check_default_domain(self) -> None:
+        """A numeric default outside the domain is a catalog defect, found now.
+
+        Otherwise every Start that omits the field would get ``too_large`` on
+        it, a catalog defect dressed up as the user's error.
+        """
+        for name, default in self._defaults.items():
+            values = default if isinstance(default, list) else [default]
+            for value in values:
+                if isinstance(value, str) and not self._numeric_field(name):
+                    continue
+                number = _as_decimal(value)
+                if number is not None and not in_domain(number):
+                    raise CatalogError(
+                        f"strategy {self.name!r}: default of {name!r} "
+                        f"({value!r}) is outside the numeric domain"
+                    )
+
+    def _numeric_field(self, name: str) -> bool:
+        prop = ((self.settings_schema or {}).get("properties") or {}).get(name)
+        return isinstance(prop, dict) and "anyOf" in prop
 
     def validate(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         """Errors for a Start's ``params``, through the pipeline of plan §4.3.5.
@@ -599,13 +632,8 @@ class CompiledStrategy:
     def _unsupported(self, values: dict[str, Any]) -> list[dict[str, Any]]:
         """Step 3: interval-widget fields must name a served interval."""
         errors: list[dict[str, Any]] = []
+        table = self.lookups.get("intervals_ms") or {}  # present: checked at compile
         for name in self._interval_fields:
-            table = self.lookups.get("intervals_ms")
-            if not isinstance(table, dict):
-                raise CatalogError(
-                    f"strategy {self.name!r}: {name!r} is an interval field but "
-                    "the catalog has no intervals_ms lookup"
-                )
             value = values.get(name)
             if str(value) not in table:
                 errors.append(
@@ -656,9 +684,13 @@ class CompiledStrategy:
         For reading stored or built-in presets, never for a Start (a Start with
         an old name is refused, see :meth:`_extra_param`). An old name alone is
         moved as is and validated later like any value. With both names, each
-        value is validated by the field's type first, so ``"7"`` and ``7``
-        agree; an invalid one is left under the new name for the field's own
-        error, and two valid values that differ are a ``legacy_conflict``.
+        value is validated by the field's **strict** type first; an invalid one
+        is left under the new name for the field's own error, and two valid
+        values that differ are a ``legacy_conflict``. Strictness is where this
+        differs from the agent on purpose: ``"7"`` beside ``7`` is a type error
+        here, while the lax agent reads both as 7. Presets only ever reach this
+        helper in their JSON form (saved through the strict API, or published
+        with integers as numbers), so a string there is a defect worth showing.
         """
         moved = dict(params)
         errors: list[dict[str, Any]] = []

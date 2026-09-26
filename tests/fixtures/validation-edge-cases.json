@@ -1967,6 +1967,84 @@
       "intentional_difference": null
     },
     {
+      "id": "decimal-bool",
+      "note": "true в decimal-поле: все слои — type (агент тоже не принимает bool как Decimal)",
+      "ui_draft": null,
+      "params_patch": {
+        "tp_pct": true
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
       "id": "int-numeric-string",
       "note": "\"5\" в целом поле",
       "ui_draft": null,
