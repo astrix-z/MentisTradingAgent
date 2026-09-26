@@ -11,8 +11,11 @@ package and is never skipped:
 
 An accepted Start must enqueue the params exactly as sent (the backend
 forwards them verbatim); a rejected one must enqueue nothing.
-``backend_preset_post`` is declared by every case but its endpoint arrives with
-PRESET-06, which adds it to ``ROUTES``.
+
+Every backend entry point the fixture declares is collected. One whose
+endpoint does not exist yet is listed under ``stages`` with its owning task
+and is reported as a ``deferred`` skip (``pytest -rs``); an ``n/a`` outcome is
+reported as an ``n/a`` skip. Neither counts as a pass.
 """
 
 import json
@@ -35,6 +38,15 @@ BASELINE: dict[str, Any] = DOCUMENT["baseline"]
 ERROR_MAP: dict[str, Any] = DOCUMENT["error_map"]["backend"]
 CASES: list[dict[str, Any]] = DOCUMENT["cases"]
 STRATEGY = "tripple_screen"
+ENTRY_POINTS = (
+    "backend_start",
+    "backend_commands_start",
+    "backend_preset_post",
+    "backend_preset_put",
+)
+STAGES: dict[str, str] = {
+    key: value for key, value in DOCUMENT["stages"].items() if key != "$comment"
+}
 
 __all__ = ["client"]  # the imported fixture, used by name below
 
@@ -87,8 +99,10 @@ def params_text(case: dict[str, Any]) -> str:
 def category(error: dict[str, Any]) -> tuple[str, str | None]:
     """Map one 422 ``detail`` item to the fixture's ``(category, field)`` pair."""
     loc = list(error.get("loc") or [])
-    if loc[:2] == ["body", "params"]:
-        loc = loc[2:]
+    # ["body", "params", <field>] or the compiled model's bare [<field>];
+    # a body-level error (e.g. ["body", 21] for broken JSON) has no field.
+    if loc[:1] == ["body"]:
+        loc = loc[2:] if loc[1:2] == ["params"] else []
     field = loc[0] if loc and isinstance(loc[0], str) else None
     kind = error["type"]
     if kind in ERROR_MAP["types"]:
@@ -100,14 +114,15 @@ def category(error: dict[str, Any]) -> tuple[str, str | None]:
     raise AssertionError(f"unmapped backend error: {error}")
 
 
-def test_every_case_declares_the_preset_endpoint() -> None:
-    """Declared now, run from PRESET-06: a missing outcome is a runner error."""
+def test_every_backend_entry_point_is_run_or_deferred() -> None:
+    """A missing outcome, or an entry point with neither route nor owner, fails."""
+    for entry_point in ENTRY_POINTS:
+        assert (entry_point in ROUTES) != (entry_point in STAGES), entry_point
     for case in CASES:
-        assert "backend_preset_post" in case["outcomes"], case["id"]
-        assert set(ROUTES) <= set(case["outcomes"]), case["id"]
+        assert set(ENTRY_POINTS) <= set(case["outcomes"]), case["id"]
 
 
-@pytest.mark.parametrize("entry_point", sorted(ROUTES))
+@pytest.mark.parametrize("entry_point", ENTRY_POINTS)
 @pytest.mark.parametrize("case", CASES, ids=[case["id"] for case in CASES])
 def test_backend_entry_point(
     client: TestClient,
@@ -116,8 +131,10 @@ def test_backend_entry_point(
     entry_point: str,
 ) -> None:
     outcome = case["outcomes"][entry_point]
+    if entry_point in STAGES:
+        pytest.skip(f"deferred: {entry_point} runs from {STAGES[entry_point]}")
     if outcome == "n/a":
-        return
+        pytest.skip(f"n/a: {entry_point} does not apply to {case['id']}")
     path, wrap = ROUTES[entry_point]
     params = params_text(case)
     response = client.post(

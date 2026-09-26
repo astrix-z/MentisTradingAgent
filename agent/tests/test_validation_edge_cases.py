@@ -7,13 +7,21 @@ snapshot through :func:`commands.resume_from_runtime`. The command and resume
 paths use a real :class:`Engine` with only the network part of the run
 (``_start_run``) stubbed, and a spy on ``from_params`` proves validation was
 actually reached: returning before it would be a false pass.
+
+The one exception is a refusal of the envelope itself (malformed JSON): the
+agent drops it before settings exist, so the runner instead requires that
+nothing happened — no result, no run — and that the refusal was logged with
+the message ``error_map.agent.envelope`` names. An ``n/a`` outcome is reported
+as a skip with that reason, never as a pass.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -38,6 +46,7 @@ ENTRY_POINTS = (
     "backend_start",
     "backend_commands_start",
     "backend_preset_post",
+    "backend_preset_put",
     "agent_model_validate",
     "agent_command",
     "agent_resume",
@@ -123,30 +132,55 @@ def engine_without_network(redis: Any) -> Engine:
     return engine
 
 
-def run_model_validate(text: str, _: pytest.MonkeyPatch) -> Any:
+@dataclass(frozen=True)
+class EnvelopeRejected:
+    """Refused before settings validation: the params never reached the model."""
+
+    category: str
+
+
+def envelope_rejection(entry_point: str, caplog: pytest.LogCaptureFixture) -> Any:
+    """The mapped category of the logged refusal; a silent drop fails the test."""
+    rule = ERROR_MAP["envelope"][entry_point]
+    logged = [record.getMessage() for record in caplog.records]
+    assert any(re.search(rule["pattern"], line) for line in logged), logged
+    return EnvelopeRejected(rule["category"])
+
+
+def run_model_validate(text: str, *_: Any) -> Any:
     try:
         return TripleScreenSettings.model_validate(json.loads(text))
     except ValidationError as exc:
         return exc
 
 
-def run_command(text: str, monkeypatch: pytest.MonkeyPatch) -> Any:
+def run_command(
+    text: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> Any:
     spy = Spy(monkeypatch)
     redis = redis_mock()
+    engine = engine_without_network(redis)
     envelope = (
         '{"id": "edge", "type": "start", "issued_at": "2026-09-26T00:00:00+00:00", '
         f'"payload": {{"network": {json.dumps(BASELINE["network"])}, '
         f'"strategy": "{STRATEGY}", "symbols": {json.dumps(BASELINE["symbols"])}, '
         f'"params": {text}}}}}'
     )
-    asyncio.run(commands.dispatch(engine_without_network(redis), redis, envelope))
-    assert spy.calls == 1, "the command never reached settings validation"
+    asyncio.run(commands.dispatch(engine, redis, envelope))
+    if spy.calls == 0:
+        # Nothing may have happened: no result, no run.
+        assert results(redis) == {}
+        engine._start_run.assert_not_awaited()  # type: ignore[attr-defined]
+        return envelope_rejection("agent_command", caplog)
+    assert spy.calls == 1
     result = results(redis)["agent:result:edge"]
     assert result["ok"] is (spy.error is None), result
     return spy.error or spy.settings
 
 
-def run_resume(text: str, monkeypatch: pytest.MonkeyPatch) -> Any:
+def run_resume(
+    text: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> Any:
     spy = Spy(monkeypatch)
     redis = redis_mock()
     redis.get.return_value = (
@@ -156,8 +190,11 @@ def run_resume(text: str, monkeypatch: pytest.MonkeyPatch) -> Any:
     )
     engine = engine_without_network(redis)
     asyncio.run(commands.resume_from_runtime(engine, redis))
-    assert spy.calls == 1, "resume never reached settings validation"
     started = engine._start_run.await_count  # type: ignore[attr-defined]
+    if spy.calls == 0:
+        assert started == 0
+        return envelope_rejection("agent_resume", caplog)
+    assert spy.calls == 1
     assert started == (0 if spy.error else 1)
     return spy.error or spy.settings
 
@@ -173,11 +210,13 @@ def test_every_case_declares_every_entry_point() -> None:
     """A missing outcome is a runner error, never a silent skip."""
     ids = [case["id"] for case in CASES]
     assert len(ids) == len(set(ids))
+    assert set(DOCUMENT["stages"]) - {"$comment"} <= set(ENTRY_POINTS)
     for case in CASES:
         assert set(case["outcomes"]) == set(ENTRY_POINTS), case["id"]
         verdicts = {
             json.dumps(verdict(case["outcomes"][ep]))
             for ep in (*AGENT_ENTRY_POINTS, "backend_start")
+            if case["outcomes"][ep] != "n/a"
         }
         if len(verdicts) > 1:
             assert case["intentional_difference"], case["id"]
@@ -186,15 +225,23 @@ def test_every_case_declares_every_entry_point() -> None:
 @pytest.mark.parametrize("entry_point", AGENT_ENTRY_POINTS)
 @pytest.mark.parametrize("case", CASES, ids=[case["id"] for case in CASES])
 def test_agent_entry_point(
-    case: dict[str, Any], entry_point: str, monkeypatch: pytest.MonkeyPatch
+    case: dict[str, Any],
+    entry_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     outcome = case["outcomes"][entry_point]
     if outcome == "n/a":
-        return
-    got = RUNNERS[entry_point](params_text(case), monkeypatch)
+        # Reported, not passed: the report must tell n/a from executed.
+        pytest.skip(f"n/a: {entry_point} does not apply to {case['id']}")
+    caplog.set_level(logging.WARNING)
+    got = RUNNERS[entry_point](params_text(case), monkeypatch, caplog)
     if outcome["result"] == "ok":
         assert isinstance(got, TripleScreenSettings), got
         assert got.model_dump(mode="json") == expected_normalized(case, outcome)
+    elif isinstance(got, EnvelopeRejected):
+        assert {(got.category, None)} == expected_errors(outcome)
     else:
+        # A settings error must come from the model, i.e. validation was reached.
         assert isinstance(got, ValidationError), got
         assert {category(error) for error in got.errors()} == expected_errors(outcome)

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from decimal import Decimal, Inexact, localcontext
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -43,8 +44,12 @@ class RuleFailed(Exception):
 
 
 def _number(value: Any) -> Decimal:
-    # Exact, never float: the reference must not share a rounding bug with the
-    # evaluator it checks (large integers, long decimals).
+    # Exact, never float arithmetic: the reference must not share a rounding
+    # bug with the evaluator it checks (large integers, long decimals). A JSON
+    # number that parsed as a float is taken by its shortest decimal text, as
+    # the model's Decimal fields take it, so 0.5 is 0.5 on both sides.
+    if isinstance(value, float) and math.isfinite(value):
+        return Decimal(repr(value))
     if isinstance(value, bool) or not isinstance(value, (int, str, Decimal)):
         raise RuleFailed(f"not a number: {value!r}")
     return Decimal(value)
@@ -244,6 +249,8 @@ def test_no_constraints_when_a_strategy_has_no_settings() -> None:
         {"tide_interval": "1w", "wave_interval": "1d", "ripple_interval": "4h"},
         {"wave_interval": "2h"},  # 4h > 2h > 15m: no longer a ratio violation
         {"tp_pct": "12"},  # Decimal as a string
+        {"trail_cap_pct": 0.5, "tp_pct": 1.5},  # Decimal as a JSON number
+        {"trail_cap_pct": "0.5", "tp_pct": "1.5"},  # the same pair as strings
     ],
 )
 def test_published_rules_accept_what_the_model_accepts(params: dict[str, Any]) -> None:
@@ -269,6 +276,7 @@ def test_published_rules_accept_what_the_model_accepts(params: dict[str, Any]) -
         },
         {"kline_window": 34},  # one below the required window
         {"stochastic_k_period": 1000},  # pushes the required window above 1000
+        {"trail_cap_pct": 1.5, "tp_pct": 1.5},  # Decimal as a JSON number
     ],
 )
 def test_published_rules_reject_what_the_model_rejects(params: dict[str, Any]) -> None:

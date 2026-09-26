@@ -106,7 +106,17 @@
           "pattern": "EMA periods must|timeframes must|trailing stop cap|kline_window must be at least",
           "category": "constraint"
         }
-      ]
+      ],
+      "envelope": {
+        "agent_command": {
+          "pattern": "dropping malformed command envelope",
+          "category": "invalid_json"
+        },
+        "agent_resume": {
+          "pattern": "ignoring malformed runtime snapshot",
+          "category": "invalid_json"
+        }
+      }
     },
     "backend": {
       "types": {
@@ -161,6 +171,9 @@
         "backend_preset_post": {
           "result": "ok"
         },
+        "backend_preset_put": {
+          "result": "ok"
+        },
         "agent_model_validate": {
           "result": "ok"
         },
@@ -190,6 +203,9 @@
           "result": "ok"
         },
         "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
           "result": "ok"
         },
         "agent_model_validate": {
@@ -245,6 +261,15 @@
           ]
         },
         "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_preset_put": {
           "result": "error",
           "errors": [
             {
@@ -332,6 +357,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "error",
           "errors": [
@@ -406,6 +440,15 @@
           ]
         },
         "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_put": {
           "result": "error",
           "errors": [
             {
@@ -498,6 +541,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "error",
           "errors": [
@@ -573,6 +625,15 @@
           ]
         },
         "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
           "result": "error",
           "errors": [
             {
@@ -660,6 +721,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "error",
           "errors": [
@@ -739,6 +809,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "error",
           "errors": [
@@ -808,6 +887,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "ok"
         },
@@ -869,6 +957,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "ok"
         },
@@ -915,6 +1012,15 @@
           ]
         },
         "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
           "result": "error",
           "errors": [
             {
@@ -995,6 +1101,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "ok"
         },
@@ -1047,6 +1162,19 @@
           ]
         },
         "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            },
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "backend_preset_put": {
           "result": "error",
           "errors": [
             {
@@ -1129,6 +1257,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "error",
           "errors": [
@@ -1201,6 +1338,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "ok"
         },
@@ -1255,6 +1401,15 @@
             }
           ]
         },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
         "agent_model_validate": {
           "result": "error",
           "errors": [
@@ -1284,6 +1439,80 @@
         }
       },
       "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "invalid-json",
+      "note": "Невалидный JSON: отказ конверта до валидации настроек",
+      "ui_draft": null,
+      "params_patch": null,
+      "params_raw": "{\"swing_low_wave_n\": ",
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": "n/a",
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
     }
-  ]
+  ],
+  "stages": {
+    "$comment": "Точки входа, чей раннер ещё не существует: кейс их объявляет, раннер показывает skip «deferred» с задачей-владельцем.",
+    "ui": "PRESET-07",
+    "backend_preset_post": "PRESET-06",
+    "backend_preset_put": "PRESET-06"
+  }
 }
