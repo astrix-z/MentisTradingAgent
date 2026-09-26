@@ -635,6 +635,32 @@ def test_cross_field_rejection_carries_the_published_message(
     assert not redis.publications
 
 
+def test_start_errors_point_at_body_params(
+    client: TestClient,
+    redis: MemoryRedis,
+) -> None:
+    """Field, rule and unknown-key errors share one location scheme (§4.3.4)."""
+    for path, body in (
+        ("/api/v1/trading/start/", {**START, "params": {"tp_pct": True}}),
+        (
+            "/api/v1/trading/commands/",
+            {"type": "start", "payload": {**START, "params": {"tp_pct": True}}},
+        ),
+    ):
+        response = client.post(path, json=body, headers=headers(client))
+        assert response.status_code == 422
+        assert [error["loc"] for error in response.json()["detail"]] == [
+            ["body", "params", "tp_pct"]
+        ]
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "params": {"kline_window": 10}},
+        headers=headers(client),
+    )
+    assert [error["loc"] for error in response.json()["detail"]] == [["body", "params"]]
+    assert not redis.publications
+
+
 def test_a_renamed_parameter_is_refused_with_a_reload_hint(
     client: TestClient,
     redis: MemoryRedis,

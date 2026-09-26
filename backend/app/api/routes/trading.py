@@ -611,6 +611,15 @@ def _start_command_payload(parsed: StartPayload) -> dict[str, Any]:
     }
 
 
+def _params_loc(loc: list[Any]) -> list[Any]:
+    """Point a strategy settings error at ``body.params`` (plan §4.3.4).
+
+    Field errors come from the compiled model by field name alone; rule and
+    unknown-parameter errors already carry ``["body", "params"]``.
+    """
+    return loc if loc[:2] == ["body", "params"] else ["body", "params", *loc]
+
+
 def _execution_loc(loc: list[Any]) -> list[Any]:
     """Point an error of the execution section at ``body.execution``.
 
@@ -685,7 +694,10 @@ async def _enforce_strategy_params(
     """
     compiled = await _compiled_strategy(strategy)
     try:
-        errors = compiled.validate(params)
+        errors = [
+            {**error, "loc": _params_loc(error.get("loc") or [])}
+            for error in compiled.validate(params)
+        ]
         if execution:
             section = await _compiled_execution()
             errors += [

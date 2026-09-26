@@ -46,7 +46,10 @@ def payload(**entry: Any) -> dict[str, Any]:
                 },
                 "window": {"type": "integer", "default": 10, "exclusiveMinimum": 0},
                 "ratio": {
-                    "anyOf": [{"type": "number", "exclusiveMinimum": 0.0}, {"type": "string"}],
+                    "anyOf": [
+                        {"type": "number", "exclusiveMinimum": 0.0},
+                        {"type": "string"},
+                    ],
                     "default": "1.5",
                 },
                 "periods": {
@@ -267,9 +270,7 @@ def test_a_repeated_message_is_reported_once() -> None:
             "malformed rule",
         ),
         (
-            lambda doc: doc["strategies"][0].update(
-                constraints=[rule(message="")]
-            ),
+            lambda doc: doc["strategies"][0].update(constraints=[rule(message="")]),
             "needs a non-empty message",
         ),
         (
@@ -447,3 +448,193 @@ def test_a_renamed_parameter_names_its_new_name() -> None:
     ]
     # Other extras keep the generic message.
     assert "unknown parameter" in strategy.validate({"other": 5})[0]["msg"]
+
+
+# --- The Start pipeline (plan §4.3.5, PRESET-04a) -----------------------------
+
+
+def interval_field(**extra: Any) -> dict[str, Any]:
+    """An interval-widget field, optionally without the enum a real one has."""
+    field: dict[str, Any] = {
+        "type": "string",
+        "default": "1h",
+        "ui": {"widget": "interval"},
+    }
+    field.update(extra)
+    return field
+
+
+def with_properties(**properties: Any) -> dict[str, Any]:
+    document = payload()
+    document["strategies"][0]["settings_schema"]["properties"].update(properties)
+    return document
+
+
+@pytest.mark.parametrize("value", [True, "5", 5.0, None])
+def test_an_integer_field_takes_only_a_json_integer(value: Any) -> None:
+    strategy = compiled()
+    assert [error["type"] for error in strategy.validate({"window": value})] == [
+        "int_type"
+    ]
+
+
+@pytest.mark.parametrize("value", [True, None])
+def test_a_decimal_field_takes_a_number_or_a_string_only(value: Any) -> None:
+    strategy = compiled()
+    assert strategy.validate({"ratio": "2.5"}) == []
+    assert strategy.validate({"ratio": 2.5}) == []
+    assert [error["type"] for error in strategy.validate({"ratio": value})] == [
+        "decimal_type"
+    ]
+
+
+def test_an_array_item_is_strict_too() -> None:
+    strategy = compiled()
+    assert [error["type"] for error in strategy.validate({"periods": [1, "2"]})] == [
+        "int_type"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "inside"),
+    [
+        ("1" + "0" * 64, True),  # one significant digit
+        ("1e64", True),
+        ("0E-100", True),  # zero is always inside
+        ("1." + "0" * 70, True),
+        ("1" + "0" * 63 + "1", False),  # 65 significant digits
+        ("1" * 64 + "5", False),  # 65 digits, exponent 64: no rounding (R63)
+        ("1" * 100 + "e-160", False),  # 100 digits at exponent -61
+        ("1e65", False),
+        ("1e-65", False),
+    ],
+)
+def test_the_numeric_domain_is_judged_by_value(value: str, inside: bool) -> None:
+    errors = compiled().validate({"ratio": value})
+    if inside:
+        assert "too_large" not in [error["type"] for error in errors]
+    else:
+        assert [error["type"] for error in errors] == ["too_large"]
+
+
+def test_the_domain_runs_before_the_bounds_and_reports_once() -> None:
+    # -1e65 breaks both the domain and exclusiveMinimum: only too_large.
+    errors = compiled().validate({"ratio": "-1e65"})
+    assert [(error["loc"], error["type"]) for error in errors] == [
+        (["ratio"], "too_large")
+    ]
+
+
+def test_a_huge_integer_is_too_large_but_a_float_in_it_is_a_type_error() -> None:
+    strategy = compiled()
+    assert [e["type"] for e in strategy.validate({"window": 10**70})] == ["too_large"]
+    assert [e["type"] for e in strategy.validate({"window": 1e65})] == ["int_type"]
+
+
+def test_an_enum_miss_is_unsupported_value() -> None:
+    errors = compiled().validate({"interval": "2h"})
+    assert [(error["loc"], error["type"]) for error in errors] == [
+        (["interval"], "unsupported_value")
+    ]
+
+
+def test_an_interval_field_is_checked_even_without_an_enum() -> None:
+    """A catalog without enum must not turn 1M into a 503 at the lookup."""
+    document = with_properties(tide=interval_field())
+    document["strategies"][0]["constraints"] = [
+        rule(
+            cmp="gt",
+            lhs={"lookup": "intervals_ms", "field": "tide"},
+            rhs={"const": 0},
+            message="tide must be positive",
+        )
+    ]
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    assert strategy.validate({"tide": "4h"}) == []
+    errors = strategy.validate({"tide": "1M"})
+    assert [(error["loc"], error["type"]) for error in errors] == [
+        (["tide"], "unsupported_value")
+    ]
+
+
+def test_rules_read_canonical_values_not_the_raw_payload() -> None:
+    """A decimal sent as a JSON number and as a string compares the same."""
+    strategy = compiled(
+        constraints=[
+            rule(
+                cmp="lt",
+                lhs={"field": "ratio"},
+                rhs={"const": 2},
+                message="ratio must be below 2",
+            )
+        ]
+    )
+    assert strategy.validate({"ratio": 1.5}) == []
+    assert strategy.validate({"ratio": "1.5"}) == []
+    assert [e["msg"] for e in strategy.validate({"ratio": 2.0})] == [
+        "ratio must be below 2"
+    ]
+
+
+def test_rules_are_exact_beyond_the_default_decimal_precision() -> None:
+    # 10**28 + 1 needs 29 digits: the default 28-digit context would round it
+    # to 10**28 and accept.
+    strategy = compiled(
+        constraints=[
+            rule(
+                cmp="gte",
+                lhs={"field": "window"},
+                rhs={"op": "add", "args": [{"field": ["periods", 0]}, {"const": 1}]},
+                message="window must be at least {rhs}",
+            )
+        ]
+    )
+    errors = strategy.validate({"window": 10**28, "periods": [10**28, 1]})
+    assert [error["msg"] for error in errors] == [
+        f"window must be at least {10**28 + 1}"
+    ]
+
+
+def test_a_catalog_constant_outside_the_domain_is_a_catalog_error() -> None:
+    strategy = compiled(constraints=[rule(rhs={"const": 10**70})])
+    with pytest.raises(CatalogError, match="outside the numeric domain"):
+        strategy.validate({})
+
+
+@pytest.mark.parametrize(
+    ("expr", "digits"),
+    [
+        ({"const": 1}, 192),
+        ({"op": "add", "args": [{"const": 1}, {"const": 2}]}, 192 + 1 + 1),
+        ({"op": "max", "args": [{"const": 1}] * 11}, 192 + 2 + 1),
+        ({"op": "mul", "args": [{"const": 1}, {"const": 2}]}, 384),
+        (
+            {
+                "op": "mul",
+                "args": [{"op": "add", "args": [{"const": 1}] * 2}, {"const": 3}],
+            },
+            194 + 192,
+        ),
+    ],
+)
+def test_rule_precision_follows_the_ast(expr: dict[str, Any], digits: int) -> None:
+    from app.core.strategy_catalog import _precision
+
+    assert _precision(expr) == digits
+
+
+def test_apply_legacy_keys_moves_and_compares_after_validation() -> None:
+    document = payload()
+    document["strategies"][0]["legacy_keys"] = {"size": "window"}
+    strategy = compile_catalog(document).strategy("unit_strategy")
+    assert strategy is not None
+    assert strategy.apply_legacy_keys({"size": 7}) == ({"window": 7}, [])
+    assert strategy.apply_legacy_keys({"size": 7, "window": 7}) == ({"window": 7}, [])
+    moved, errors = strategy.apply_legacy_keys({"size": 7, "window": 9})
+    assert moved == {"window": 9}
+    assert [error["type"] for error in errors] == ["legacy_conflict"]
+    # An invalid old value is left under the new name for the field's error.
+    moved, errors = strategy.apply_legacy_keys({"size": 0, "window": 7})
+    assert (moved, errors) == ({"window": 0}, [])
+    assert [e["type"] for e in strategy.validate(moved)] == ["greater_than"]
