@@ -44,6 +44,8 @@ CATALOG_KEY="agent:strategies"
 CATALOG_WAIT_S="${DEPLOY_CATALOG_WAIT_S:-120}"
 HEALTH_WAIT_S="${DEPLOY_HEALTH_WAIT_S:-120}"
 PAUSE_S="${DEPLOY_PAUSE_S:-2}"
+#: Предел одного вызова redis-cli и curl в ожиданиях (R129).
+CALL_TIMEOUT_S="${DEPLOY_CALL_TIMEOUT_S:-10}"
 KEEP_REVISIONS=10
 SERVICES=(backend agent)
 
@@ -57,7 +59,12 @@ echo "==> $(date -Is) попытка $ATTEMPT, ревизия $REVISION, скр�
 PHASE=before
 
 compose() { (cd "$APP_DIR" && "${COMPOSE[@]}" "$@"); }
-redis_cli() { compose exec -T redis redis-cli "$@"; }
+redis_cli() { (cd "$APP_DIR" && timeout "$CALL_TIMEOUT_S" "${COMPOSE[@]}" exec -T redis redis-cli "$@"); }
+# Самый свежий непустой дамп базы $1 (пустой файл — не дамп, R123).
+latest_dump() {
+  find "$BACKUP_DIR" -maxdepth 1 -name "pre-deploy-$1-*.dump" -size +0c -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | head -n 1 | cut -d' ' -f2-
+}
 image_id() { docker image inspect -f '{{.Id}}' "$1" 2>/dev/null || true; }
 running_images() {
   local svc
@@ -101,6 +108,13 @@ on_exit() {
         how_to_lift ;;
       fenced|waiting)
         how_to_lift ;;
+      lifted)
+        # Сбой после снятия флага (current/history, ротация): fail closed —
+        # флаг ставится снова, агент цели работает (R130).
+        echo "==> trap: флаг снят, но выкладка не завершена — ставлю флаг снова"
+        redis_cli SET "$FENCE_KEY" "deploy $REVISION $ATTEMPT failed after lift $(date -Is)" >/dev/null \
+          || echo "!!! trap: не удалось поставить флаг — Start ОТКРЫТ, поставьте его вручную"
+        how_to_lift ;;
     esac
   fi
   rm -rf -- "$STAGE"
@@ -108,6 +122,11 @@ on_exit() {
   echo "==> $(date -Is) код выхода $code"
 }
 trap on_exit EXIT
+# Сигнал (systemctl --user stop/kill, перезагрузка) — не успех: без этого
+# EXIT-trap записал бы в .exit код последней команды, например 0.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 fail() { echo "ОШИБКА: $*"; exit 1; }
 
@@ -127,7 +146,7 @@ if [[ ! -s "$RELEASES/current" ]]; then
   [[ -n "$T0" ]] || fail "первый запуск: нужен --t0-revision <ревизия, работающая сейчас>"
   [[ "$T0" =~ ^[0-9a-f]{7,40}$ ]] || fail "плохая --t0-revision: $T0"
   echo "==> T0: сверка $T0 с последним дампом и контейнерами"
-  last_dump="$(ls -1t "$BACKUP_DIR"/pre-deploy-app-*.dump 2>/dev/null | head -n 1 || true)"
+  last_dump="$(latest_dump app)"
   t0_ok=1
   if [[ -z "$last_dump" || "$(basename "$last_dump")" != pre-deploy-app-"$T0"-* ]]; then
     echo "    последний дамп '${last_dump:-нет}' не от ревизии $T0"
@@ -156,7 +175,10 @@ if [[ ! -s "$RELEASES/current" ]]; then
   for svc in "${SERVICES[@]}"; do
     docker tag "$(docker inspect -f '{{.Image}}' "$(compose ps -q "$svc")")" "mentis-$svc:$T0"
   done
-  [[ -f "$APP_DIR/uv.lock" ]] && cp -p "$APP_DIR/uv.lock" "$RELEASES/$T0.uv.lock"
+  # Только справка: происхождение lock в APP_DIR не доказано (его перезаписывал
+  # любой прежний деплой), пересобрать T0 по нему нельзя — T0 живёт на
+  # закреплённых образах (R124).
+  [[ -f "$APP_DIR/uv.lock" ]] && cp -p "$APP_DIR/uv.lock" "$RELEASES/$T0.appdir.uv.lock"
   grep -qx "$T0" "$RELEASES/pinned" 2>/dev/null || echo "$T0" >>"$RELEASES/pinned"
   echo "$T0" >"$RELEASES/current"
   echo "$(date -Is) $T0 t0" >>"$RELEASES/history"
@@ -169,17 +191,33 @@ if [[ "${DEPLOY_NO_BACKUP:-0}" != 1 ]]; then
   mkdir -p "$BACKUP_DIR"
   stamp="$(date +%Y%m%d-%H%M%S)"
   for db in app agent; do
-    docker exec "$DB_CONTAINER" pg_dump -Fc -U postgres "$db" \
-      >"$BACKUP_DIR/pre-deploy-$db-$REVISION-$stamp.dump" \
-      || echo "    (пропущено: $db ещё не существует)"
-    ls -1t "$BACKUP_DIR"/pre-deploy-"$db"-*.dump 2>/dev/null | tail -n +11 | xargs -r rm --
+    exists="$(docker exec "$DB_CONTAINER" psql -U postgres -tAc \
+      "SELECT 1 FROM pg_database WHERE datname = '$db'")" \
+      || fail "не удалось проверить базу $db — без снапшота не продолжаю"
+    if [[ "$exists" != 1 ]]; then
+      echo "    (пропущено: базы $db ещё нет)"
+      continue
+    fi
+    # Во временный файл; имя дампа появляется только у целого дампа (R123).
+    final="$BACKUP_DIR/pre-deploy-$db-$REVISION-$stamp.dump"
+    docker exec "$DB_CONTAINER" pg_dump -Fc -U postgres "$db" >"$final.part" \
+      || { rm -f -- "$final.part"; fail "pg_dump $db не удался — без снапшота не продолжаю"; }
+    [[ -s "$final.part" ]] || { rm -f -- "$final.part"; fail "pg_dump $db дал пустой дамп"; }
+    mv -- "$final.part" "$final"
+    find "$BACKUP_DIR" -maxdepth 1 -name "pre-deploy-$db-*.dump" -printf '%T@ %p\n' \
+      | sort -rn | tail -n +11 | cut -d' ' -f2- | xargs -r -d '\n' rm --
   done
 fi
 
 # --- Установка артефакта: чистая, с удалением лишнего (.env.prod сохраняется) --
 echo "==> Установка $REVISION в $APP_DIR"
 mkdir -p "$APP_DIR"
-if [[ ! -f "$STAGE/tree/uv.lock" && -f "$RELEASES/$REVISION.uv.lock" ]]; then
+# Доверенный lock — только tracked lock ревизии: из её дерева или его копия
+# releases/<rev>.uv.lock, сохранённая при прежней выкладке этой ревизии (R124).
+tracked_lock=0
+if [[ -f "$STAGE/tree/uv.lock" ]]; then
+  tracked_lock=1
+elif [[ -f "$RELEASES/$REVISION.uv.lock" ]]; then
   cp -p "$RELEASES/$REVISION.uv.lock" "$STAGE/tree/uv.lock"
 fi
 rsync -a --delete --exclude=/.env.prod "$STAGE/tree/" "$APP_DIR/"
@@ -206,12 +244,17 @@ elif [[ "${DEPLOY_NO_BUILD:-0}" == 1 ]]; then
   fail "--no-build, а образов :$REVISION нет"
 else
   [[ -f "$APP_DIR/uv.lock" ]] || fail "у ревизии $REVISION нет tracked uv.lock и нет releases/$REVISION.uv.lock — lock текущего дерева не подставляется"
-  (cd "$APP_DIR" && MENTIS_TAG=probe "${COMPOSE[@]}" config --images) | grep -qx 'mentis-agent:probe' \
-    || fail "compose.yml цели не знает MENTIS_TAG: сборка сдвинула бы :latest"
+  # Оба собираемых образа должны зависеть от MENTIS_TAG, иначе сборка сдвинет
+  # :latest одного из них ещё до флага (R125).
+  probe="$(cd "$APP_DIR" && MENTIS_TAG=probe "${COMPOSE[@]}" config --images)"
+  for svc in "${SERVICES[@]}"; do
+    grep -qx "mentis-$svc:probe" <<<"$probe" \
+      || fail "compose.yml цели не знает MENTIS_TAG для $svc: сборка сдвинула бы :latest"
+  done
   echo "==> Сборка :$REVISION"
   (cd "$APP_DIR" && MENTIS_TAG="$REVISION" "${COMPOSE[@]}" build)
 fi
-cp -p "$APP_DIR/uv.lock" "$RELEASES/$REVISION.uv.lock" 2>/dev/null || true
+(( tracked_lock )) && cp -p "$APP_DIR/uv.lock" "$RELEASES/$REVISION.uv.lock"
 
 # --- G4 --------------------------------------------------------------------------
 echo "==> (1) флаг $FENCE_KEY"
@@ -230,28 +273,35 @@ done
 compose up -d --remove-orphans
 PHASE=waiting
 echo "==> (5) ожидание каталога агента цели (до ${CATALOG_WAIT_S} с)"
+# Предел — время, а не число попыток: каждый вызов сам ограничен (R129).
 published=""
-for ((i = 0; i < CATALOG_WAIT_S; i += 2)); do
+deadline=$((SECONDS + CATALOG_WAIT_S))
+while :; do
   published="$(redis_cli GET "$CATALOG_KEY" 2>/dev/null || true)"
   [[ -n "$published" ]] && break
+  ((SECONDS < deadline)) || break
   sleep "$PAUSE_S"
 done
 [[ -n "$published" ]] || fail "агент цели не опубликовал $CATALOG_KEY за ${CATALOG_WAIT_S} с"
 echo "    schema_hash: $(grep -o '"schema_hash": *"[^"]*"' <<<"$published" | head -n 1)"
-echo "==> (6) снятие флага"
-redis_cli DEL "$FENCE_KEY" >/dev/null
-PHASE=lifted
 
-echo "==> Healthcheck backend"
+# Healthcheck — до снятия флага: неработающий backend оставляет Start закрытым (R130).
+echo "==> Healthcheck backend (до ${HEALTH_WAIT_S} с)"
 bind="$(grep -E '^WEB_BIND=' "$APP_DIR/.env.prod" 2>/dev/null | cut -d= -f2 || true)"
 port="$(grep -E '^WEB_PORT=' "$APP_DIR/.env.prod" 2>/dev/null | cut -d= -f2 || true)"
 url="http://${bind:-127.0.0.1}:${port:-8010}/api/v1/utils/health-check/"
 healthy=0
-for ((i = 0; i < HEALTH_WAIT_S; i += 3)); do
-  curl -fsS "$url" >/dev/null 2>&1 && { healthy=1; break; }
+deadline=$((SECONDS + HEALTH_WAIT_S))
+while :; do
+  curl -fsS --max-time "$CALL_TIMEOUT_S" "$url" >/dev/null 2>&1 && { healthy=1; break; }
+  ((SECONDS < deadline)) || break
   sleep "$PAUSE_S"
 done
 (( healthy )) || { compose logs --tail 50 backend || true; fail "backend не прошёл healthcheck $url"; }
+
+echo "==> (6) снятие флага"
+redis_cli DEL "$FENCE_KEY" >/dev/null
+PHASE=lifted
 
 echo "$REVISION" >"$RELEASES/current"
 echo "$(date -Is) $REVISION" >>"$RELEASES/history"

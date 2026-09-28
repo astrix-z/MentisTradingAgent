@@ -47,6 +47,7 @@ STUBS: dict[str, str] = {
     "systemctl": r"""
         # systemctl --user show -p LoadState -p ActiveState -p Environment <unit>
         echo "systemctl $*" >>"$STATE/calls.log"
+        [[ -f "$STATE/show_sleep" ]] && sleep "$(cat "$STATE/show_sleep")"
         if [[ -f "$STATE/show_fail" ]]; then
           n=$(cat "$STATE/show_fail")
           if (( n != 0 )); then
@@ -81,9 +82,24 @@ STUBS: dict[str, str] = {
         done
         case "$mode" in
           occupied)
+            # Someone else's unit may appear between S0 and S1.
+            if [[ -f "$STATE/occupied_env" ]]; then
+              echo loaded >"$STATE/unit.load"; echo active >"$STATE/unit.active"
+              cp "$STATE/occupied_env" "$STATE/unit.env"
+            fi
             echo "Unit mentis-deploy.service was already loaded or has a fragment file." >&2
             exit 1 ;;
           vanish)
+            exit 0 ;;
+          hang)
+            echo loaded >"$STATE/unit.load"; echo active >"$STATE/unit.active"
+            echo "$env_line" >"$STATE/unit.env"
+            exit 0 ;;
+          handover)
+            # Ours for a moment, then the name belongs to another attempt.
+            echo loaded >"$STATE/unit.load"; echo active >"$STATE/unit.active"
+            echo "$env_line" >"$STATE/unit.env"
+            ( sleep 0.5; echo "DEPLOY_ATTEMPT=1-1-00000000 DEPLOY_REVISION=${cmd[2]}" >"$STATE/unit.env" ) &
             exit 0 ;;
           lost-reply)
             echo loaded >"$STATE/unit.load"; echo active >"$STATE/unit.active"
@@ -94,11 +110,15 @@ STUBS: dict[str, str] = {
             echo "Connection reset" >&2
             exit 1 ;;
           *)
-            # Run the unit now, as systemd would, then --collect unloads it.
+            # Detached, as systemd runs it; --collect unloads it when done.
             echo loaded >"$STATE/unit.load"; echo active >"$STATE/unit.active"
             echo "$env_line" >"$STATE/unit.env"
-            env "${envs[@]}" "${cmd[@]}" || true
-            rm -f "$STATE/unit.load" "$STATE/unit.active" "$STATE/unit.env" ;;
+            setsid bash -c '
+              env "$@" >/dev/null 2>&1 </dev/null
+              echo $$ >/dev/null
+              rm -f "$STATE/unit.load" "$STATE/unit.active" "$STATE/unit.env"
+            ' unit "${envs[@]}" "${cmd[@]}" >/dev/null 2>&1 </dev/null &
+            echo $! >"$STATE/unit.pid" ;;
         esac
     """,
     "curl": """
@@ -115,6 +135,8 @@ STUBS: dict[str, str] = {
             config)
               if [[ "$1" == --services ]]; then
                 cat "$STATE/services" 2>/dev/null || printf 'db\nredis\nbackend\nagent\n'
+              elif [[ -n "${MENTIS_TAG:-}" && -f "$STATE/compose_tag_agent_only" ]]; then
+                printf 'mentis-backend:latest\nmentis-agent:%s\n' "$MENTIS_TAG"
               elif [[ -n "${MENTIS_TAG:-}" && ! -f "$STATE/compose_no_tag" ]]; then
                 printf 'mentis-backend:%s\nmentis-agent:%s\n' "$MENTIS_TAG" "$MENTIS_TAG"
               else
@@ -125,6 +147,7 @@ STUBS: dict[str, str] = {
               op="$1"; key="$2"; mkdir -p "$STATE/redis"
               echo "redis $op $key" >>"$STATE/calls.log"
               [[ -f "$STATE/fail_redis_$op" ]] && exit 1
+              [[ -f "$STATE/sleep_redis_$op" ]] && sleep "$(cat "$STATE/sleep_redis_$op")"
               case "$op" in
                 SET) echo "$3" >"$STATE/redis/$key" ;;
                 DEL) rm -f "$STATE/redis/$key" ;;
@@ -158,7 +181,14 @@ STUBS: dict[str, str] = {
               '{{.Created}}') cat "$STATE/containers/$4.created" 2>/dev/null || date -Is ;;
               *) echo "image $(cat "$STATE/containers/$4.image")" ;;
             esac ;;
-          exec) echo "dump" ;;
+          exec)
+            if [[ "$*" == *psql* ]]; then
+              case "$*" in *"'agent'"*) db=agent ;; *) db=app ;; esac
+              cat "$STATE/db_exists_$db" 2>/dev/null || echo 1
+            else
+              [[ -f "$STATE/fail_dump" ]] && exit 1
+              [[ -f "$STATE/empty_dump" ]] || echo "dump"
+            fi ;;
           ps) ls "$STATE/containers" ;;
         esac
     """,
@@ -200,6 +230,7 @@ class Server:
     def deploy(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(DEPLOY), *args],
+            check=False,
             cwd=ROOT,
             env=self.env,
             capture_output=True,
@@ -208,10 +239,16 @@ class Server:
         )
 
 
-@pytest.fixture
-def server(tmp_path: Path) -> Server:
-    home, state, bin_dir = tmp_path / "home", tmp_path / "state", tmp_path / "bin"
-    for path in (home / "apps/mentis-trading-agent", state / "images", state / "containers", bin_dir):
+@pytest.fixture(params=["home"])
+def server(tmp_path: Path, request: pytest.FixtureRequest) -> Server:
+    home = tmp_path / request.param
+    state, bin_dir = tmp_path / "state", tmp_path / "bin"
+    for path in (
+        home / "apps/mentis-trading-agent",
+        state / "images",
+        state / "containers",
+        bin_dir,
+    ):
         path.mkdir(parents=True)
     (home / "apps/mentis-trading-agent/.env.prod").write_text("WEB_PORT=8010\n")
     for name, body in STUBS.items():
@@ -231,6 +268,7 @@ def server(tmp_path: Path) -> Server:
         "DEPLOY_CATALOG_WAIT_S": "1",
         "DEPLOY_HEALTH_WAIT_S": "1",
         "DEPLOY_WAIT_TIMEOUT_S": "60",
+        "DEPLOY_CALL_TIMEOUT_S": "5",
     }
     server = Server(home=home, state=state, env=env)
     # A running stack that already went through 09a once: current = T0.
@@ -258,7 +296,9 @@ def order(calls: list[str], *needles: str) -> list[int]:
 # --- A normal deploy --------------------------------------------------------------
 
 
-def test_a_deploy_builds_fences_swaps_the_agent_and_lifts_the_fence(server: Server) -> None:
+def test_a_deploy_builds_fences_swaps_the_agent_and_lifts_the_fence(
+    server: Server,
+) -> None:
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 0, result.stdout + result.stderr
     calls = server.calls()
@@ -275,7 +315,9 @@ def test_a_deploy_builds_fences_swaps_the_agent_and_lifts_the_fence(server: Serv
     assert steps == sorted(steps)
     assert server.redis("trading:start_fence") is None
     assert server.image("mentis-agent:latest") == f"id-agent-{REVISION}"
-    assert server.image(f"mentis-agent:{T0}") == f"id-agent-{T0}"  # the previous one kept
+    assert (
+        server.image(f"mentis-agent:{T0}") == f"id-agent-{T0}"
+    )  # the previous one kept
     assert (server.releases / "current").read_text().strip() == REVISION
     assert (server.releases / "history").read_text().split()[-1] == REVISION
     assert (server.releases / f"{REVISION}.uv.lock").exists()
@@ -284,7 +326,9 @@ def test_a_deploy_builds_fences_swaps_the_agent_and_lifts_the_fence(server: Serv
     assert (server.home / "apps/mentis-trading-agent/.env.prod").exists()
 
 
-def test_a_build_failure_leaves_neither_fence_nor_a_stopped_agent(server: Server) -> None:
+def test_a_build_failure_leaves_neither_fence_nor_a_stopped_agent(
+    server: Server,
+) -> None:
     server.put("fail_build")
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 1
@@ -351,7 +395,9 @@ def test_a_target_whose_compose_ignores_mentis_tag_is_not_built(server: Server) 
     assert not any(" build" in call for call in server.calls())
 
 
-def test_a_target_without_the_agent_service_is_refused_before_step_1(server: Server) -> None:
+def test_a_target_without_the_agent_service_is_refused_before_step_1(
+    server: Server,
+) -> None:
     server.put("services", "db\nredis\nbackend\n")
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 1
@@ -386,17 +432,24 @@ def test_a_first_run_without_t0_is_refused(first_run: Server) -> None:
 
 
 def test_a_first_run_pins_t0_on_the_running_images(first_run: Server) -> None:
-    result = first_run.deploy("--revision", REVISION, "--t0-revision", T0, "--no-backup")
+    result = first_run.deploy(
+        "--revision", REVISION, "--t0-revision", T0, "--no-backup"
+    )
     assert result.returncode == 0, result.stdout
     assert first_run.image(f"mentis-agent:{T0}") == f"id-agent-{T0}"
     assert (first_run.releases / "pinned").read_text().split() == [T0]
-    assert (first_run.releases / f"{T0}.uv.lock").read_text() == "t0 lock"
-    history = [line.split()[1] for line in (first_run.releases / "history").read_text().splitlines()]
+    assert (first_run.releases / f"{T0}.appdir.uv.lock").read_text() == "t0 lock"
+    history = [
+        line.split()[1]
+        for line in (first_run.releases / "history").read_text().splitlines()
+    ]
     assert history == [T0, REVISION]
 
 
 def test_t0_not_matching_the_last_dump_needs_a_human(first_run: Server) -> None:
-    result = first_run.deploy("--revision", REVISION, "--t0-revision", REVISION, "--no-backup")
+    result = first_run.deploy(
+        "--revision", REVISION, "--t0-revision", REVISION, "--no-backup"
+    )
     assert result.returncode == 1
     assert "--t0-confirm" in result.stdout
     confirmed = first_run.deploy(
@@ -408,7 +461,9 @@ def test_t0_not_matching_the_last_dump_needs_a_human(first_run: Server) -> None:
 def test_t0_containers_older_than_the_dump_are_refused(first_run: Server) -> None:
     for svc in ("backend", "agent"):
         first_run.put(f"containers/c-{svc}.created", "2023-01-01T00:00:00Z")
-    result = first_run.deploy("--revision", REVISION, "--t0-revision", T0, "--no-backup")
+    result = first_run.deploy(
+        "--revision", REVISION, "--t0-revision", T0, "--no-backup"
+    )
     assert result.returncode == 1
     assert "ни один контейнер не создан после дампа" in result.stdout
 
@@ -433,10 +488,16 @@ def test_a_revision_older_than_the_catalog_key_is_refused(server: Server) -> Non
 
 def test_a_running_deploy_of_the_same_revision_is_joined(server: Server) -> None:
     other = "1700000000-42-abcdef01"
-    server.unit("loaded", "active", f"DEPLOY_ATTEMPT={other} DEPLOY_REVISION={REVISION}")
+    server.unit(
+        "loaded", "active", f"DEPLOY_ATTEMPT={other} DEPLOY_REVISION={REVISION}"
+    )
     # A previous failed attempt of the same revision must not be read (R97).
-    (server.releases / f"deploy-{REVISION}-1600000000-1-00000000.exit").write_text("7\n")
-    (server.releases / f"deploy-{REVISION}-{other}.log").write_text("other attempt log\n")
+    (server.releases / f"deploy-{REVISION}-1600000000-1-00000000.exit").write_text(
+        "7\n"
+    )
+    (server.releases / f"deploy-{REVISION}-{other}.log").write_text(
+        "other attempt log\n"
+    )
     (server.releases / f"deploy-{REVISION}-{other}.exit").write_text("0\n")
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 0, result.stdout
@@ -449,7 +510,11 @@ def test_a_running_deploy_of_the_same_revision_is_joined(server: Server) -> None
 def test_a_running_deploy_of_another_revision_is_refused_without_writes(
     server: Server,
 ) -> None:
-    server.unit("loaded", "active", f"DEPLOY_ATTEMPT=1700000000-42-abcdef01 DEPLOY_REVISION={T0}")
+    server.unit(
+        "loaded",
+        "active",
+        f"DEPLOY_ATTEMPT=1700000000-42-abcdef01 DEPLOY_REVISION={T0}",
+    )
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 1
     assert f"идёт выкладка ревизии {T0}" in result.stdout
@@ -518,3 +583,197 @@ def test_another_attempts_stage_is_kept(server: Server) -> None:
     assert result.returncode == 0, result.stdout
     assert theirs.exists()
     assert "для ручной уборки" in result.stdout
+
+
+# --- Review round R120-R133 -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("server", ["home with space"], indirect=True)
+def test_a_server_home_with_a_space_is_quoted_remotely(server: Server) -> None:
+    """R128: "$HOME" is expanded by the server and quoted there."""
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (server.home.parent / "home").exists()
+    assert (server.releases / "current").read_text().strip() == REVISION
+
+
+def test_a_failed_dump_stops_before_install_and_publishes_nothing(
+    server: Server,
+) -> None:
+    """R123: a failed pg_dump is not a dump and does not rotate a good one out."""
+    backups = server.home / "backups/mentis-trading-agent"
+    backups.mkdir(parents=True)
+    for i in range(10):
+        good = backups / f"pre-deploy-app-{T0}-2026092{i % 10}-00000{i}.dump"
+        good.write_text("good")
+    server.put("fail_dump")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "pg_dump app не удался" in result.stdout
+    assert sorted(p.read_text() for p in backups.iterdir()) == ["good"] * 10
+    assert not any("start_fence" in call for call in server.calls())
+    assert not any(" build" in call for call in server.calls())
+
+
+def test_an_empty_dump_is_refused(server: Server) -> None:
+    server.put("empty_dump")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "пустой дамп" in result.stdout
+    assert not list((server.home / "backups/mentis-trading-agent").glob("*.dump"))
+
+
+def test_a_database_that_does_not_exist_yet_is_skipped(server: Server) -> None:
+    server.put("db_exists_agent", "")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout
+    assert "базы agent ещё нет" in result.stdout
+    dumps = [p.name for p in (server.home / "backups/mentis-trading-agent").iterdir()]
+    assert len(dumps) == 1 and dumps[0].startswith(f"pre-deploy-app-{REVISION}-")
+
+
+def test_the_t0_lock_from_app_dir_does_not_allow_a_rebuild(first_run: Server) -> None:
+    """R124: T0's APP_DIR lock is kept for reference; its origin is unknown."""
+    result = first_run.deploy(
+        "--revision", REVISION, "--t0-revision", T0, "--no-backup"
+    )
+    assert result.returncode == 0, result.stdout
+    assert (first_run.releases / f"{T0}.appdir.uv.lock").read_text() == "t0 lock"
+    assert not (first_run.releases / f"{T0}.uv.lock").exists()
+    for svc in ("backend", "agent"):  # the pinned images are lost
+        (first_run.state / f"images/mentis-{svc}:{T0}").unlink()
+    again = first_run.deploy("--revision", T0, "--no-backup")
+    assert again.returncode == 1
+    assert "lock текущего дерева не подставляется" in again.stdout
+
+
+def test_a_target_with_one_hard_coded_latest_is_not_built(server: Server) -> None:
+    """R125: both built images must follow MENTIS_TAG."""
+    server.put("compose_tag_agent_only")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "не знает MENTIS_TAG для backend" in result.stdout
+    assert not any(" build" in call for call in server.calls())
+    assert server.image("mentis-backend:latest") == f"id-backend-{T0}"
+
+
+def test_an_unhealthy_backend_keeps_the_fence(server: Server) -> None:
+    """R130: the healthcheck runs before the fence is lifted."""
+    server.put("unhealthy")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "не прошёл healthcheck" in result.stdout
+    assert not any("DEL trading:start_fence" in call for call in server.calls())
+    assert "failed after lift" not in (server.redis("trading:start_fence") or "")
+    assert (server.releases / "current").read_text().strip() == T0
+
+
+def test_a_failure_after_the_lift_sets_the_fence_again(server: Server) -> None:
+    """R130: writing releases/current fails after (6) — fail closed."""
+    (server.releases / "current").chmod(0o444)
+    try:
+        result = server.deploy("--revision", REVISION)
+    finally:
+        (server.releases / "current").chmod(0o644)
+    assert result.returncode == 1
+    assert "ставлю флаг снова" in result.stdout
+    assert "failed after lift" in (server.redis("trading:start_fence") or "")
+
+
+def test_a_hung_catalog_read_is_bounded_by_time(server: Server) -> None:
+    """R129: each GET is bounded and the wait ends on time, not on a count."""
+    server.put("sleep_redis_GET", "30")
+    server.env["DEPLOY_CALL_TIMEOUT_S"] = "1"
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1, result.stdout + "\n".join(server.calls())
+    assert "не опубликовал agent:strategies" in result.stdout
+    assert server.redis("trading:start_fence") is not None
+
+
+@pytest.mark.parametrize("where", ["S0", "S1"])
+def test_look_alike_variable_names_are_not_metadata(server: Server, where: str) -> None:
+    """R127: NOT_DEPLOY_ATTEMPT is not DEPLOY_ATTEMPT, in S0 or after a refusal."""
+    env = f"NOT_DEPLOY_ATTEMPT=1700000000-42-abcdef01 NOT_DEPLOY_REVISION={REVISION}"
+    if where == "S0":
+        server.unit("loaded", "active", env)
+    else:
+        server.put("run_mode", "occupied")
+        server.put("occupied_env", env)
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "метаданные попытки отсутствуют или некорректны" in result.stdout
+    assert sum("systemd-run" in call for call in server.calls()) == (where == "S1")
+
+
+def test_the_name_taken_by_another_attempt_ends_the_wait(server: Server) -> None:
+    """R133: while polling, a unit with another DEPLOY_ATTEMPT is not ours."""
+    server.put("run_mode", "handover")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "завершился без кода" in result.stdout
+    assert "1-1-00000000" in result.stdout
+
+
+def test_the_client_timeout_leaves_the_unit_running(server: Server) -> None:
+    """R126/R133: the overall wait is bounded; the unit is not stopped."""
+    server.put("run_mode", "hang")
+    server.env["DEPLOY_WAIT_TIMEOUT_S"] = "2"
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "таймаут 2 с" in result.stdout
+    assert (server.state / "unit.load").read_text().strip() == "loaded"
+
+
+def test_a_hung_show_is_bounded(server: Server) -> None:
+    """R126: one show that never answers does not hold the client."""
+    server.put("show_sleep", "60")
+    server.env["DEPLOY_READ_RETRY_S"] = "2"
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "состояние юнита mentis-deploy неизвестно" in result.stdout
+
+
+@pytest.mark.parametrize("signal_name", ["SIGTERM", "SIGKILL"])
+def test_a_unit_killed_during_g4_is_not_a_success(
+    server: Server, signal_name: str
+) -> None:
+    """systemctl --user stop/kill while (5) waits: never reported as success.
+
+    TERM runs the trap, which writes a non-zero code; KILL leaves no code, and
+    the client reports "ended without a code". The fence stays either way.
+    """
+    import signal
+    import time
+
+    server.put("agent_silent")
+    server.env["DEPLOY_CATALOG_WAIT_S"] = "60"
+    process = subprocess.Popen(
+        ["bash", str(DEPLOY), "--revision", REVISION],
+        cwd=ROOT,
+        env=server.env,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            logs = list(server.releases.glob(f"deploy-{REVISION}-*.log"))
+            if logs and "(5) ожидание" in logs[0].read_text():
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the unit never reached step (5)")
+        pid = int((server.state / "unit.pid").read_text())
+        os.killpg(pid, getattr(signal, signal_name))
+        if signal_name == "SIGKILL":  # systemd would unload the dead unit
+            for name in ("unit.load", "unit.active", "unit.env"):
+                (server.state / name).unlink(missing_ok=True)
+        out, _ = process.communicate(timeout=60)
+    finally:
+        process.kill()
+    assert process.returncode == 1
+    if signal_name == "SIGTERM":
+        assert "завершился с кодом 143" in out
+    else:
+        assert "завершился без кода" in out
+    assert server.redis("trading:start_fence") is not None

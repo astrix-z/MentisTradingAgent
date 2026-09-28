@@ -34,9 +34,11 @@ cd "$REPO_ROOT"
 SERVER="${DEPLOY_SERVER:-192.168.55.40}"
 SERVER_USER="${DEPLOY_USER:-jb}"
 SSH_TARGET="${SERVER_USER}@${SERVER}"
-# Раскрываются на сервере: команды уходят в run_remote строкой.
+# Раскрываются на сервере: команды уходят в run_remote строкой. "$HOME" в
+# кавычках — удалённая shell не разобьёт путь с пробелом (R128); остальная
+# часть путей из [0-9a-z./-]. Такие пути подставляются БЕЗ внешних кавычек.
 # shellcheck disable=SC2016
-R_RELEASES='$HOME/apps/releases'
+R_RELEASES='"$HOME"/apps/releases'
 UNIT="mentis-deploy"
 #: С этого коммита агент публикует agent:strategies (шаг (5) его ждёт).
 CATALOG_SINCE="608cfa1"
@@ -44,6 +46,9 @@ WAIT_TIMEOUT_S="${DEPLOY_WAIT_TIMEOUT_S:-3600}"
 READ_RETRY_S="${DEPLOY_READ_RETRY_S:-30}"
 POLL_S="${DEPLOY_POLL_S:-3}"
 READ_PAUSE_S="${DEPLOY_READ_PAUSE_S:-2}"
+#: Предел одного удалённого вызова и загрузки артефакта (R126).
+CALL_TIMEOUT_S="${DEPLOY_CALL_TIMEOUT_S:-30}"
+UPLOAD_TIMEOUT_S="${DEPLOY_UPLOAD_TIMEOUT_S:-300}"
 
 REV_ARG="HEAD"
 ALLOW_DIRTY=0
@@ -71,7 +76,9 @@ else
   SSH=(ssh -o BatchMode=yes "$SSH_TARGET")
 fi
 # Одна строка — одна команда на сервере; $HOME в ней раскрывает сервер.
-run_remote() { "${SSH[@]}" "$1"; }
+# Каждый вызов ограничен по времени (второй аргумент, секунды): зависший SSH
+# не держит скрипт дольше его дедлайнов (R126).
+run_remote() { timeout "${2:-$CALL_TIMEOUT_S}" "${SSH[@]}" "$1"; }
 
 die() { echo "ОШИБКА: $*"; exit 1; }
 
@@ -119,7 +126,7 @@ echo "==> Выкладка ${REVISION} на ${SSH_TARGET}, попытка ${MY_A
 run_remote "mkdir -p $R_RELEASES && mkdir $MY_STAGE && mkdir $MY_STAGE/tree" \
   || die "не удалось создать $MY_STAGE"
 remove_mine() { run_remote "rm -rf -- $MY_STAGE $MY_SCRIPT" || true; }
-git archive "$REVISION" | run_remote "tar -x -C $MY_STAGE/tree" \
+git archive "$REVISION" | run_remote "tar -x -C $MY_STAGE/tree" "$UPLOAD_TIMEOUT_S" \
   || { remove_mine; die "не удалось загрузить артефакт"; }
 # set -C: копия скрипта никогда не перезаписывается (bash читает скрипт по ходу).
 run_remote "set -C; cat > $MY_SCRIPT" <scripts/deploy-fence.sh \
@@ -128,19 +135,28 @@ run_remote "set -C; cat > $MY_SCRIPT" <scripts/deploy-fence.sh \
 # --- Снимок юнита и запуск (R102, R106, R109) ----------------------------------------
 
 S_LOAD="" S_ACTIVE="" S_ATTEMPT="" S_REVISION=""
-# Один вызов show; ошибка чтения — повтор каждые 2 с до READ_RETRY_S, затем отказ.
-# Новый запуск по ошибке чтения не делается никогда.
+# Один вызов show; ошибка чтения — повтор до бюджета (по умолчанию
+# READ_RETRY_S; сам вызов тоже ограничен остатком), затем отказ. Новый запуск
+# по ошибке чтения не делается никогда.
 read_snapshot() {
-  local out deadline=$((SECONDS + READ_RETRY_S))
+  local out word budget="${1:-$READ_RETRY_S}"
+  local deadline=$((SECONDS + budget))
   while :; do
-    if out="$(run_remote "systemctl --user show -p LoadState -p ActiveState -p Environment $UNIT" 2>/dev/null)" \
+    if out="$(run_remote "systemctl --user show -p LoadState -p ActiveState -p Environment $UNIT" \
+      "$(((deadline - SECONDS) > 1 ? deadline - SECONDS : 1))" 2>/dev/null)" \
       && grep -q '^LoadState=' <<<"$out"; then
       S_LOAD="$(sed -n 's/^LoadState=//p' <<<"$out")"
       S_ACTIVE="$(sed -n 's/^ActiveState=//p' <<<"$out")"
-      local env
-      env="$(sed -n 's/^Environment=//p' <<<"$out")"
-      S_ATTEMPT="$(grep -o 'DEPLOY_ATTEMPT=[^ ]*' <<<"$env" | cut -d= -f2 || true)"
-      S_REVISION="$(grep -o 'DEPLOY_REVISION=[^ ]*' <<<"$env" | cut -d= -f2 || true)"
+      S_ATTEMPT="" S_REVISION=""
+      # Точные имена переменных, не подстроки (R127).
+      local words=()
+      read -ra words <<<"$(sed -n 's/^Environment=//p' <<<"$out")"
+      for word in "${words[@]}"; do
+        case "$word" in
+          DEPLOY_ATTEMPT=*) S_ATTEMPT="${word#DEPLOY_ATTEMPT=}" ;;
+          DEPLOY_REVISION=*) S_REVISION="${word#DEPLOY_REVISION=}" ;;
+        esac
+      done
       return 0
     fi
     ((SECONDS < deadline)) || return 1
@@ -149,7 +165,7 @@ read_snapshot() {
 }
 
 snapshot_or_die() {
-  read_snapshot || {
+  read_snapshot "$@" || {
     echo "ОШИБКА: состояние юнита $UNIT неизвестно (нет ответа менеджера за ${READ_RETRY_S} с)."
     echo "    Выкладка не запускалась повторно; проверьте на сервере: systemctl --user status $UNIT"
     exit 1
@@ -192,7 +208,7 @@ else
 --setenv=DEPLOY_NO_BUILD=$NO_BUILD --setenv=DEPLOY_NO_BACKUP=$NO_BACKUP \
 --setenv=DEPLOY_T0_REVISION=$T0_REVISION --setenv=DEPLOY_T0_CONFIRM=$T0_CONFIRM \
 --setenv=DEPLOY_COMPOSE='${DEPLOY_COMPOSE:-docker compose}' \
-bash \"$MY_SCRIPT\" $REVISION $MY_ATTEMPT" 2>&1 >/dev/null)" && launched=1 || launched=0
+bash $MY_SCRIPT $REVISION $MY_ATTEMPT" 2>&1 >/dev/null)" && launched=1 || launched=0
   if ((launched)); then
     WATCH_ATTEMPT="$MY_ATTEMPT"
   else
@@ -221,9 +237,16 @@ LOG_FILE="$R_RELEASES/deploy-$REVISION-$WATCH_ATTEMPT.log"
 EXIT_FILE="$R_RELEASES/deploy-$REVISION-$WATCH_ATTEMPT.exit"
 offset=0
 
+# Остаток общего бюджета ожидания для одного вызова: не больше CALL_TIMEOUT_S.
+left() {
+  local rest=$((deadline - SECONDS))
+  ((rest > CALL_TIMEOUT_S)) && rest=$CALL_TIMEOUT_S
+  echo $((rest > 1 ? rest : 1))
+}
+
 print_log() {
   local out size
-  out="$(run_remote "f=$LOG_FILE; n=\$(stat -c %s \"\$f\" 2>/dev/null || echo 0); echo \$n; tail -c +$((offset + 1)) \"\$f\" 2>/dev/null | head -c \$((n - $offset))" 2>/dev/null)" || return 0
+  out="$(run_remote "f=$LOG_FILE; n=\$(stat -c %s \"\$f\" 2>/dev/null || echo 0); echo \$n; tail -c +$((offset + 1)) \"\$f\" 2>/dev/null | head -c \$((n - $offset))" "$(left)" 2>/dev/null)" || return 0
   size="$(head -n 1 <<<"$out")"
   [[ "$size" =~ ^[0-9]+$ ]] || return 0
   if ((size > offset)); then
@@ -232,19 +255,22 @@ print_log() {
   fi
 }
 
-exit_code() { run_remote "cat $EXIT_FILE 2>/dev/null" 2>/dev/null || true; }
+exit_code() { run_remote "cat $EXIT_FILE 2>/dev/null" "$(left)" 2>/dev/null || true; }
 
 report_and_fail() {
   echo "ОШИБКА: $1"
   echo "---- хвост лога ($LOG_FILE) ----"
-  run_remote "tail -n 40 $LOG_FILE" 2>/dev/null || true
+  run_remote "tail -n 40 $LOG_FILE" "$CALL_TIMEOUT_S" 2>/dev/null || true
   echo "---- образы сервисов ----"
-  run_remote "docker ps --filter name=mentis --format '{{.Names}} {{.Image}}'" 2>/dev/null || true
+  run_remote "docker ps --filter name=mentis --format '{{.Names}} {{.Image}}'" "$CALL_TIMEOUT_S" 2>/dev/null || true
   echo "Флаг trading:start_fence снимается только по runbook (docs/DEPLOY.md §6)."
   exit 1
 }
 
 deadline=$((SECONDS + WAIT_TIMEOUT_S))
+timed_out() {
+  report_and_fail "таймаут ${WAIT_TIMEOUT_S} с; юнит не остановлен и продолжает работу"
+}
 while :; do
   print_log
   code="$(exit_code)"
@@ -258,12 +284,17 @@ while :; do
     fi
     report_and_fail "скрипт ограды завершился с кодом $code"
   fi
-  snapshot_or_die
+  ((SECONDS < deadline)) || timed_out
+  budget=$((deadline - SECONDS))
+  ((budget > READ_RETRY_S)) && budget=$READ_RETRY_S
+  if ! read_snapshot "$budget"; then
+    ((SECONDS < deadline)) || timed_out
+    snapshot_or_die 0  # сообщает «состояние неизвестно» и выходит
+  fi
   if ! alive || [[ "$S_ATTEMPT" != "$WATCH_ATTEMPT" ]]; then
     code="$(exit_code)"  # .exit мог появиться между чтениями
     [[ -n "$code" ]] && continue
     report_and_fail "скрипт ограды завершился без кода (юнит: $S_LOAD/$S_ACTIVE, попытка '${S_ATTEMPT}')"
   fi
-  ((SECONDS < deadline)) || report_and_fail "таймаут ${WAIT_TIMEOUT_S} с; юнит не остановлен и продолжает работу"
   sleep "$POLL_S"
 done
