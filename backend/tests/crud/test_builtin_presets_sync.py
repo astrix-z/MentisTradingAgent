@@ -511,11 +511,14 @@ def redis_hung_on_get() -> Iterator[tuple[str, list[str]]]:
 
     redis-py sends ``CLIENT SETINFO`` on connect, outside its retry loop; a
     server silent from the first byte times out there, so a retried GET would
-    go unnoticed (R100). Yields the URL and the commands received.
+    go unnoticed (R100). Yields the URL and the commands received. On exit
+    every connection is shut down and its handler joined, even if the client
+    still holds it open (R110).
     """
     received: list[str] = []
     stop = threading.Event()
     conns: list[socket.socket] = []
+    handlers: list[threading.Thread] = []
 
     def commands(conn: socket.socket) -> Iterator[list[bytes]]:
         buf = b""
@@ -565,7 +568,9 @@ def redis_hung_on_get() -> Iterator[tuple[str, list[str]]]:
                 except TimeoutError:
                     continue
                 conns.append(conn)
-                threading.Thread(target=serve, args=(conn,), daemon=True).start()
+                handler = threading.Thread(target=serve, args=(conn,), daemon=True)
+                handlers.append(handler)
+                handler.start()
 
         acceptor = threading.Thread(target=accept, daemon=True)
         acceptor.start()
@@ -575,7 +580,41 @@ def redis_hung_on_get() -> Iterator[tuple[str, list[str]]]:
             stop.set()
             acceptor.join(timeout=5)
             for conn in conns:
+                # close() from another thread does not wake a blocked recv()
+                try:
+                    conn.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 conn.close()
+            for handler in handlers:
+                handler.join(timeout=5)
+            assert not acceptor.is_alive()
+            assert not any(handler.is_alive() for handler in handlers)
+
+
+def test_the_hung_server_stops_its_handlers_while_a_client_is_connected() -> None:
+    with redis_hung_on_get() as (url, received):
+        # longer than the handler join: only the shutdown can end this GET
+        client = make_sync_redis(url, 30.0)
+        errors: list[RedisError] = []
+
+        def get() -> None:
+            try:
+                client.get("k")
+            except RedisError as exc:
+                errors.append(exc)
+
+        getter = threading.Thread(target=get, daemon=True)
+        getter.start()
+        deadline = time.monotonic() + 5
+        while "GET" not in received and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "GET" in received  # a handler is blocked in recv on an open peer
+    # leaving the context joined that handler; the client sees the shutdown
+    getter.join(timeout=5)
+    assert not getter.is_alive()
+    assert len(errors) == 1  # the GET ended with the connection, not a reply
+    client.close()
 
 
 def test_a_hung_redis_releases_the_lock_after_the_timeout() -> None:
@@ -595,11 +634,15 @@ def test_a_hung_redis_releases_the_lock_after_the_timeout() -> None:
         second = threading.Thread(target=wait_then_sync)
         started = time.monotonic()
         second.start()
-        with Session(engine) as session:
-            assert sync_builtin_presets(session, hung, STRATEGY).result == "failed"
-        assert time.monotonic() - started < 2 * timeout
-        second.join(timeout=30)
-        hung.close()
+        try:
+            with Session(engine) as session:
+                result = sync_builtin_presets(session, hung, STRATEGY).result
+            elapsed = time.monotonic() - started
+        finally:
+            second.join(timeout=30)
+            hung.close()
+        assert result == "failed"
+        assert elapsed < 2 * timeout
     assert "CLIENT" in received  # the handshake passed; the timeout hit the GET
     assert received.count("GET") == 1
     assert [o.result for o in waiter] == ["applied"]  # waited under the lock
