@@ -966,3 +966,26 @@ def test_s_is_the_enum_then_the_interval_lookup(
         json={"options": SEEDED["ripple_interval"]},
     )
     assert saved.json()["unsupported"] == unsupported
+
+
+def test_four_concurrent_first_gets_give_one_row_per_name(
+    superuser_token_headers: dict[str, str],
+    db: Session,
+) -> None:
+    """§7.1: four GET presets/ at once on an empty sync state, over HTTP."""
+
+    async def four() -> list[httpx.Response]:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            return list(
+                await asyncio.gather(
+                    *(c.get(PRESETS, headers=superuser_token_headers) for _ in range(4))
+                )
+            )
+
+    responses = asyncio.run(asyncio.wait_for(four(), timeout=30))
+    assert [r.status_code for r in responses] == [200] * 4
+    rows = db.exec(
+        select(StrategyPreset).where(StrategyPreset.strategy == STRATEGY)
+    ).all()
+    assert sorted(row.name for row in rows) == ["Default", "Fast"]
