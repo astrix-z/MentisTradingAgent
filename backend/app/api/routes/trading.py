@@ -56,9 +56,11 @@ from typing import Annotated, Any, Literal, Self
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from redis.exceptions import RedisError
-from sqlmodel import col, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel import Session, col, select
 
 from app.api.deps import CurrentUser, SessionDep, get_current_active_superuser
+from app.core.field_options import option_errors, read_options
 from app.core.redis_client import get_redis
 from app.core.strategy_catalog import (
     CatalogError,
@@ -500,6 +502,11 @@ def _redis_unavailable(_exc: RedisError) -> HTTPException:
     return HTTPException(status_code=503, detail="Redis is unavailable")
 
 
+def database_unavailable(exc: SQLAlchemyError) -> HTTPException:
+    logger.error("database error: %s", exc)
+    return HTTPException(status_code=503, detail="the database is unavailable")
+
+
 async def _enqueue(envelope: CommandEnvelope) -> None:
     """Durably append to the command stream (at-least-once; see module docstring)."""
     redis = get_redis()
@@ -684,20 +691,49 @@ async def _compiled_strategy(name: str) -> CompiledStrategy:
     return compiled
 
 
+def strategy_params_errors(
+    compiled: CompiledStrategy,
+    params: dict[str, Any],
+    session: Session,
+    options: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """The pipeline of plan §4.3.5 for a Start or a saved preset, ``loc`` at
+    ``body.params``.
+
+    Steps 1–4 are the agent's published rules (schema + cross-field
+    constraints); step 5 is the option lists in the database, checked once
+    steps 1–3 passed and reported together with step 4. Raises
+    :class:`CatalogError` (a rule cannot be evaluated) and ``503`` when the
+    lists cannot be read — neither means valid or invalid. ``options`` spares
+    the read when the caller checks many presets at once.
+    """
+    checked = compiled.check(params)
+    errors = list(checked.errors)
+    if checked.canonical is not None:
+        if options is None:
+            try:
+                options = read_options(session, compiled.name)
+            except SQLAlchemyError as exc:
+                raise database_unavailable(exc) from exc
+        errors += option_errors(options, checked.canonical)
+    return [{**error, "loc": _params_loc(error.get("loc") or [])} for error in errors]
+
+
 async def _enforce_strategy_params(
-    strategy: str, params: dict[str, Any], execution: dict[str, Any] | None = None
+    strategy: str,
+    params: dict[str, Any],
+    execution: dict[str, Any] | None,
+    session: Session,
 ) -> None:
     """Reject an invalid Start here, so nothing invalid reaches Redis.
 
     The rules enforced are the agent's own published ones (schema + cross-field
-    constraints); the backend contributes no domain knowledge.
+    constraints) and the option lists the operator keeps; the backend
+    contributes no domain knowledge.
     """
     compiled = await _compiled_strategy(strategy)
     try:
-        errors = [
-            {**error, "loc": _params_loc(error.get("loc") or [])}
-            for error in compiled.validate(params)
-        ]
+        errors = strategy_params_errors(compiled, params, session)
         if execution:
             section = await _compiled_execution()
             errors += [
@@ -882,14 +918,18 @@ async def set_working_symbols(
 
 
 @router.post("/commands/", status_code=202, response_model=CommandEnvelope)
-async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnvelope:
+async def issue_command(
+    request: CommandRequest, session: SessionDep, _: SuperUserDep
+) -> CommandEnvelope:
     """Publish an arbitrary known command to the agent."""
     if request.type == "start":
         try:
             parsed = StartPayload(**request.payload)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=json_safe_errors(exc)) from exc
-        await _enforce_strategy_params(parsed.strategy, parsed.params, parsed.execution)
+        await _enforce_strategy_params(
+            parsed.strategy, parsed.params, parsed.execution, session
+        )
         return await _apply_command("start", _start_command_payload(parsed))
     if request.type == "balance":
         return await _apply_command("balance", request.payload)
@@ -930,9 +970,13 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
 
 
 @router.post("/start/", status_code=202, response_model=CommandEnvelope)
-async def start_trading(payload: StartPayload, _: SuperUserDep) -> CommandEnvelope:
+async def start_trading(
+    payload: StartPayload, session: SessionDep, _: SuperUserDep
+) -> CommandEnvelope:
     """Convenience alias: start trading on a network with a strategy."""
-    await _enforce_strategy_params(payload.strategy, payload.params, payload.execution)
+    await _enforce_strategy_params(
+        payload.strategy, payload.params, payload.execution, session
+    )
     return await _apply_command("start", _start_command_payload(payload))
 
 

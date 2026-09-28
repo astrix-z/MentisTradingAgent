@@ -18,7 +18,8 @@ from fastapi.testclient import TestClient
 from redis.exceptions import RedisError
 
 from app.api import deps
-from app.api.routes import trading
+from app.api.errors import install_error_handlers
+from app.api.routes import presets, trading
 from app.core.security import create_access_token
 from app.core.strategy_catalog import REDIS_STRATEGIES_KEY
 from app.models import User
@@ -281,6 +282,7 @@ def redis(monkeypatch: pytest.MonkeyPatch) -> MemoryRedis:
     # declared. Tests that need "the agent has not run yet" delete this key.
     store.values[REDIS_STRATEGIES_KEY] = json.dumps(catalog_payload())
     monkeypatch.setattr(trading, "get_redis", lambda: store)
+    monkeypatch.setattr(presets, "get_redis", lambda: store)
     monkeypatch.setattr(trading, "_now", lambda: NOW)
     return store
 
@@ -288,7 +290,9 @@ def redis(monkeypatch: pytest.MonkeyPatch) -> MemoryRedis:
 @pytest.fixture
 def client(redis: MemoryRedis) -> Iterator[TestClient]:
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(trading.router, prefix="/api/v1")
+    app.include_router(presets.router, prefix="/api/v1")
     users = {
         "admin": User(
             email="admin@example.com", hashed_password="unused", is_superuser=True
@@ -301,12 +305,16 @@ def client(redis: MemoryRedis) -> Iterator[TestClient]:
     session.get.side_effect = lambda _model, user_id: next(
         (user for user in users.values() if str(user.id) == user_id), None
     )
+    # No option lists (plan §4.3.5 step 5 checks nothing then); the preset
+    # runner of test_validation_edge_cases stores the fixture's lists instead.
+    session.exec.return_value.all.return_value = []
     app.dependency_overrides[deps.get_db] = lambda: session
     with TestClient(app) as test_client:
         test_client.app_state["tokens"] = {
             role: create_access_token(user.id, timedelta(minutes=5))
             for role, user in users.items()
         }
+        test_client.app_state["session"] = session
         yield test_client
     assert redis is not None
 
@@ -711,6 +719,33 @@ def test_non_finite_literals_are_a_422_not_a_500(
         headers={**headers(client), "Content-Type": "application/json"},
     )
     assert response.status_code == 422
+    assert not redis.publications
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (
+            "/api/v1/trading/start/",
+            json.dumps(START).replace('["btcusdt"]', "[NaN]"),
+        ),
+        ("/api/v1/trading/commands/", '{"type": "start", "payload": NaN}'),
+    ],
+)
+def test_non_finite_literals_in_the_wrapper_are_a_422_not_a_500(
+    client: TestClient,
+    redis: MemoryRedis,
+    path: str,
+    body: str,
+) -> None:
+    """R79: FastAPI's own 422 could not write a NaN ``input``; now it can."""
+    response = client.post(
+        path,
+        content=body,
+        headers={**headers(client), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422, response.text
+    assert "NaN" not in response.text.replace('"nan"', "")
     assert not redis.publications
 
 

@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from starlette.middleware.cors import CORSMiddleware
 
+from app.api.errors import install_error_handlers
 from app.api.main import api_router
 from app.core.config import settings
 from app.core.redis_client import close_redis, get_redis
@@ -53,5 +54,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+install_error_handlers(app)
 app.include_router(api_router, prefix=settings.API_V1_STR)
 app.frontend("/", directory=FRONTEND_DIR)

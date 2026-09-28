@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 #: (the parse of plan §4.2 and the pipeline of §4.3.5). Part of the idempotency
 #: key: raising it re-parses an unchanged list, so a preset rejected by old
 #: rules is not stuck. Raise it whenever those rules change.
-PRESETS_PIPELINE_VERSION = 2
+PRESETS_PIPELINE_VERSION = 3
 
 #: ``pipeline_source_hash()`` for each pipeline version. A test fails when the
 #: source no longer matches the current version's entry: then add a new
@@ -64,6 +64,7 @@ PRESETS_PIPELINE_VERSION = 2
 PIPELINE_SOURCE_SHA256: dict[int, str] = {
     1: "80a1c6b0ef063270ad18d05db611e9da1a263e96723ef136c1ae2881a7006da1",
     2: "355d43db1d124fcd9e22909bbf296e8d3c9e747bb649983b2750d5102e9a5e4e",
+    3: "2d9aeca5a418a047da888d013fe36e49b152418fdf7d12e8ce157846cc41e3f2",
 }
 
 #: How long the sync waits for the lock row (or any row lock) before giving

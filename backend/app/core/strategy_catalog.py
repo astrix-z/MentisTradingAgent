@@ -35,7 +35,7 @@ import json
 import logging
 import math
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, Inexact, InvalidOperation, localcontext
 from typing import Annotated, Any, Literal
@@ -118,8 +118,17 @@ def json_safe_errors(exc: ValidationError) -> list[dict[str, Any]]:
     ``input`` or the context: the request body may carry ``NaN``/``Infinity``
     (Python's JSON parser accepts them), and the response writer does not.
     """
+    return plain_errors(exc.errors(include_url=False))
+
+
+def plain_errors(raw_errors: Sequence[Any]) -> list[dict[str, Any]]:
+    """Validation errors as strict JSON (see :func:`json_safe_errors`).
+
+    Also for FastAPI's own ``RequestValidationError``, whose default handler
+    cannot write a non-finite ``input`` (R79).
+    """
     errors: list[dict[str, Any]] = []
-    for raw_error in exc.errors(include_url=False):
+    for raw_error in raw_errors:
         error: dict[str, Any] = dict(raw_error)
         error["loc"] = list(raw_error.get("loc") or ())
         if "input" in error:
@@ -600,6 +609,18 @@ class PresetsParse:
 # --- Compiled catalog -------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class Checked:
+    """The outcome of the pipeline of plan §4.3.5, steps 1–4.
+
+    ``canonical`` (the model's output, with schema defaults) is set once steps
+    1–3 passed, whether or not a rule of step 4 failed: step 5 reads it.
+    """
+
+    errors: list[dict[str, Any]]
+    canonical: dict[str, Any] | None = None
+
+
 def _legacy_keys(entry: dict[str, Any], name: str) -> dict[str, str]:
     """The strategy's renamed parameters (old -> new), or ``{}``.
 
@@ -785,6 +806,23 @@ class CompiledStrategy:
                 ) from exc
 
     def validate(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        """Errors for a Start's ``params``; see :meth:`check`."""
+        return self.check(params).errors
+
+    def materialize(self, params: dict[str, Any]) -> dict[str, Any]:
+        """The full snapshot a saved preset stores (plan §4.3.3).
+
+        Every non-const parameter, as sent or else the schema default, in its
+        JSON form. Call it only for params that :meth:`check` accepted: then
+        every non-const field is either sent or has a default.
+        """
+        return {
+            name: params[name] if name in params else self._defaults[name]
+            for name in sorted(self.editable_fields())
+            if name in params or name in self._defaults
+        }
+
+    def check(self, params: dict[str, Any]) -> Checked:
         """Errors for a Start's ``params``, through the pipeline of plan §4.3.5.
 
         1. fields — the compiled model: strict wire types, the numeric domain,
@@ -794,28 +832,34 @@ class CompiledStrategy:
         3. supported values — an interval-widget field must name an interval
            the agent serves (a guard for a catalog published without enum);
         4. cross-field rules, evaluated exactly.
-        A step with errors stops the pipeline. (Step 5, the option lists kept
-        in the database, is added by the preset API, PRESET-06.)
+        A step with errors stops the pipeline, except step 4. Step 5, the
+        option lists kept in the database, belongs to the caller
+        (``app.core.field_options``): it runs on ``canonical``, which is set
+        once steps 1–3 passed, and its errors are collected with step 4's.
 
-        Empty means the agent will accept these parameters. Raises
+        No errors means the agent will accept these parameters. Raises
         :class:`CatalogError` when a rule cannot be evaluated — the caller must
         not treat that as either valid or invalid.
         """
         if self._model is None:
-            return [] if not params else [self._unknown_params(params.keys())]
+            if not params:
+                return Checked(errors=[], canonical={})
+            return Checked(errors=[self._unknown_params(params.keys())])
         try:
             canonical = self._model.model_validate(params).model_dump()
         except ValidationError as exc:
-            return [
-                self._extra_param(self._extra_keys(error))
-                if error["type"] == "extra_forbidden"
-                else error
-                for error in json_safe_errors(exc)
-            ]
+            return Checked(
+                errors=[
+                    self._extra_param(self._extra_keys(error))
+                    if error["type"] == "extra_forbidden"
+                    else error
+                    for error in json_safe_errors(exc)
+                ]
+            )
         unsupported = self._unsupported(canonical)
         if unsupported:
-            return unsupported
-        return self._rule_failures(canonical)
+            return Checked(errors=unsupported)
+        return Checked(errors=self._rule_failures(canonical), canonical=canonical)
 
     def _unsupported(self, values: dict[str, Any]) -> list[dict[str, Any]]:
         """Step 3: interval-widget fields must name a served interval."""
@@ -1050,6 +1094,7 @@ __all__ = [
     "CATALOG_VERSION",
     "REDIS_STRATEGIES_KEY",
     "CatalogError",
+    "Checked",
     "CompiledCatalog",
     "CompiledStrategy",
     "PresetRecord",
@@ -1057,6 +1102,7 @@ __all__ = [
     "compile_catalog",
     "compile_published",
     "json_safe_errors",
+    "plain_errors",
     "preset_name",
     "read_catalog",
 ]

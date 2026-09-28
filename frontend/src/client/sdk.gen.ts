@@ -2,7 +2,7 @@
 
 import { type Client, type Options as Options2, type TDataShape, urlSearchParamsBodySerializer } from './client';
 import { client } from './client.gen';
-import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingFetchIndicatorsData, tradingFetchIndicatorsResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetCommandStateData, tradingGetCommandStateErrors, tradingGetCommandStateResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListPositionsData, tradingListPositionsResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingListWorkingSymbolsData, tradingListWorkingSymbolsResponses, tradingRefreshPricesData, tradingRefreshPricesResponses, tradingSetWorkingSymbolsData, tradingSetWorkingSymbolsErrors, tradingSetWorkingSymbolsResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
+import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, presetsCreatePresetData, presetsCreatePresetErrors, presetsCreatePresetResponses, presetsDeletePresetData, presetsDeletePresetErrors, presetsDeletePresetResponses, presetsListOptionsData, presetsListOptionsErrors, presetsListOptionsResponses, presetsListPresetsData, presetsListPresetsErrors, presetsListPresetsResponses, presetsUpdateOptionsData, presetsUpdateOptionsErrors, presetsUpdateOptionsResponses, presetsUpdatePresetData, presetsUpdatePresetErrors, presetsUpdatePresetResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingFetchIndicatorsData, tradingFetchIndicatorsResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetCommandStateData, tradingGetCommandStateErrors, tradingGetCommandStateResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListPositionsData, tradingListPositionsResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingListWorkingSymbolsData, tradingListWorkingSymbolsResponses, tradingRefreshPricesData, tradingRefreshPricesResponses, tradingSetWorkingSymbolsData, tradingSetWorkingSymbolsErrors, tradingSetWorkingSymbolsResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -596,6 +596,102 @@ export class TradingService {
             security: [{ scheme: 'bearer', type: 'http' }],
             url: '/api/v1/trading/status/',
             ...options
+        });
+    }
+}
+
+export class PresetsService {
+    /**
+     * List Presets
+     *
+     * Saved and built-in presets, each checked against today's catalog.
+     *
+     * The built-in sync is blocking (it holds a row lock while it reads Redis)
+     * and runs in the threadpool, so this worker's event loop keeps serving
+     * (§4.3.2, R87). Everything below is read after it returned. Its failure
+     * is not an error here: the last recorded sync state is served.
+     */
+    public static listPresets<ThrowOnError extends boolean = true>(options: Options<presetsListPresetsData, ThrowOnError>) {
+        return (options.client ?? client).get<presetsListPresetsResponses, presetsListPresetsErrors, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/strategies/{strategy}/presets/',
+            ...options
+        });
+    }
+    
+    /**
+     * Create Preset
+     */
+    public static createPreset<ThrowOnError extends boolean = true>(options: Options<presetsCreatePresetData, ThrowOnError>) {
+        return (options.client ?? client).post<presetsCreatePresetResponses, presetsCreatePresetErrors, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/strategies/{strategy}/presets/',
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                ...options.headers
+            }
+        });
+    }
+    
+    /**
+     * Delete Preset
+     *
+     * Works without a catalog: deleting needs no validation.
+     */
+    public static deletePreset<ThrowOnError extends boolean = true>(options: Options<presetsDeletePresetData, ThrowOnError>) {
+        return (options.client ?? client).delete<presetsDeletePresetResponses, presetsDeletePresetErrors, ThrowOnError>({
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/strategies/{strategy}/presets/{preset_id}',
+            ...options
+        });
+    }
+    
+    /**
+     * Update Preset
+     */
+    public static updatePreset<ThrowOnError extends boolean = true>(options: Options<presetsUpdatePresetData, ThrowOnError>) {
+        return (options.client ?? client).put<presetsUpdatePresetResponses, presetsUpdatePresetErrors, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/strategies/{strategy}/presets/{preset_id}',
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                ...options.headers
+            }
+        });
+    }
+    
+    /**
+     * List Options
+     */
+    public static listOptions<ThrowOnError extends boolean = true>(options: Options<presetsListOptionsData, ThrowOnError>) {
+        return (options.client ?? client).get<presetsListOptionsResponses, presetsListOptionsErrors, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/strategies/{strategy}/options/',
+            ...options
+        });
+    }
+    
+    /**
+     * Update Options
+     *
+     * Saved even without a catalog, values outside S included (D3).
+     */
+    public static updateOptions<ThrowOnError extends boolean = true>(options: Options<presetsUpdateOptionsData, ThrowOnError>) {
+        return (options.client ?? client).put<presetsUpdateOptionsResponses, presetsUpdateOptionsErrors, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/strategies/{strategy}/options/{field}',
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                ...options.headers
+            }
         });
     }
 }

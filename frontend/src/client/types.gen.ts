@@ -73,6 +73,26 @@ export type Body_login_login_access_token = {
 };
 
 /**
+ * BuiltinSyncState
+ */
+export type BuiltinSyncState = {
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Synced At
+     */
+    synced_at?: string | null;
+    /**
+     * Errors
+     */
+    errors?: Array<{
+        [key: string]: unknown;
+    }>;
+};
+
+/**
  * CommandEnvelope
  *
  * A command as it travels over the channel to the agent.
@@ -186,6 +206,20 @@ export type CommandState = {
      * Error
      */
     error?: string | null;
+};
+
+/**
+ * FieldOptionsOut
+ */
+export type FieldOptionsOut = {
+    /**
+     * Options
+     */
+    options: Array<string>;
+    /**
+     * Unsupported
+     */
+    unsupported: Array<string> | null;
 };
 
 /**
@@ -303,6 +337,16 @@ export type NewPassword = {
 };
 
 /**
+ * OptionsIn
+ */
+export type OptionsIn = {
+    /**
+     * Options
+     */
+    options: Array<string>;
+};
+
+/**
  * PositionsList
  */
 export type PositionsList = {
@@ -310,6 +354,67 @@ export type PositionsList = {
      * Positions
      */
     positions: Array<SignalPositionPublic>;
+};
+
+/**
+ * PresetIn
+ */
+export type PresetIn = {
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Params
+     */
+    params?: {
+        [key: string]: unknown;
+    };
+};
+
+/**
+ * PresetList
+ */
+export type PresetList = {
+    /**
+     * Items
+     */
+    items: Array<PresetOut>;
+    builtin_sync: BuiltinSyncState;
+};
+
+/**
+ * PresetOut
+ */
+export type PresetOut = {
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Is Builtin
+     */
+    is_builtin: boolean;
+    /**
+     * Params
+     */
+    params: {
+        [key: string]: unknown;
+    };
+    /**
+     * Valid
+     */
+    valid: boolean | null;
+    /**
+     * Errors
+     */
+    errors?: Array<{
+        [key: string]: unknown;
+    }>;
 };
 
 /**
@@ -1742,6 +1847,202 @@ export type tradingGetStatusResponses = {
 };
 
 export type tradingGetStatusResponse = tradingGetStatusResponses[keyof tradingGetStatusResponses];
+
+export type presetsListPresetsData = {
+    body?: never;
+    path: {
+        /**
+         * Strategy
+         */
+        strategy: string;
+    };
+    query?: never;
+    url: '/api/v1/trading/strategies/{strategy}/presets/';
+};
+
+export type presetsListPresetsErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type presetsListPresetsError = presetsListPresetsErrors[keyof presetsListPresetsErrors];
+
+export type presetsListPresetsResponses = {
+    /**
+     * Successful Response
+     */
+    200: PresetList;
+};
+
+export type presetsListPresetsResponse = presetsListPresetsResponses[keyof presetsListPresetsResponses];
+
+export type presetsCreatePresetData = {
+    body: PresetIn;
+    path: {
+        /**
+         * Strategy
+         */
+        strategy: string;
+    };
+    query?: never;
+    url: '/api/v1/trading/strategies/{strategy}/presets/';
+};
+
+export type presetsCreatePresetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type presetsCreatePresetError = presetsCreatePresetErrors[keyof presetsCreatePresetErrors];
+
+export type presetsCreatePresetResponses = {
+    /**
+     * Successful Response
+     */
+    201: PresetOut;
+};
+
+export type presetsCreatePresetResponse = presetsCreatePresetResponses[keyof presetsCreatePresetResponses];
+
+export type presetsDeletePresetData = {
+    body?: never;
+    path: {
+        /**
+         * Strategy
+         */
+        strategy: string;
+        /**
+         * Preset Id
+         */
+        preset_id: string;
+    };
+    query?: never;
+    url: '/api/v1/trading/strategies/{strategy}/presets/{preset_id}';
+};
+
+export type presetsDeletePresetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type presetsDeletePresetError = presetsDeletePresetErrors[keyof presetsDeletePresetErrors];
+
+export type presetsDeletePresetResponses = {
+    /**
+     * Successful Response
+     */
+    204: void;
+};
+
+export type presetsDeletePresetResponse = presetsDeletePresetResponses[keyof presetsDeletePresetResponses];
+
+export type presetsUpdatePresetData = {
+    body: PresetIn;
+    path: {
+        /**
+         * Strategy
+         */
+        strategy: string;
+        /**
+         * Preset Id
+         */
+        preset_id: string;
+    };
+    query?: never;
+    url: '/api/v1/trading/strategies/{strategy}/presets/{preset_id}';
+};
+
+export type presetsUpdatePresetErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type presetsUpdatePresetError = presetsUpdatePresetErrors[keyof presetsUpdatePresetErrors];
+
+export type presetsUpdatePresetResponses = {
+    /**
+     * Successful Response
+     */
+    200: PresetOut;
+};
+
+export type presetsUpdatePresetResponse = presetsUpdatePresetResponses[keyof presetsUpdatePresetResponses];
+
+export type presetsListOptionsData = {
+    body?: never;
+    path: {
+        /**
+         * Strategy
+         */
+        strategy: string;
+    };
+    query?: never;
+    url: '/api/v1/trading/strategies/{strategy}/options/';
+};
+
+export type presetsListOptionsErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type presetsListOptionsError = presetsListOptionsErrors[keyof presetsListOptionsErrors];
+
+export type presetsListOptionsResponses = {
+    /**
+     * Response Presets-List Options
+     *
+     * Successful Response
+     */
+    200: {
+        [key: string]: FieldOptionsOut;
+    };
+};
+
+export type presetsListOptionsResponse = presetsListOptionsResponses[keyof presetsListOptionsResponses];
+
+export type presetsUpdateOptionsData = {
+    body: OptionsIn;
+    path: {
+        /**
+         * Strategy
+         */
+        strategy: string;
+        /**
+         * Field
+         */
+        field: string;
+    };
+    query?: never;
+    url: '/api/v1/trading/strategies/{strategy}/options/{field}';
+};
+
+export type presetsUpdateOptionsErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type presetsUpdateOptionsError = presetsUpdateOptionsErrors[keyof presetsUpdateOptionsErrors];
+
+export type presetsUpdateOptionsResponses = {
+    /**
+     * Successful Response
+     */
+    200: FieldOptionsOut;
+};
+
+export type presetsUpdateOptionsResponse = presetsUpdateOptionsResponses[keyof presetsUpdateOptionsResponses];
 
 export type privateCreateUserData = {
     body: PrivateUserCreate;

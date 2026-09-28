@@ -138,6 +138,7 @@
         "json_invalid": "invalid_json",
         "too_large": "too_large",
         "unsupported_value": "unsupported",
+        "option_value": "option",
         "string_type": "type",
         "bool_type": "type"
       },
@@ -3317,8 +3318,6 @@
   ],
   "stages": {
     "$comment": "Точки входа, чей раннер ещё не существует: кейс их объявляет, раннер показывает skip «deferred» с задачей-владельцем.",
-    "ui": "PRESET-07",
-    "backend_preset_post": "PRESET-06",
-    "backend_preset_put": "PRESET-06"
+    "ui": "PRESET-07"
   }
 }
