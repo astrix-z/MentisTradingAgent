@@ -84,6 +84,9 @@ REDIS_HEARTBEAT_KEY = "trading:heartbeat"
 REDIS_RESULT_KEY = "agent:result"
 REDIS_COMMAND_STATE_PREFIX = "agent:command:"
 REDIS_SYMBOLS_KEY = "agent:symbols"
+#: Set by the deploy fence script while the agent and its catalog change
+#: (plan §4.6 G4); no Start is written while it exists.
+REDIS_START_FENCE_KEY = "trading:start_fence"
 
 # Approximate trim keeps the durable command stream bounded without an exact
 # (expensive) length check on every write.
@@ -97,8 +100,14 @@ _TERMINAL_STATUSES = ("succeeded", "failed", "timed_out")
 
 # Compare the exact document read by this worker, then commit and durably
 # enqueue without interleaving with another worker. JSON stays in Python to
-# preserve empty arrays.
+# preserve empty arrays. A Start (ARGV[6] = "1") is refused while the start
+# fence KEYS[2] exists — checked in the same script as the write, so a Start
+# validated before the fence was set is still refused (plan §4.6 G4).
+# Returns 1 written, 0 snapshot CAS lost (re-read and retry), -1 fenced.
 COMMIT_RUNTIME_LUA = """
+if ARGV[6] == '1' and redis.call('EXISTS', KEYS[2]) == 1 then
+    return -1
+end
 local current = redis.call('GET', KEYS[1])
 if (current or '') ~= ARGV[1] then
     return 0
@@ -502,6 +511,24 @@ def _redis_unavailable(_exc: RedisError) -> HTTPException:
     return HTTPException(status_code=503, detail="Redis is unavailable")
 
 
+def _start_fenced() -> HTTPException:
+    return HTTPException(status_code=503, detail="starting is closed for maintenance")
+
+
+async def _refuse_start_if_fenced() -> None:
+    """Early answer while a deploy holds the start fence (plan §4.6 G4).
+
+    Only a courtesy before validation: the guarantee is the check inside
+    ``COMMIT_RUNTIME_LUA``, atomic with the write.
+    """
+    try:
+        fenced = await get_redis().exists(REDIS_START_FENCE_KEY)
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    if fenced:
+        raise _start_fenced()
+
+
 def database_unavailable(exc: SQLAlchemyError) -> HTTPException:
     logger.error("database error: %s", exc)
     return HTTPException(status_code=503, detail="the database is unavailable")
@@ -591,14 +618,19 @@ async def _apply_command(
                 committed = await redis.execute_command(  # type: ignore[no-untyped-call]
                     "EVAL",
                     COMMIT_RUNTIME_LUA,
-                    1,
+                    2,
                     REDIS_RUNTIME_KEY,
+                    REDIS_START_FENCE_KEY,
                     raw if raw is not None else "",
                     snapshot.model_dump_json(),
                     REDIS_COMMAND_STREAM,
                     envelope.model_dump_json(),
                     str(COMMAND_STREAM_MAXLEN),
+                    "1" if type_ == "start" else "0",
                 )
+                if committed == -1:
+                    # Not retried: the fence stays until the deploy lifts it.
+                    raise _start_fenced()
                 if committed:
                     break
         except RedisError as exc:
@@ -923,6 +955,7 @@ async def issue_command(
 ) -> CommandEnvelope:
     """Publish an arbitrary known command to the agent."""
     if request.type == "start":
+        await _refuse_start_if_fenced()
         try:
             parsed = StartPayload(**request.payload)
         except ValidationError as exc:
@@ -974,6 +1007,7 @@ async def start_trading(
     payload: StartPayload, session: SessionDep, _: SuperUserDep
 ) -> CommandEnvelope:
     """Convenience alias: start trading on a network with a strategy."""
+    await _refuse_start_if_fenced()
     await _enforce_strategy_params(
         payload.strategy, payload.params, payload.execution, session
     )

@@ -212,6 +212,7 @@ class MemoryRedis:
         self.hashes: dict[str, dict[str, str]] = {}
         self.publications: list[tuple[str, dict[str, Any], str | None]] = []
         self.conflicts = 0
+        self.evals = 0
         self.fail: str | None = None
 
     async def get(self, key: str) -> str | None:
@@ -220,6 +221,11 @@ class MemoryRedis:
         raw = self.values.get(key)
         await asyncio.sleep(0)
         return raw
+
+    async def exists(self, key: str) -> int:
+        if self.fail == "get":
+            raise RedisError("read failed")
+        return int(key in self.values)
 
     async def hgetall(self, key: str) -> dict[str, str]:
         if self.fail == "get":
@@ -253,18 +259,25 @@ class MemoryRedis:
         script: str,
         numkeys: int,
         key: str,
+        fence: str,
         expected: str,
         snapshot: str,
         stream: str,
         envelope: str,
         maxlen: str,
+        is_start: str,
     ) -> int:
         assert command == "EVAL"
         assert script == trading.COMMIT_RUNTIME_LUA
-        assert numkeys == 1
+        assert numkeys == 2
+        assert fence == trading.REDIS_START_FENCE_KEY
+        self.evals += 1
         await asyncio.sleep(0)
         if self.fail == "eval":
             raise RedisError("commit failed")
+        # Same order as the script: the fence first, then the snapshot CAS.
+        if is_start == "1" and fence in self.values:
+            return -1
         if self.values.get(key, "") != expected:
             self.conflicts += 1
             return 0
@@ -1358,3 +1371,86 @@ def test_close_position_needs_a_valid_symbol(
     assert accepted.status_code == 202
     assert redis.publications[0][1]["payload"] == {"symbol": "BTCUSDT"}
     assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+# --- Start fence (plan §4.6 G4, PRESET-09a) -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        ("/api/v1/trading/start/", START),
+        ("/api/v1/trading/commands/", {"type": "start", "payload": START}),
+    ],
+)
+def test_the_start_fence_refuses_both_start_routes_early(
+    client: TestClient, redis: MemoryRedis, path: str, body: dict[str, Any]
+) -> None:
+    redis.values[trading.REDIS_START_FENCE_KEY] = "deploy abc1234 at 2026-09-28"
+    response = client.post(path, json=body, headers=headers(client))
+    assert response.status_code == 503
+    assert response.json()["detail"] == "starting is closed for maintenance"
+    assert redis.evals == 0  # refused before validation and the commit
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        ("/api/v1/trading/start/", START),
+        ("/api/v1/trading/commands/", {"type": "start", "payload": START}),
+    ],
+)
+def test_a_start_validated_before_the_fence_is_refused_at_the_write(
+    client: TestClient,
+    redis: MemoryRedis,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    body: dict[str, Any],
+) -> None:
+    """The early check passed; the fence is set while the Start is validated.
+
+    The script refuses it in the one EVAL that would have written it: code -1,
+    no retry, nothing in the stream or the runtime snapshot.
+    """
+    real = trading._enforce_strategy_params
+
+    async def fence_meanwhile(*args: Any) -> None:
+        await real(*args)
+        redis.values[trading.REDIS_START_FENCE_KEY] = "deploy"
+
+    monkeypatch.setattr(trading, "_enforce_strategy_params", fence_meanwhile)
+    response = client.post(path, json=body, headers=headers(client))
+    assert response.status_code == 503
+    assert redis.evals == 1
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+def test_stop_is_written_while_the_fence_stands(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    assert (
+        client.post(
+            "/api/v1/trading/start/", json=START, headers=headers(client)
+        ).status_code
+        == 202
+    )
+    redis.values[trading.REDIS_START_FENCE_KEY] = "deploy"
+    response = client.post("/api/v1/trading/stop/", headers=headers(client))
+    assert response.status_code == 202
+    snapshot = json.loads(redis.values[trading.REDIS_RUNTIME_KEY])
+    assert (snapshot["running"], snapshot["last_command"]) == (False, "stop")
+    assert [p[1]["type"] for p in redis.publications] == ["start", "stop"]
+
+
+def test_the_fence_check_fails_closed_when_redis_fails(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    redis.fail = "get"
+    response = client.post(
+        "/api/v1/trading/start/", json=START, headers=headers(client)
+    )
+    assert response.status_code == 503
+    assert not redis.publications
