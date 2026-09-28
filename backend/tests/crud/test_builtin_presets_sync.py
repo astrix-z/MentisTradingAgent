@@ -502,17 +502,90 @@ def test_the_blocking_client_bounds_every_read() -> None:
     options = get_sync_redis().connection_pool.connection_kwargs
     assert options["socket_timeout"] == SYNC_REDIS_TIMEOUT_S == 2.0
     assert options["socket_connect_timeout"] == SYNC_REDIS_TIMEOUT_S
+    assert not options.get("retry_on_timeout")
 
 
-def test_a_hung_redis_releases_the_lock_after_the_timeout() -> None:
-    """The production client against a server that accepts and never answers:
-    the sync fails within one timeout (no retries), and a worker waiting for
-    the lock meanwhile gets it right after and syncs (R95)."""
-    timeout = 0.5
+@contextmanager
+def redis_hung_on_get() -> Iterator[tuple[str, list[str]]]:
+    """A server that completes the connection handshake and never answers GET.
+
+    redis-py sends ``CLIENT SETINFO`` on connect, outside its retry loop; a
+    server silent from the first byte times out there, so a retried GET would
+    go unnoticed (R100). Yields the URL and the commands received.
+    """
+    received: list[str] = []
+    stop = threading.Event()
+    conns: list[socket.socket] = []
+
+    def commands(conn: socket.socket) -> Iterator[list[bytes]]:
+        buf = b""
+
+        def line() -> bytes:
+            nonlocal buf
+            while b"\r\n" not in buf:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    raise EOFError
+                buf += chunk
+            head, buf = buf.split(b"\r\n", 1)
+            return head
+
+        def exactly(n: int) -> bytes:
+            nonlocal buf
+            while len(buf) < n + 2:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    raise EOFError
+                buf += chunk
+            data, buf = buf[:n], buf[n + 2 :]
+            return data
+
+        while True:
+            count = int(line()[1:])  # *<n>
+            yield [exactly(int(line()[1:])) for _ in range(count)]  # $<len> <data>
+
+    def serve(conn: socket.socket) -> None:
+        try:
+            for command in commands(conn):
+                received.append(command[0].decode().upper())
+                if received[-1] == "CLIENT":
+                    conn.sendall(b"+OK\r\n")
+        except EOFError, OSError:
+            pass
+
     with socket.socket() as server:
         server.bind(("127.0.0.1", 0))
         server.listen()
-        hung = make_sync_redis(f"redis://127.0.0.1:{server.getsockname()[1]}", timeout)
+        server.settimeout(0.05)
+
+        def accept() -> None:
+            while not stop.is_set():
+                try:
+                    conn, _ = server.accept()
+                except TimeoutError:
+                    continue
+                conns.append(conn)
+                threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+        acceptor = threading.Thread(target=accept, daemon=True)
+        acceptor.start()
+        try:
+            yield f"redis://127.0.0.1:{server.getsockname()[1]}", received
+        finally:
+            stop.set()
+            acceptor.join(timeout=5)
+            for conn in conns:
+                conn.close()
+
+
+def test_a_hung_redis_releases_the_lock_after_the_timeout() -> None:
+    """The production client against a server that answers the handshake and
+    never GET: the sync fails within one timeout, with one GET (no retries), and
+    a worker waiting for the lock meanwhile gets it right after and syncs (R95,
+    R100)."""
+    timeout = 0.5
+    with redis_hung_on_get() as (url, received):
+        hung = make_sync_redis(url, timeout)
         waiter: list[SyncOutcome] = []
 
         def wait_then_sync() -> None:
@@ -527,6 +600,8 @@ def test_a_hung_redis_releases_the_lock_after_the_timeout() -> None:
         assert time.monotonic() - started < 2 * timeout
         second.join(timeout=30)
         hung.close()
+    assert "CLIENT" in received  # the handshake passed; the timeout hit the GET
+    assert received.count("GET") == 1
     assert [o.result for o in waiter] == ["applied"]  # waited under the lock
 
 
