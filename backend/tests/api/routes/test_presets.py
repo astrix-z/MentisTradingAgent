@@ -989,3 +989,24 @@ def test_four_concurrent_first_gets_give_one_row_per_name(
         select(StrategyPreset).where(StrategyPreset.strategy == STRATEGY)
     ).all()
     assert sorted(row.name for row in rows) == ["Default", "Fast"]
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_a_failed_commit_is_503_even_when_the_rollback_fails(
+    superuser_token_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    rollback_fails: bool,
+) -> None:
+    """R121: the rollback after a failed commit must not turn 503 into 500."""
+    real_commit = presets._commit
+
+    def break_the_session(session: Session) -> None:
+        fail_once(session, "commit")
+        if rollback_fails:
+            fail_once(session, "rollback")
+        real_commit(session)
+
+    monkeypatch.setattr(presets, "_commit", break_the_session)
+    with TestClient(app, raise_server_exceptions=False) as own:
+        response = post(own, superuser_token_headers, "Mine")
+    assert response.status_code == 503, response.text

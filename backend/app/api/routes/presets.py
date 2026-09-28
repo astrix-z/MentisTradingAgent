@@ -194,12 +194,21 @@ def _checked_params(
     return compiled.materialize(params)
 
 
+def _rollback(session: Session) -> None:
+    """Roll back after a failed commit; a lost connection may fail this too,
+    and must not turn the original error into another one (R121)."""
+    try:
+        session.rollback()
+    except SQLAlchemyError:
+        logger.exception("rollback after a failed commit failed")
+
+
 def _commit(session: Session) -> None:
     """Commit; ``409`` for a taken name only, ``503`` for a database failure."""
     try:
         session.commit()
     except IntegrityError as exc:
-        session.rollback()
+        _rollback(session)
         constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
         if constraint == NAME_INDEX:
             raise HTTPException(
@@ -207,7 +216,7 @@ def _commit(session: Session) -> None:
             ) from exc
         raise
     except SQLAlchemyError as exc:
-        session.rollback()
+        _rollback(session)
         raise database_unavailable(exc) from exc
 
 
