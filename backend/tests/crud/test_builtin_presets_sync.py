@@ -593,28 +593,24 @@ def redis_hung_on_get() -> Iterator[tuple[str, list[str]]]:
 
 
 def test_the_hung_server_stops_its_handlers_while_a_client_is_connected() -> None:
-    with redis_hung_on_get() as (url, received):
-        # longer than the handler join: only the shutdown can end this GET
-        client = make_sync_redis(url, 30.0)
-        errors: list[RedisError] = []
+    """A raw peer sends GET and stays open: only the shutdown ends the handler.
 
-        def get() -> None:
-            try:
-                client.get("k")
-            except RedisError as exc:
-                errors.append(exc)
-
-        getter = threading.Thread(target=get, daemon=True)
-        getter.start()
-        deadline = time.monotonic() + 5
-        while "GET" not in received and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert "GET" in received  # a handler is blocked in recv on an open peer
-    # leaving the context joined that handler; the client sees the shutdown
-    getter.join(timeout=5)
-    assert not getter.is_alive()
-    assert len(errors) == 1  # the GET ended with the connection, not a reply
-    client.close()
+    No client thread: the peer is closed in ``finally`` whatever fails (R113).
+    """
+    peer = socket.socket()
+    try:
+        with redis_hung_on_get() as (url, received):
+            peer.connect(("127.0.0.1", int(url.rsplit(":", 1)[1])))
+            peer.sendall(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
+            deadline = time.monotonic() + 5
+            while "GET" not in received and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert "GET" in received  # a handler is blocked in recv on an open peer
+        # leaving the context joined that handler; the peer sees the shutdown
+        peer.settimeout(5)
+        assert peer.recv(1) == b""
+    finally:
+        peer.close()
 
 
 def test_a_hung_redis_releases_the_lock_after_the_timeout() -> None:
