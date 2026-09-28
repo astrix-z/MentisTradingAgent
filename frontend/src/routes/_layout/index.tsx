@@ -34,7 +34,9 @@ function msUntilNextRefreshMark(): number {
   const now = new Date()
   const next = new Date(now)
   next.setSeconds(0, 0)
-  const upcoming = REFRESH_MARKS_PAST_HOUR.find((mark) => mark > now.getMinutes())
+  const upcoming = REFRESH_MARKS_PAST_HOUR.find(
+    (mark) => mark > now.getMinutes(),
+  )
   if (upcoming === undefined) {
     next.setHours(next.getHours() + 1)
     next.setMinutes(REFRESH_MARKS_PAST_HOUR[0])
@@ -121,8 +123,8 @@ function Dashboard() {
             Hi, {currentUser?.full_name || currentUser?.email} 👋
           </h1>
           <p className="text-muted-foreground">
-            Account balance and ENTRY-signal-derived positions, refreshed
-            every 15 minutes and on demand.
+            Account balance and ENTRY-signal-derived positions, refreshed every
+            15 minutes and on demand.
           </p>
         </div>
         <Button
@@ -166,10 +168,10 @@ function Dashboard() {
         <CardHeader>
           <CardTitle>Positions</CardTitle>
           <CardDescription>
-            Derived from ENTRY signals — the strategy never places a real
-            order (D-SIGNAL-ONLY), so this shows "what would have happened",
-            not an actual exchange position. Closed once the last known price
-            crossed stop or take.
+            Derived from ENTRY signals — the strategy never places a real order
+            (D-SIGNAL-ONLY), so this shows "what would have happened", not an
+            actual exchange position. Closed once the last known price crossed
+            stop or take.
           </CardDescription>
         </CardHeader>
         <CardContent>
