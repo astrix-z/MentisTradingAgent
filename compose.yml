@@ -69,7 +69,9 @@ services:
       - traefik.http.services.adminer.loadbalancer.server.port=8080
 
   backend:
-    image: mentis-backend:latest
+    # Built as :<revision> (MENTIS_TAG, scripts/deploy.sh), so a build never moves
+    # :latest; the deploy fence retags :latest at its step (4) (plan §4.6 G4).
+    image: mentis-backend:${MENTIS_TAG:-latest}
     depends_on:
       db:
         condition: service_healthy
@@ -111,7 +113,9 @@ services:
       - traefik.http.routers.backend-http.entrypoints=http
 
   agent:
-    image: mentis-agent:latest
+    # Built as :<revision> (MENTIS_TAG, scripts/deploy.sh), so a build never moves
+    # :latest; the deploy fence retags :latest at its step (4) (plan §4.6 G4).
+    image: mentis-agent:${MENTIS_TAG:-latest}
     build:
       context: .
       dockerfile: agent/Dockerfile
