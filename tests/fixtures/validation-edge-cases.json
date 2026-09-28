@@ -2560,6 +2560,68 @@
       "intentional_difference": "the agent reports an unsupported interval from its cross-field validator, without a field; the backend reports it on the field"
     },
     {
+      "id": "option-ripple-outside-list",
+      "note": "Интервал из S, но не из baseline-списка ripple (T2): отказ по списку, шаг 5",
+      "ui_draft": null,
+      "params_patch": {
+        "ripple_interval": "3m"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "ripple_interval": "3m"
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "option",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "option",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "option",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "option",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "option lists live in the backend database (plan §4.3.5 step 5); the agent checks only S"
+    },
+    {
       "id": "arithmetic-safe-sum",
       "note": "k + d + slow − 2 = 9007199254740991 > kline_window: float дал бы равенство",
       "ui_draft": {

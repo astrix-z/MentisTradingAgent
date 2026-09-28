@@ -170,12 +170,13 @@ def test_backend_entry_point(
     entry_point: str,
 ) -> None:
     outcome = case["outcomes"][entry_point]
+    rows = stored(client)  # the fixture's option lists, for Start and presets
     if entry_point in STAGES:
         pytest.skip(f"deferred: {entry_point} runs from {STAGES[entry_point]}")
     if outcome == "n/a":
         pytest.skip(f"n/a: {entry_point} does not apply to {case['id']}")
     if entry_point in PRESET_ENTRY_POINTS:
-        run_preset(client, redis, case, entry_point, outcome)
+        run_preset(client, redis, rows, case, entry_point, outcome)
         return
     path, wrap = ROUTES[entry_point]
     assert wrap is not None
@@ -201,12 +202,12 @@ def test_backend_entry_point(
 def run_preset(
     client: TestClient,
     redis: MemoryRedis,
+    rows: dict[uuid.UUID, StrategyPreset],
     case: dict[str, Any],
     entry_point: str,
     outcome: dict[str, Any],
 ) -> None:
     """POST the case as a new preset, or PUT it over one made from the baseline."""
-    rows = stored(client)
     path, _ = ROUTES[entry_point]
     params = params_text(case)
     send = {**headers(client), "Content-Type": "application/json"}

@@ -129,23 +129,32 @@ def sync_builtin_presets(session: Session, redis: Redis, strategy: str) -> SyncO
 
     Owns the session's transaction: call it with no pending work, and read the
     presets for a response only after it returns (commit or rollback done).
-    Any failure is logged and reported as ``failed``: a sync never fails the
-    request that triggered it.
+    Any failure — the commit included (R116) — is rolled back, logged and
+    reported as ``failed``: a sync never fails the request that triggered it.
     """
     try:
         outcome = _sync(session, redis, strategy)
+        if outcome.result == "applied":
+            session.commit()
+        else:
+            session.rollback()
     except Exception:
-        session.rollback()
+        _rollback_quietly(session)
         logger.exception("strategy %r: built-in preset sync failed", strategy)
         return SyncOutcome("failed")
     except BaseException:
-        session.rollback()
+        _rollback_quietly(session)
         raise
-    if outcome.result == "applied":
-        session.commit()
-    else:
-        session.rollback()
     return outcome
+
+
+def _rollback_quietly(session: Session) -> None:
+    """Roll back after a failure; a lost connection may fail this too, and the
+    caller's next statement then reports the database state it finds."""
+    try:
+        session.rollback()
+    except Exception:
+        logger.exception("rollback after a failed built-in preset sync failed")
 
 
 def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:

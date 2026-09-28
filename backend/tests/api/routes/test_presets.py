@@ -598,14 +598,17 @@ def test_a_preset_saved_with_old_names_reads_valid_and_put_stores_new_names(
     item = next(i for i in items if i["name"] == "Old")
     assert (item["valid"], item["errors"]) == (True, [])
     moved = {**old, "swing_low_wave_n": 7, "trail_ripple_n": 9}
-    response = client.put(
-        f"{PRESETS}{preset_id}",
-        headers=superuser_token_headers,
-        json={"name": "Old", "params": moved},
-    )
-    assert response.status_code == 200, response.json()
+    assert item["params"] == moved  # served with the new names (R115)
     row = db.get(StrategyPreset, preset_id)
     assert row is not None
+    db.refresh(row)
+    assert "swing_low_h1_n" in row.params  # the row keeps its keys until a PUT
+    response = client.put(  # what GET served goes straight back
+        f"{PRESETS}{preset_id}",
+        headers=superuser_token_headers,
+        json={"name": "Old", "params": item["params"]},
+    )
+    assert response.status_code == 200, response.json()
     db.refresh(row)
     assert row.params == moved
 
@@ -818,3 +821,148 @@ def test_a_value_outside_s_on_a_list_is_refused_by_start(
     response = start(client, superuser_token_headers, ripple_interval="1M")
     assert response.status_code == 422
     assert [e["type"] for e in response.json()["detail"]] == ["unsupported_value"]
+
+
+# --- Failure boundaries (R116, R117) --------------------------------------------------
+
+
+def fail_once(target: Any, name: str) -> list[int]:
+    """Make ``target.name`` raise OperationalError once, then behave again."""
+    real = getattr(target, name)
+    calls: list[int] = []
+
+    def failing(*args: Any, **kwargs: Any) -> Any:
+        if not calls:
+            calls.append(1)
+            raise OperationalError(name, {}, Exception("connection lost"))
+        return real(*args, **kwargs)
+
+    setattr(target, name, failing)
+    return calls
+
+
+def test_a_sync_whose_commit_fails_serves_the_last_state(
+    client: TestClient,
+    superuser_token_headers: dict[str, str],
+    redis: MemoryRedis,
+    sync_redis: SyncRedis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = client.get(PRESETS, headers=superuser_token_headers).json()
+    changed = copy.deepcopy(CATALOG)
+    default = changed["strategies"][0]["presets"][0]
+    default["params"] = {**default["params"], "tp_pct": "12"}
+    redis.values[REDIS_STRATEGIES_KEY] = sync_redis.raw = json.dumps(changed)
+    real_sync = builtin_presets._sync
+    failed: list[list[int]] = []
+
+    def sync_then_fail_commit(session: Session, *args: Any) -> SyncOutcome:
+        outcome = real_sync(session, *args)
+        failed.append(fail_once(session, "commit"))
+        return outcome
+
+    monkeypatch.setattr(builtin_presets, "_sync", sync_then_fail_commit)
+    response = client.get(PRESETS, headers=superuser_token_headers)
+    assert response.status_code == 200, response.text
+    assert failed == [[1]]  # the commit itself failed
+    after = response.json()
+    assert after["builtin_sync"] == before["builtin_sync"]
+    served = {item["name"]: item["params"]["tp_pct"] for item in after["items"]}
+    assert served["Default"] == DEFAULT["tp_pct"]  # nothing of the failed sync
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT"])
+def test_a_failing_read_after_a_successful_commit_is_not_a_500(
+    client: TestClient,
+    superuser_token_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    db: Session,
+    method: str,
+) -> None:
+    """The committed row is expired; reading it again would be a new SELECT."""
+    preset_id = None
+    if method == "PUT":
+        preset_id = post(client, superuser_token_headers, "Before").json()["id"]
+    real_commit = presets._commit
+
+    def commit_then_break_reads(session: Session) -> None:
+        real_commit(session)
+        fail_once(session, "execute")
+        fail_once(session, "_execute_internal")
+
+    monkeypatch.setattr(presets, "_commit", commit_then_break_reads)
+    body = {"name": "After", "params": {"tp_pct": "12"}}
+    if method == "POST":
+        response = client.post(PRESETS, headers=superuser_token_headers, json=body)
+        assert response.status_code == 201, response.text
+    else:
+        response = client.put(
+            f"{PRESETS}{preset_id}", headers=superuser_token_headers, json=body
+        )
+        assert response.status_code == 200, response.text
+    assert response.json()["params"]["tp_pct"] == "12"
+    row = db.get(StrategyPreset, uuid.UUID(response.json()["id"]))
+    assert row is not None
+    db.refresh(row)
+    assert (row.name, row.params["tp_pct"]) == ("After", "12")
+
+
+# --- Option lists: long labels, the source of S (R118, R119) ---------------------------
+
+
+def test_a_long_interval_label_is_normalized_as_text(
+    client: TestClient,
+    superuser_token_headers: dict[str, str],
+) -> None:
+    long = "H" + "0" * 3 + "9" * 4301
+    response = client.put(
+        f"{OPTIONS}ripple_interval",
+        headers=superuser_token_headers,
+        json={"options": [long, "15m"]},
+    )
+    assert response.status_code == 200, response.text
+    code = "9" * 4301 + "h"
+    assert response.json() == {"options": [code, "15m"], "unsupported": [code]}
+    duplicate = client.put(
+        f"{OPTIONS}ripple_interval",
+        headers=superuser_token_headers,
+        json={"options": ["H0001", "1h"]},
+    )
+    assert duplicate.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "enum,unsupported",
+    [
+        # The field's enum decides first: 1m is served by the lookup, not by it.
+        (["12h", "6h", "4h", "2h", "1h", "30m", "15m", "5m"], ["1m"]),
+        # Without an enum, an interval field falls back to intervals_ms.
+        (None, []),
+    ],
+)
+def test_s_is_the_enum_then_the_interval_lookup(
+    client: TestClient,
+    superuser_token_headers: dict[str, str],
+    redis: MemoryRedis,
+    enum: list[str] | None,
+    unsupported: list[str],
+) -> None:
+    changed = copy.deepcopy(CATALOG)
+    ripple = changed["strategies"][0]["settings_schema"]["properties"][
+        "ripple_interval"
+    ]
+    changed["strategies"][0].pop("presets", None)
+    if enum is None:
+        ripple.pop("enum")
+    else:
+        ripple["enum"] = enum
+    assert "1m" in changed["lookups"]["intervals_ms"]
+    redis.values[REDIS_STRATEGIES_KEY] = json.dumps(changed)
+    listed = client.get(OPTIONS, headers=superuser_token_headers).json()
+    assert listed["ripple_interval"]["unsupported"] == unsupported
+    saved = client.put(
+        f"{OPTIONS}ripple_interval",
+        headers=superuser_token_headers,
+        json={"options": SEEDED["ripple_interval"]},
+    )
+    assert saved.json()["unsupported"] == unsupported

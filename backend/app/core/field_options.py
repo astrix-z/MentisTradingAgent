@@ -114,7 +114,8 @@ def normalize_value(field: str, raw: str, allowed: list[str] | None) -> str:
     match = _LABEL.fullmatch(value)
     if match is not None:
         unit, count = match.groups()
-        return f"{int(count)}{unit.lower()}"
+        # Leading zeros dropped as text: int() refuses more than 4300 digits (R118).
+        return f"{count.lstrip('0') or '0'}{unit.lower()}"
     return value
 
 

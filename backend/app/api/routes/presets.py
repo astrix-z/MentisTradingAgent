@@ -258,28 +258,32 @@ def _preset_out(
     session: Session,
     options: dict[str, list[str]] | None,
 ) -> PresetOut:
-    errors: list[dict[str, Any]] = []
-    valid: bool | None = None
-    if compiled is not None:
-        moved, errors = _drift_errors(compiled, row.params)
-        if not errors:
-            try:
-                errors = strategy_params_errors(compiled, moved, session, options)
-            except CatalogError as exc:
-                logger.error("strategy catalog not evaluable: %s", exc)
-                return _plain_out(row, None, [])
-        valid = not errors
-    return _plain_out(row, valid, errors)
+    """Served with today's parameter names (old ones moved by ``legacy_keys``,
+    R115): what the UI may send back. The row itself keeps its keys until the
+    next ``PUT``."""
+    if compiled is None:
+        return _plain_out(row, None, [])
+    moved, errors = _drift_errors(compiled, row.params)
+    if not errors:
+        try:
+            errors = strategy_params_errors(compiled, moved, session, options)
+        except CatalogError as exc:
+            logger.error("strategy catalog not evaluable: %s", exc)
+            return _plain_out(row, None, [], moved)
+    return _plain_out(row, not errors, errors, moved)
 
 
 def _plain_out(
-    row: StrategyPreset, valid: bool | None, errors: list[dict[str, Any]]
+    row: StrategyPreset,
+    valid: bool | None,
+    errors: list[dict[str, Any]],
+    params: dict[str, Any] | None = None,
 ) -> PresetOut:
     return PresetOut(
         id=row.id,
         name=row.name,
         is_builtin=row.is_builtin,
-        params=row.params,
+        params=row.params if params is None else params,
         valid=valid,
         errors=errors,
     )
@@ -341,9 +345,12 @@ async def create_preset(
     row = StrategyPreset(
         strategy=strategy, name=name, params=params, created_by=user.id
     )
+    # Built before the commit: reading the expired row afterwards is another
+    # SELECT, which could fail after the row was saved (R117).
+    out = _plain_out(row, True, [])
     session.add(row)
     _commit(session)
-    return _plain_out(row, True, [])
+    return out
 
 
 @router.put("/{strategy}/presets/{preset_id}", response_model=PresetOut)
@@ -365,9 +372,10 @@ async def update_preset(
     row.name = name
     row.params = params
     row.updated_at = get_datetime_utc()
+    out = _plain_out(row, True, [])  # before the commit, as in create_preset
     session.add(row)
     _commit(session)
-    return _plain_out(row, True, [])
+    return out
 
 
 @router.delete("/{strategy}/presets/{preset_id}", status_code=204)
