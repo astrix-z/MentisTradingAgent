@@ -558,6 +558,9 @@ def test_an_unreadable_unit_state_is_retried_then_refused(server: Server) -> Non
     assert result.returncode == 1
     assert "состояние юнита mentis-deploy неизвестно" in result.stdout
     assert not any("systemd-run" in call for call in server.calls())
+    # Nothing was launched, so this attempt's files serve no one.
+    assert not list(server.releases.glob("stage-*"))
+    assert not list(server.releases.glob("deploy-fence-*.sh"))
 
 
 def test_a_bus_that_recovers_is_read_again_without_a_new_launch(server: Server) -> None:
@@ -731,6 +734,8 @@ def test_a_hung_show_is_bounded(server: Server) -> None:
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 1
     assert "состояние юнита mentis-deploy неизвестно" in result.stdout
+    assert not list(server.releases.glob("stage-*"))
+    assert not list(server.releases.glob("deploy-fence-*.sh"))
 
 
 @pytest.mark.parametrize("signal_name", ["SIGTERM", "SIGKILL"])

@@ -164,13 +164,13 @@ read_snapshot() {
   done
 }
 
-snapshot_or_die() {
-  read_snapshot "$@" || {
-    echo "ОШИБКА: состояние юнита $UNIT неизвестно (нет ответа менеджера за ${READ_RETRY_S} с)."
-    echo "    Выкладка не запускалась повторно; проверьте на сервере: systemctl --user status $UNIT"
-    exit 1
-  }
+unknown_state() {
+  echo "ОШИБКА: состояние юнита $UNIT неизвестно (нет ответа менеджера за ${READ_RETRY_S} с)."
+  echo "    Выкладка не запускалась повторно; проверьте на сервере: systemctl --user status $UNIT"
+  exit 1
 }
+
+snapshot_or_die() { read_snapshot "$@" || unknown_state; }
 
 # Загруженный юнит обязан нести корректные метаданные попытки (R109).
 check_metadata() {
@@ -198,7 +198,9 @@ choose_by_snapshot() {
 }
 
 WATCH_ATTEMPT=""
-snapshot_or_die
+# S0: запуска ещё не было, файлы попытки не нужны никому — убрать их. После
+# попытки запуска так нельзя: при потерянном ответе их уже читает наш юнит.
+read_snapshot || { remove_mine; unknown_state; }
 check_metadata
 if alive; then
   choose_by_snapshot
