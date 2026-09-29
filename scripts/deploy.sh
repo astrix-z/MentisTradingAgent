@@ -265,7 +265,17 @@ report_and_fail() {
   run_remote "tail -n 40 $LOG_FILE" "$CALL_TIMEOUT_S" 2>/dev/null || true
   echo "---- образы сервисов ----"
   run_remote "docker ps --filter name=mentis --format '{{.Names}} {{.Image}}'" "$CALL_TIMEOUT_S" 2>/dev/null || true
-  echo "Флаг trading:start_fence снимается только по runbook (docs/DEPLOY.md §6)."
+  # Завершённая попытка без шага (1) в логе флаг не ставила. Всё остальное
+  # (шаг был, лог не прочитан, юнит ещё работает) — как будто флаг стоит.
+  local found=2
+  if [[ "${2:-}" == finished ]]; then
+    run_remote "grep -q '^==> (1) флаг' $LOG_FILE" "$CALL_TIMEOUT_S" 2>/dev/null && found=0 || found=$?
+  fi
+  if ((found == 1)); then
+    echo "Флаг trading:start_fence не ставился, агент не останавливался: сбой до шага (1)."
+  else
+    echo "Флаг trading:start_fence снимается только по runbook (docs/DEPLOY.md §6)."
+  fi
   exit 1
 }
 
@@ -284,7 +294,7 @@ while :; do
       echo "    Доступ: ssh -L 8010:localhost:8010 ${SSH_TARGET}  затем http://localhost:8010"
       exit 0
     fi
-    report_and_fail "скрипт ограды завершился с кодом $code"
+    report_and_fail "скрипт ограды завершился с кодом $code" finished
   fi
   ((SECONDS < deadline)) || timed_out
   budget=$((deadline - SECONDS))

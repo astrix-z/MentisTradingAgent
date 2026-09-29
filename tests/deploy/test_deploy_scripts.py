@@ -158,7 +158,13 @@ STUBS: dict[str, str] = {
               for s in backend agent; do echo "id-$s-$MENTIS_TAG" >"$(img "mentis-$s:$MENTIS_TAG")"; done ;;
             up)
               [[ -f "$STATE/fail_up" && "$*" == *remove-orphans* ]] && exit 1
+              if [[ -f "$STATE/fail_up_after_backend" && "$*" == *remove-orphans* ]]; then
+                cp "$(img "mentis-backend:latest")" "$STATE/containers/c-backend.image"
+                exit 1
+              fi
+              # `up -d <service>` recreates only that service, as compose does.
               for s in backend agent; do
+                [[ "$*" == *remove-orphans* || " $* " == *" $s "* ]] || continue
                 cp "$(img "mentis-$s:latest")" "$STATE/containers/c-$s.image" 2>/dev/null || true
               done
               if [[ ! -f "$STATE/agent_silent" ]]; then
@@ -177,7 +183,10 @@ STUBS: dict[str, str] = {
             elif [[ "$2" == rm ]]; then rm "$(img "$3")" 2>/dev/null || exit 1; fi ;;
           inspect)
             case "$3" in
-              '{{.Image}}') id=$(cat "$STATE/containers/$4.image"); echo "$id"; cp "$STATE/containers/$4.image" "$STATE/images/$id" ;;
+              '{{.Image}}')
+                id=$(cat "$STATE/containers/$4.image"); echo "$id"
+                # gone_<container>: the image was deleted under a running container.
+                [[ -f "$STATE/gone_$4" ]] || cp "$STATE/containers/$4.image" "$STATE/images/$id" ;;
               '{{.Created}}') cat "$STATE/containers/$4.created" 2>/dev/null || date -Is ;;
               *) echo "image $(cat "$STATE/containers/$4.image")" ;;
             esac ;;
@@ -336,6 +345,8 @@ def test_a_build_failure_leaves_neither_fence_nor_a_stopped_agent(
     assert not any("start_fence" in call or "stop agent" in call for call in calls)
     assert server.image("mentis-agent:latest") == f"id-agent-{T0}"
     assert "скрипт ограды завершился с кодом" in result.stdout
+    assert "Флаг trading:start_fence не ставился" in result.stdout
+    assert "снимается только по runbook" not in result.stdout
 
 
 def test_a_failure_before_up_starts_the_previous_agent_and_keeps_the_fence(
@@ -348,13 +359,54 @@ def test_a_failure_before_up_starts_the_previous_agent_and_keeps_the_fence(
     order(calls, "stop agent", "start agent")
     assert server.redis("trading:start_fence") is not None
     assert "Флаг trading:start_fence остаётся" in result.stdout, result.stdout
+    assert "снимается только по runbook" in result.stdout
 
 
-def test_a_failure_inside_up_runs_the_agent_of_releases_current(server: Server) -> None:
-    server.put("fail_up")
+def test_the_images_report_names_a_missing_container(server: Server) -> None:
+    (server.state / "containers/c-backend.image").unlink()
+    server.put("fail_redis_DEL")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "backend: нет контейнера" in result.stdout, result.stdout
+
+
+def test_files_of_old_finished_attempts_are_rotated(server: Server) -> None:
+    for i in range(25):
+        attempt = f"{1_600_000_000 + i}-1-0000000{i % 10}"
+        for name in (f"deploy-{T0}-{attempt}.log", f"deploy-{T0}-{attempt}.exit",
+                     f"deploy-fence-{attempt}.sh"):
+            path = server.releases / name
+            path.write_text("0\n")
+            os.utime(path, (1_600_000_000 + i, 1_600_000_000 + i))
+    # A client between its upload and its launch (R108): no .exit yet.
+    waiting = server.releases / "deploy-fence-1500000000-1-aaaaaaaa.sh"
+    waiting.write_text("#!/bin/bash\n")
+    os.utime(waiting, (1_500_000_000, 1_500_000_000))
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout
+    exits = sorted(server.releases.glob(f"deploy-{T0}-*.exit"))
+    assert len(exits) == 20  # the newest 20 old ones; this attempt's is extra
+    assert not (server.releases / f"deploy-{T0}-1600000000-1-00000000.log").exists()
+    assert not (server.releases / "deploy-fence-1600000004-1-00000004.sh").exists()
+    assert (server.releases / "deploy-fence-1600000005-1-00000005.sh").exists()
+    assert waiting.exists()
+    assert len(list(server.releases.glob(f"deploy-{REVISION}-*.exit"))) == 1
+
+
+@pytest.mark.parametrize(
+    "failure,backend", [("fail_up", T0), ("fail_up_after_backend", REVISION)]
+)
+def test_a_failure_inside_up_runs_the_agent_of_releases_current(
+    server: Server, failure: str, backend: str
+) -> None:
+    server.put(failure)
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 1
     assert server.image("mentis-agent:latest") == f"id-agent-{T0}"
+    # :latest of the backend is what runs, whichever way up failed.
+    assert server.image("mentis-backend:latest") == f"id-backend-{backend}"
+    running = (server.state / "containers/c-backend.image").read_text().strip()
+    assert running == f"id-backend-{backend}"
     calls = server.calls()
     index = order(calls, f"tag mentis-agent:{T0} mentis-agent:latest")[0]
     assert any("up -d agent" in call for call in calls[index:])
@@ -381,10 +433,29 @@ def test_a_rollback_to_saved_images_does_not_build(server: Server) -> None:
 
 
 def test_a_target_without_images_or_a_tracked_lock_is_refused(server: Server) -> None:
+    app_dir = server.home / "apps/mentis-trading-agent"
+    (app_dir / "running-tree").write_text("the tree of the running revision")
     result = server.deploy("--revision", NO_LOCK)
     assert result.returncode == 1
     assert "lock текущего дерева не подставляется" in result.stdout
     assert not any("start_fence" in call for call in server.calls())
+    # Refused before step (1): APP_DIR still holds the running revision.
+    assert sorted(p.name for p in app_dir.iterdir()) == [".env.prod", "running-tree"]
+
+
+def test_app_dir_gets_the_target_only_after_the_build(server: Server) -> None:
+    app_dir = server.home / "apps/mentis-trading-agent"
+    (app_dir / "running-tree").write_text("the tree of the running revision")
+    server.put("fail_build")
+    assert server.deploy("--revision", REVISION).returncode == 1
+    assert sorted(p.name for p in app_dir.iterdir()) == [".env.prod", "running-tree"]
+    (server.state / "fail_build").unlink()
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout
+    assert not (app_dir / "running-tree").exists()  # a clean install
+    assert (app_dir / "compose.yml").exists()
+    assert (app_dir / ".env.prod").read_text() == "WEB_PORT=8010\n"
+    assert not (app_dir / ".env.prod").is_symlink()
 
 
 def test_a_target_whose_compose_ignores_mentis_tag_is_not_built(server: Server) -> None:
@@ -456,6 +527,19 @@ def test_t0_not_matching_the_last_dump_needs_a_human(first_run: Server) -> None:
         "--revision", REVISION, "--t0-revision", REVISION, "--t0-confirm", "--no-backup"
     )
     assert confirmed.returncode == 0, confirmed.stdout
+
+
+def test_t0_with_a_deleted_running_image_pins_nothing(first_run: Server) -> None:
+    """Docker's containerd store drops an untagged image under a running container."""
+    first_run.put("gone_c-agent")
+    result = first_run.deploy(
+        "--revision", REVISION, "--t0-revision", T0, "--t0-confirm", "--no-backup"
+    )
+    assert result.returncode == 1
+    assert "уже нет в хранилище Docker" in result.stdout
+    assert first_run.image(f"mentis-backend:{T0}") is None  # no half-pinned T0
+    assert not (first_run.releases / "pinned").exists()
+    assert not (first_run.releases / "current").exists()
 
 
 def test_t0_containers_older_than_the_dump_are_refused(first_run: Server) -> None:

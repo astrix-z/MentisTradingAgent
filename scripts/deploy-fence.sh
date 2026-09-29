@@ -16,11 +16,12 @@
 #   DEPLOY_COMPOSE         команда compose (по умолчанию "docker compose")
 #
 # Порядок: .current → [T0: проверка и закрепление] → снапшот и его ротация →
-# установка stage в APP_DIR → проверки контракта цели → сборка :<revision>
-# (всё до флага: сбой здесь не оставляет ни флага, ни остановленного агента) →
+# проверки контракта цели и сборка :<revision> из stage → установка stage в
+# APP_DIR (всё до флага: сбой здесь не оставляет ни флага, ни остановленного
+# агента, а до установки и APP_DIR работающей ревизии) →
 # G4: (1) флаг, (2) stop agent, (3) DEL каталога, (4) retag :latest и up,
-# (5) ожидание каталога до 2 мин, (6) снятие флага → healthcheck backend →
-# releases/current, history, ротация образов. Код выхода — в .exit попытки.
+# (5) ожидание каталога до 2 мин, healthcheck backend, (6) снятие флага →
+# releases/current, history, ротация образов и файлов попыток. Код выхода — в .exit попытки.
 
 set -Eeuo pipefail
 
@@ -47,6 +48,8 @@ PAUSE_S="${DEPLOY_PAUSE_S:-2}"
 #: Предел одного вызова redis-cli и curl в ожиданиях (R129).
 CALL_TIMEOUT_S="${DEPLOY_CALL_TIMEOUT_S:-10}"
 KEEP_REVISIONS=10
+#: Файлы (.log, .exit, копия скрипта ограды) стольких последних завершённых попыток.
+KEEP_ATTEMPTS=20
 SERVICES=(backend agent)
 
 exec >>"$LOG" 2>&1
@@ -59,6 +62,8 @@ echo "==> $(date -Is) попытка $ATTEMPT, ревизия $REVISION, скр�
 PHASE=before
 
 compose() { (cd "$APP_DIR" && "${COMPOSE[@]}" "$@"); }
+# Compose-файлы цели до установки в APP_DIR (проверки и сборка).
+stage_compose() { (cd "$STAGE/tree" && "${COMPOSE[@]}" "$@"); }
 redis_cli() { (cd "$APP_DIR" && timeout "$CALL_TIMEOUT_S" "${COMPOSE[@]}" exec -T redis redis-cli "$@"); }
 # Самый свежий непустой дамп базы $1 (пустой файл — не дамп, R123).
 latest_dump() {
@@ -67,9 +72,15 @@ latest_dump() {
 }
 image_id() { docker image inspect -f '{{.Id}}' "$1" 2>/dev/null || true; }
 running_images() {
-  local svc
+  local svc cid
   for svc in "${SERVICES[@]}"; do
-    echo "    $svc: $(compose ps -q "$svc" | xargs -r docker inspect -f '{{.Config.Image}} {{.Image}}' 2>/dev/null || echo 'не запущен')"
+    # -a: остановленный контейнер тоже показывается, с его состоянием.
+    cid="$(compose ps -aq "$svc" 2>/dev/null | head -n 1)"
+    if [[ -n "$cid" ]]; then
+      echo "    $svc: $(docker inspect -f '{{.Config.Image}} {{.Image}} {{.State.Status}}' "$cid" 2>/dev/null || echo '?')"
+    else
+      echo "    $svc: нет контейнера"
+    fi
   done
 }
 
@@ -102,6 +113,16 @@ on_exit() {
           compose up -d agent
         else
           echo "!!! trap: нет образа mentis-agent:$previous — агента не трогаю"
+        fi
+        # :latest backend — образ, который реально работает: up мог пересоздать
+        # его, а мог не дойти до него. Иначе ручной `compose up` молча поднял бы
+        # другой backend.
+        local backend_image
+        backend_image="$(compose ps -aq backend | head -n 1 | xargs -r docker inspect -f '{{.Image}}' 2>/dev/null)"
+        if [[ -n "$backend_image" ]] && docker tag "$backend_image" mentis-backend:latest; then
+          echo "==> trap: mentis-backend:latest = образ работающего backend"
+        else
+          echo "!!! trap: образ backend не определён — mentis-backend:latest может указывать на цель"
         fi
         echo "    Backend мог быть пересоздан и применить миграции: при «новый backend +"
         echo "    прежний агент» флаг снимается только повторным deploy.sh или решением человека."
@@ -172,8 +193,20 @@ if [[ ! -s "$RELEASES/current" ]]; then
     [[ "${DEPLOY_T0_CONFIRM:-0}" == 1 ]] || fail "сверка T0 не пройдена; продолжить можно только с --t0-confirm после проверки человеком"
     echo "    сверка не пройдена, но есть --t0-confirm (решение человека)"
   fi
+  # Сначала оба образа, потом теги: сбой не оставляет T0 закреплённым наполовину.
+  # Образ без тега Docker (хранилище containerd) удаляет, даже если на нём ещё
+  # работает контейнер, — такой T0 закрепить нечем.
+  t0_images=()
   for svc in "${SERVICES[@]}"; do
-    docker tag "$(docker inspect -f '{{.Image}}' "$(compose ps -q "$svc")")" "mentis-$svc:$T0"
+    cid="$(compose ps -q "$svc")"
+    [[ -n "$cid" ]] || fail "T0: $svc не запущен — закреплять нечего"
+    image="$(docker inspect -f '{{.Image}}' "$cid")"
+    [[ -n "$(image_id "$image")" ]] \
+      || fail "T0: образа работающего $svc ($image) уже нет в хранилище Docker — закрепить T0 нечем"
+    t0_images+=("$image")
+  done
+  for i in "${!SERVICES[@]}"; do
+    docker tag "${t0_images[$i]}" "mentis-${SERVICES[$i]}:$T0"
   done
   # Только справка: происхождение lock в APP_DIR не доказано (его перезаписывал
   # любой прежний деплой), пересобрать T0 по нему нельзя — T0 живёт на
@@ -209,9 +242,11 @@ if [[ "${DEPLOY_NO_BACKUP:-0}" != 1 ]]; then
   done
 fi
 
-# --- Установка артефакта: чистая, с удалением лишнего (.env.prod сохраняется) --
-echo "==> Установка $REVISION в $APP_DIR"
-mkdir -p "$APP_DIR"
+# --- Цель в stage: lock, контракт, сборка — до установки в APP_DIR -------------
+# APP_DIR до шага установки остаётся деревом работающей ревизии: отказ здесь не
+# оставляет в нём код цели. .env.prod — ссылкой (rsync его не переносит).
+[[ -f "$APP_DIR/.env.prod" ]] || fail "нет $APP_DIR/.env.prod (docs/DEPLOY.md §3)"
+ln -sfn "$APP_DIR/.env.prod" "$STAGE/tree/.env.prod"
 # Доверенный lock — только tracked lock ревизии: из её дерева или его копия
 # releases/<rev>.uv.lock, сохранённая при прежней выкладке этой ревизии (R124).
 tracked_lock=0
@@ -220,15 +255,13 @@ if [[ -f "$STAGE/tree/uv.lock" ]]; then
 elif [[ -f "$RELEASES/$REVISION.uv.lock" ]]; then
   cp -p "$RELEASES/$REVISION.uv.lock" "$STAGE/tree/uv.lock"
 fi
-rsync -a --delete --exclude=/.env.prod "$STAGE/tree/" "$APP_DIR/"
 
-# --- Контракт с целью: до шага (1) --------------------------------------------
 echo "==> Проверка контракта цели"
-services="$(compose config --services)"
+services="$(stage_compose config --services)"
 for svc in backend agent redis; do
   grep -qx "$svc" <<<"$services" || fail "в compose-файлах цели нет сервиса $svc"
 done
-images="$(cd "$APP_DIR" && env -u MENTIS_TAG "${COMPOSE[@]}" config --images)"
+images="$(cd "$STAGE/tree" && env -u MENTIS_TAG "${COMPOSE[@]}" config --images)"
 for svc in "${SERVICES[@]}"; do
   grep -qx "mentis-$svc:latest" <<<"$images" || fail "образ $svc цели без MENTIS_TAG — не mentis-$svc:latest"
 done
@@ -243,18 +276,23 @@ if (( have_images )); then
 elif [[ "${DEPLOY_NO_BUILD:-0}" == 1 ]]; then
   fail "--no-build, а образов :$REVISION нет"
 else
-  [[ -f "$APP_DIR/uv.lock" ]] || fail "у ревизии $REVISION нет tracked uv.lock и нет releases/$REVISION.uv.lock — lock текущего дерева не подставляется"
+  [[ -f "$STAGE/tree/uv.lock" ]] || fail "у ревизии $REVISION нет tracked uv.lock и нет releases/$REVISION.uv.lock — lock текущего дерева не подставляется"
   # Оба собираемых образа должны зависеть от MENTIS_TAG, иначе сборка сдвинет
   # :latest одного из них ещё до флага (R125).
-  probe="$(cd "$APP_DIR" && MENTIS_TAG=probe "${COMPOSE[@]}" config --images)"
+  probe="$(cd "$STAGE/tree" && MENTIS_TAG=probe "${COMPOSE[@]}" config --images)"
   for svc in "${SERVICES[@]}"; do
     grep -qx "mentis-$svc:probe" <<<"$probe" \
       || fail "compose.yml цели не знает MENTIS_TAG для $svc: сборка сдвинула бы :latest"
   done
   echo "==> Сборка :$REVISION"
-  (cd "$APP_DIR" && MENTIS_TAG="$REVISION" "${COMPOSE[@]}" build)
+  (cd "$STAGE/tree" && MENTIS_TAG="$REVISION" "${COMPOSE[@]}" build)
 fi
-(( tracked_lock )) && cp -p "$APP_DIR/uv.lock" "$RELEASES/$REVISION.uv.lock"
+(( tracked_lock )) && cp -p "$STAGE/tree/uv.lock" "$RELEASES/$REVISION.uv.lock"
+
+# --- Установка артефакта: чистая, с удалением лишнего (.env.prod сохраняется) --
+echo "==> Установка $REVISION в $APP_DIR"
+mkdir -p "$APP_DIR"
+rsync -a --delete --exclude=/.env.prod "$STAGE/tree/" "$APP_DIR/"
 
 # --- G4 --------------------------------------------------------------------------
 echo "==> (1) флаг $FENCE_KEY"
@@ -315,5 +353,15 @@ while IFS= read -r old; do
     docker image rm "mentis-$svc:$old" >/dev/null 2>&1 && echo "    ротация: mentis-$svc:$old"
   done
 done < <(awk '{print $2}' "$RELEASES/history" | sort -u)
+
+# --- Ротация файлов попыток: последние $KEEP_ATTEMPTS завершённых по .exit ----
+# Копия скрипта без .exit не трогается: попытка ещё не запущена (клиент между
+# загрузкой и запуском, R108) или убита — это ручная уборка, как чужой stage.
+while IFS= read -r done_exit; do
+  name="$(basename "$done_exit" .exit)"   # deploy-<revision>-<attempt>
+  old_attempt="${name#deploy-*-}"
+  rm -f -- "$RELEASES/$name.log" "$done_exit" "$RELEASES/deploy-fence-$old_attempt.sh"
+done < <(find "$RELEASES" -maxdepth 1 -name 'deploy-*.exit' -printf '%T@ %p\n' \
+           | sort -rn | tail -n +$((KEEP_ATTEMPTS + 1)) | cut -d' ' -f2-)
 
 echo "==> Готово: $REVISION"
