@@ -155,7 +155,10 @@ class ExecutionRuntime:
             logger.error(self.alerts["schema"])
             return
         self._restore_pending = True
-        await self.tick()
+        try:
+            await self.tick()
+        except Exception:  # noqa: BLE001 - the watchdog retries; boot must finish
+            logger.exception("first execution round failed; the watchdog retries")
         self._watchdog = asyncio.create_task(self._watch())
 
     async def _restore(self) -> None:
@@ -467,18 +470,31 @@ class ExecutionRuntime:
             )
 
     async def _take_lead(self) -> None:
-        """Take the lock, then reconcile before anything may be mutated."""
+        """Take the lock, then reconcile before anything may be mutated.
+
+        A failed reconciliation keeps the lock (nobody else may mutate either)
+        and leaves ``reconciled`` false; the next watchdog round retries it.
+        """
         assert self.lock is not None and self.context is not None
         self.reconciled = False
-        if not await self.lock.acquire():
-            self.alerts["lock"] = (
-                f"another process holds execution for {self.context.account}/"
-                f"{self.context.network}"
+        if not self.lock.held:
+            if not await self.lock.acquire():
+                self.alerts["lock"] = (
+                    f"another process holds execution for {self.context.account}/"
+                    f"{self.context.network}"
+                )
+                return
+            self.alerts.pop("lock", None)
+        try:
+            for hook in self._hooks:
+                await hook(self.context)
+        except Exception as exc:  # noqa: BLE001 - any failure: retry, stay closed
+            self.alerts["reconcile"] = (
+                f"reconciliation before execution failed, retrying: {exc}"
             )
+            logger.warning(self.alerts["reconcile"])
             return
-        self.alerts.pop("lock", None)
-        for hook in self._hooks:
-            await hook(self.context)
+        self.alerts.pop("reconcile", None)
         self.reconciled = True
         await self.unfinished(self.context)
 
@@ -533,7 +549,7 @@ class ExecutionRuntime:
                 if self.lock.held and not await self.lock.check():
                     self.reconciled = False
                     self.alerts["lock"] = "execution lock lost; mutations stopped"
-                if not self.lock.held:
+                if not self.lock.held or not self.reconciled:
                     await self._take_lead()
             now = self._clock()
             if self.trade is not None and (

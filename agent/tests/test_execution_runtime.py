@@ -26,6 +26,7 @@ from test_engine_lifecycle import setup_engine, start
 
 from agent.core.migrate import migrate
 from agent.exchange.budget import RequestBudget
+from agent.exchange.rest import ExchangeError
 from agent.exchange.trade import TradeClient
 from agent.execution.models import (
     AttemptState,
@@ -170,6 +171,67 @@ def test_losing_the_lock_session_hands_over_after_reconcile() -> None:
         assert not first.may_mutate()
         assert "lock" in first.alerts
         assert seen == [("first", False), ("second", False)]
+
+    run(scenario)
+
+
+def _flaky_reconcile(failures: int) -> tuple[list[int], Any]:
+    calls: list[int] = []
+
+    async def reconcile(context: ExecutionContext) -> None:
+        calls.append(1)
+        if len(calls) <= failures:
+            raise ExchangeError("ticker price timed out")
+
+    return calls, reconcile
+
+
+def test_failed_startup_reconcile_is_retried_while_the_lock_is_held() -> None:
+    # Review 2026-09-30 (EXEC-05): a failing hook left the lock held and
+    # reconciled=False, and later ticks only re-led when the lock was gone.
+    async def scenario(state: World) -> None:
+        runtime = state.runtime()
+        calls, reconcile = _flaky_reconcile(failures=2)
+        runtime.on_leadership(reconcile)
+        await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
+        assert runtime.lock is not None and runtime.lock.held
+        assert not runtime.may_mutate()
+        assert "ticker price timed out" in runtime.alerts["reconcile"]
+        await runtime.tick()
+        assert not runtime.may_mutate() and len(calls) == 2
+        await runtime.tick()
+        assert runtime.may_mutate()
+        assert "reconcile" not in runtime.alerts
+        assert len(calls) == 3
+        await runtime.tick()
+        assert len(calls) == 3  # reconciled: not repeated every round
+
+    run(scenario)
+
+
+def test_boot_restores_and_starts_the_watchdog_despite_a_failing_reconcile() -> None:
+    async def scenario(state: World) -> None:
+        await add(state, position())
+        runtime = state.runtime()
+        # The restore leads and fails; the same round retries once and fails.
+        calls, reconcile = _flaky_reconcile(failures=2)
+        runtime.on_leadership(reconcile)
+        await runtime.boot()
+        assert runtime._watchdog is not None and not runtime._watchdog.done()
+        assert runtime.context is not None and runtime.context.network == "live"
+        assert not runtime.may_mutate() and len(calls) == 2
+        await runtime.tick()
+        assert runtime.may_mutate() and len(calls) == 3
+
+    run(scenario)
+
+
+def test_boot_starts_the_watchdog_even_if_the_first_round_raises() -> None:
+    async def scenario(state: World) -> None:
+        runtime = state.runtime()
+        runtime.tick = AsyncMock(side_effect=ExchangeError("boom"))  # type: ignore[method-assign]
+        await runtime.boot()
+        assert runtime._watchdog is not None and not runtime._watchdog.done()
 
     run(scenario)
 
