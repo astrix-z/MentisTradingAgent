@@ -204,3 +204,88 @@ def test_lost_feedback_never_breaks_execution() -> None:
         await runtime.notify(event(at=datetime.now(UTC)), closed=True)  # no raise
 
     asyncio.run(scenario())
+
+
+def test_changes_during_startup_are_replayed_after_on_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review 2026-09-30 (EXEC-07): BTC closed through the worker/finalizer
+    # while on_start was running; the feedback was dropped and the strategy
+    # kept holding BTC without its cooldown.
+    async def scenario() -> None:
+        engine, _redis, strategy, _streams = setup_engine(monkeypatch)
+        at = datetime.now(UTC)
+        until = at + timedelta(minutes=60)
+        held: set[str] = set()
+        cooldown: dict[str, datetime] = {}
+        order: list[str] = []
+
+        async def restore(snapshot: PositionsSnapshot) -> None:
+            held.clear()
+            held.update(snapshot.open_symbols)
+            order.append("restore")
+
+        async def opened(e: PositionEvent) -> None:
+            held.add(e.symbol)
+            order.append(f"opened {e.symbol}")
+
+        async def closed(e: PositionEvent) -> None:
+            held.discard(e.symbol)
+            if e.cooldown_until is not None:
+                cooldown[e.symbol] = e.cooldown_until
+            order.append(f"closed {e.symbol}")
+
+        async def on_start(services: Any) -> None:
+            order.append("on_start")
+            # The finalizer commits BTC's close while the strategy starts.
+            await engine.position_feedback(
+                event("BTCUSDT", at=at, cooldown_until=until), True
+            )
+
+        strategy.restore_positions = AsyncMock(side_effect=restore)
+        strategy.on_position_opened = AsyncMock(side_effect=opened)
+        strategy.on_position_closed = AsyncMock(side_effect=closed)
+        strategy.on_start = AsyncMock(side_effect=on_start)
+
+        async def snapshot() -> PositionsSnapshot:
+            # ETH opens right after the snapshot was read.
+            await engine.position_feedback(event("ETHUSDT", at=at), False)
+            return PositionsSnapshot(open_symbols=frozenset({"BTCUSDT"}))
+
+        runtime = AsyncMock()
+        runtime.positions_snapshot = AsyncMock(side_effect=snapshot)
+        runtime.open_admission = lambda name: None
+        runtime.close_admission = lambda: None
+        runtime.heartbeat = lambda: {}
+        runtime.message = lambda: None
+        engine.execution = runtime
+        await start(engine)
+        assert order == ["restore", "on_start", "opened ETHUSDT", "closed BTCUSDT"]
+        assert held == {"ETHUSDT"}
+        assert cooldown == {"BTCUSDT": until}
+        # Running: delivered directly, nothing buffered any more.
+        await engine.position_feedback(event("ETHUSDT", at=at), True)
+        assert held == set()
+        assert engine._startup_feedback is None
+        await engine.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_start_drops_its_buffer(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        engine, _redis, strategy, _streams = setup_engine(monkeypatch)
+
+        async def on_start(services: Any) -> None:
+            await engine.position_feedback(event(at=datetime.now(UTC)), True)
+            raise RuntimeError("no market data")
+
+        strategy.on_start = AsyncMock(side_effect=on_start)
+        strategy.on_position_closed = AsyncMock()
+        with pytest.raises(RuntimeError):
+            await start(engine)
+        assert engine._startup_feedback is None
+        strategy.on_position_closed.assert_not_awaited()
+        await engine.shutdown()
+
+    asyncio.run(scenario())

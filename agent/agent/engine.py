@@ -91,6 +91,10 @@ class Engine:
         self._task: asyncio.Task[None] | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._startup: asyncio.Task[None] | None = None
+        #: Position changes committed while a start is between its positions
+        #: snapshot and ``running``; replayed onto the strategy before it runs.
+        #: ``None`` outside a start.
+        self._startup_feedback: list[tuple[PositionEvent, bool]] | None = None
         self._network: str = "testnet"
         self._strategy_name: str = ""
         self._state: AgentState = "idle"
@@ -214,18 +218,28 @@ class Engine:
 
         async with self._lifecycle_lock:
             snapshot = PositionsSnapshot()
-            if self.execution is not None:
-                await self.execution.prepare_start(
-                    network=network, settings=execution_settings, params=params
-                )
-                snapshot = await self.execution.positions_snapshot()
-            self._startup = asyncio.create_task(
-                self._start_run(network, strategy, normalized, strategy_obj, snapshot)
-            )
+            # Buffer from before the snapshot is read: a change committed in
+            # between is then both in the snapshot and replayed, which the
+            # strategy's idempotent handlers absorb; one committed after is
+            # never lost.
+            self._startup_feedback = []
             try:
-                await self._startup
+                if self.execution is not None:
+                    await self.execution.prepare_start(
+                        network=network, settings=execution_settings, params=params
+                    )
+                    snapshot = await self.execution.positions_snapshot()
+                self._startup = asyncio.create_task(
+                    self._start_run(
+                        network, strategy, normalized, strategy_obj, snapshot
+                    )
+                )
+                try:
+                    await self._startup
+                finally:
+                    self._startup = None
             finally:
-                self._startup = None
+                self._startup_feedback = None
             if self.execution is not None:
                 self.execution.open_admission(strategy)
 
@@ -258,6 +272,10 @@ class Engine:
                 emit=self._on_signal,
             )
             await strategy_obj.on_start(services)
+            await self._replay_startup_feedback(strategy_obj)
+            # No await between the drained buffer and "running": a change
+            # arriving now is delivered directly.
+            self._startup_feedback = None
             self._task = asyncio.create_task(self._run_loop())
             self._state = "running"
             await self.publish_heartbeat()
@@ -306,10 +324,27 @@ class Engine:
             await self.publish_heartbeat()
 
     async def position_feedback(self, event: PositionEvent, closed: bool) -> None:
-        """Forward a committed position change to the running strategy."""
+        """Forward a committed position change to the running strategy.
+
+        During a start the change is buffered and replayed once the strategy
+        has restored its snapshot and finished ``on_start``.
+        """
+        if self._startup_feedback is not None:
+            self._startup_feedback.append((event, closed))
+            return
         strategy = self._strategy
         if strategy is None or self._state != "running":
             return
+        await self._deliver(strategy, event, closed)
+
+    async def _replay_startup_feedback(self, strategy: Strategy) -> None:
+        buffered = self._startup_feedback
+        while buffered:  # may grow while a delivery awaits
+            event, closed = buffered.pop(0)
+            await self._deliver(strategy, event, closed)
+
+    @staticmethod
+    async def _deliver(strategy: Strategy, event: PositionEvent, closed: bool) -> None:
         if closed:
             await strategy.on_position_closed(event)
         else:
