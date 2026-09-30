@@ -193,10 +193,9 @@ export function parseSettingsSchema(schema: unknown): StrategyField[] {
         kind: "enum",
         options,
         widget,
-        defaultValue:
-          prop.default !== undefined
-            ? String(prop.default)
-            : (options[0] ?? ""),
+        // No declared default: nothing is chosen for the user. A preset that
+        // lacks the value stays missing and fails as required.
+        defaultValue: prop.default !== undefined ? String(prop.default) : "",
       })
       continue
     }
@@ -683,6 +682,36 @@ export type HistoryHint = {
   interval: string
   days: number
   tooLong: boolean
+  /** The smallest window the published constraints allow for the current
+   * values, and the history it takes on this interval; shown all the time,
+   * not only once the window is already too small. */
+  minBars?: number
+  minDays?: number
+}
+
+/**
+ * The smallest valid window: the largest lower bound that a published
+ * constraint puts on the window field (``window >= rhs`` or ``window > rhs``),
+ * evaluated for the current values. ``undefined`` when none can be evaluated.
+ */
+export function minimumWindow(
+  constraints: ConstraintRule[],
+  values: FieldValues,
+  lookups: Lookups,
+): number | undefined {
+  let minimum: number | undefined
+  for (const rule of constraints) {
+    const lhs = rule.lhs
+    if (!isRecord(lhs) || lhs.field !== HISTORY_BARS_FIELD) continue
+    if (rule.cmp !== "gte" && rule.cmp !== "gt") continue
+    const rhs = evaluateExpr(rule.rhs, values, lookups)
+    if (rhs === undefined) continue
+    const bound = Number(formatDecimal(rhs))
+    if (!Number.isFinite(bound)) continue
+    const bars = rule.cmp === "gt" ? Math.floor(bound) + 1 : Math.ceil(bound)
+    minimum = minimum === undefined ? bars : Math.max(minimum, bars)
+  }
+  return minimum
 }
 
 /** Required history of every interval field: bars × interval (D4). */
@@ -690,12 +719,14 @@ export function requiredHistory(
   fields: StrategyField[],
   values: FieldValues,
   lookups: Lookups,
+  constraints: ConstraintRule[] = [],
 ): HistoryHint[] {
   const barsText = values[HISTORY_BARS_FIELD]
   if (typeof barsText !== "string" || !INTEGER_TEXT.test(barsText)) return []
   const bars = Number(barsText)
   if (!Number.isSafeInteger(bars) || bars <= 0) return []
   const table = lookups.intervals_ms ?? {}
+  const minBars = minimumWindow(constraints, values, lookups)
   const hints: HistoryHint[] = []
   for (const field of fields) {
     if (field.widget !== "interval") continue
@@ -708,6 +739,11 @@ export function requiredHistory(
       interval,
       days: ms / 86_400_000,
       tooLong: ms > HISTORY_WARNING_MS,
+      minBars,
+      minDays:
+        minBars === undefined
+          ? undefined
+          : (minBars * table[interval]) / 86_400_000,
     })
   }
   return hints

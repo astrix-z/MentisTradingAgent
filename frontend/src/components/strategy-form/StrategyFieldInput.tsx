@@ -159,6 +159,11 @@ export function StrategyFieldInput({
           History: {formatDays(history.days)}
           {history.tooLong &&
             " — more than a year; the exchange may not have it for every symbol"}
+          {history.minBars !== undefined && history.minDays !== undefined && (
+            <span data-history-minimum={field.key}>
+              {` · minimum ${history.minBars} bars (${formatDays(history.minDays)})`}
+            </span>
+          )}
         </p>
       )}
     </div>

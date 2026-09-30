@@ -87,15 +87,18 @@ function plan(draft: Record<string, string>) {
   return { typed, seeded }
 }
 
+/**
+ * The issues the form shows, as `category|field`. An error type the fixture
+ * does not map comes back as `unmapped:<type>|field`, so it can never equal
+ * an expected list: the runner fails on it, it is never skipped.
+ */
 async function shownIssues(page: Page): Promise<string[]> {
   const issues = page.locator("[data-issue-type]")
   const found: string[] = []
   for (const issue of await issues.all()) {
     const type = (await issue.getAttribute("data-issue-type")) ?? ""
     const field = (await issue.getAttribute("data-issue-field")) || null
-    const category = FIXTURE.error_map.ui.types[type]
-    // An unknown UI error type fails the runner, it is never skipped.
-    expect(category, `error_map.ui has no entry for ${type}`).toBeDefined()
+    const category = FIXTURE.error_map.ui.types[type] ?? `unmapped:${type}`
     found.push(`${category}|${field}`)
   }
   return [...new Set(found)].sort()
@@ -140,14 +143,15 @@ for (const fixtureCase of FIXTURE.cases) {
       })
       return
     }
+    // A disabled Start also means "context or options still loading", so
+    // it says nothing about validation having run: wait for its output.
+    const expected = [
+      ...new Set(
+        outcome.errors.map((error) => `${error.category}|${error.field}`),
+      ),
+    ].sort()
+    await expect.poll(() => shownIssues(page)).toEqual(expected)
     await expectBlocked(page)
-    expect(await shownIssues(page)).toEqual(
-      [
-        ...new Set(
-          outcome.errors.map((error) => `${error.category}|${error.field}`),
-        ),
-      ].sort(),
-    )
     expect(api.posts).toEqual([])
   })
 }

@@ -583,12 +583,14 @@ function Strategy() {
   const history = useMemo(
     () =>
       new Map(
-        requiredHistory(fields, values, catalog?.lookups ?? {}).map((hint) => [
-          hint.field,
-          hint,
-        ]),
+        requiredHistory(
+          fields,
+          values,
+          catalog?.lookups ?? {},
+          activeStrategy?.constraints ?? [],
+        ).map((hint) => [hint.field, hint]),
       ),
-    [fields, values, catalog?.lookups],
+    [fields, values, catalog?.lookups, activeStrategy],
   )
   const builtinSync = presetsQuery.data?.builtin_sync
   const presetsProblem = presetsQuery.isError

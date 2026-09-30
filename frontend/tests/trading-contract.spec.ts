@@ -1021,15 +1021,20 @@ test("required history is shown per timeframe and warns past a year without bloc
   await page.goto("/strategy")
   await choose(page, "Preset", "Default · built-in")
   const tide = page.locator('[data-history="tide_interval"]')
-  await expect(tide).toHaveText("History: 166.7 days")
-  await expect(page.locator('[data-history="wave_interval"]')).toHaveText(
-    "History: 41.7 days",
+  // The minimum window the constraints allow is shown all the time, not only
+  // after a too small window was typed.
+  await expect(tide).toHaveText(
+    "History: 166.7 days · minimum 35 bars (5.8 days)",
   )
-  await expect(page.locator('[data-history="ripple_interval"]')).toHaveText(
-    "History: 10.4 days",
+  await expect(page.locator('[data-history="wave_interval"]')).toContainText(
+    "History: 41.7 days · minimum 35 bars",
+  )
+  await expect(page.locator('[data-history="ripple_interval"]')).toContainText(
+    "History: 10.4 days · minimum 35 bars",
   )
   await choose(page, "Tide interval", "D1")
   await expect(tide).toContainText("1000 days — more than a year")
+  await expect(tide).toContainText("minimum 35 bars (35 days)")
   await choose(page, "Tide interval", "W1")
   await expect(tide).toContainText("7000 days — more than a year")
   await page.getByRole("button", { name: "Start", exact: true }).click()
@@ -1327,4 +1332,25 @@ test("an emptied list cannot be saved and a discarded edit restores it", async (
   await quote.getByRole("button", { name: "Discard" }).click()
   await expect(quote.locator("[data-option]")).toHaveText(["USDT", "USDC"])
   expect(api.presets.writes).toEqual([])
+})
+
+test("a required choice with no default is not invented for an old preset", async ({
+  page,
+}) => {
+  // Review 2026-09-30 (PRESET-07): the parser picked the first option.
+  const published = structuredClone(strategyCatalog)
+  const ripple = published.strategies[0].settings_schema.properties
+    .ripple_interval as { default?: string }
+  delete ripple.default
+  const status = stopped()
+  delete (status.desired.params as Record<string, unknown>).ripple_interval
+  const api = await mock(page, status, catalog(published))
+  await page.goto("/strategy")
+  await expect(
+    page.locator(
+      '[data-issue-type="required"][data-issue-field="ripple_interval"]',
+    ),
+  ).toBeVisible()
+  await expectBlocked(page)
+  expect(api.posts).toEqual([])
 })
