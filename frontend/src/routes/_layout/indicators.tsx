@@ -118,6 +118,14 @@ function IndicatorsMonitor() {
     latest?.phase === "accepted" ||
     latest?.phase === "pending"
   const actual = status?.actual
+  // The table shows what was read, from where it was read: a snapshot of
+  // another network or strategy than the one running now is marked, never
+  // relabelled with the current status.
+  const mismatch =
+    snapshot !== null &&
+    actual != null &&
+    ((actual.network != null && actual.network !== snapshot.network) ||
+      (actual.strategy != null && actual.strategy !== snapshot.strategy))
 
   return (
     <div className="flex flex-col gap-6">
@@ -143,9 +151,25 @@ function IndicatorsMonitor() {
         {snapshot && (
           <span className="text-muted-foreground" data-testid="computed-at">
             Updated {formatBarTime(snapshot.computed_at)}
+            <span data-testid="snapshot-source">
+              {` · read from ${snapshot.strategy} · ${snapshot.network.toUpperCase()}`}
+            </span>
           </span>
         )}
       </div>
+      {mismatch && snapshot && actual && (
+        <p
+          role="alert"
+          className="text-amber-600 dark:text-amber-400"
+          data-testid="snapshot-mismatch"
+        >
+          These values were read from {snapshot.strategy} on{" "}
+          {snapshot.network.toUpperCase()}; the agent now runs{" "}
+          {actual.strategy ?? "no strategy"} on{" "}
+          {actual.network?.toUpperCase() ?? "no network"}. Press Refresh for
+          current values.
+        </p>
+      )}
       {latest?.phase === "failed" && (
         <p role="alert">
           {latest.result?.message ?? "The agent could not read indicators."}

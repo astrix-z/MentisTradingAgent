@@ -1190,6 +1190,21 @@ test("indicators monitor reads on request and renders the strategy's own groups"
   await expect(page.getByTestId("computed-at")).toContainText(
     "2026-09-23 08:31 UTC",
   )
+  await expect(page.getByTestId("snapshot-source")).toHaveText(
+    " · read from tripple_screen · LIVE",
+  )
+  await expect(page.getByTestId("snapshot-mismatch")).toHaveCount(0)
+
+  // Review 2026-09-30: the agent switches to TESTNET and the status poll
+  // picks it up, but nobody refreshed: the LIVE values must not pass for
+  // TESTNET ones.
+  api.status.actual!.network = "testnet"
+  await page.clock.runFor(6000)
+  await expect(page.getByText(/Agent: .* · TESTNET/)).toBeVisible()
+  await expect(page.getByTestId("snapshot-source")).toContainText("LIVE")
+  await expect(page.getByTestId("snapshot-mismatch")).toContainText(
+    "read from tripple_screen on LIVE; the agent now runs tripple_screen on TESTNET",
+  )
 })
 
 test("indicators monitor explains a failed read instead of an empty table", async ({
