@@ -559,7 +559,20 @@ class FakeExchange:
         order_list.status_type = "ALL_DONE"
 
     def _settle_list(self, order_list: OrderList) -> None:
-        if any(o.status == "FILLED" for o in order_list.orders):
+        """Binance OCO: once a leg executes at all, even partly, its sibling
+        is cancelled (EXPIRED). The list ends when no leg is open any more.
+
+        The two legs share one lock of the list quantity, so the sibling can
+        never sell what the executed leg already sold.
+        """
+        executed = [o for o in order_list.orders if o.executed > 0]
+        if not executed:
+            return
+        for order in order_list.orders:
+            if order.open and order not in executed:
+                order.status = "EXPIRED"
+                order.update_time = self.now()
+        if not any(o.open for o in order_list.orders):
             self._finish_list(order_list, "EXPIRED")
 
     def fill_leg(self, client_order_id: str, qty: Decimal, price: Decimal) -> None:

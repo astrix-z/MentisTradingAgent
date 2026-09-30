@@ -273,13 +273,15 @@ def test_partial_fill_during_cancel_leaves_a_remainder() -> None:
         await buy(trade)
         await protect(trade)
         fake.fill_leg("mta-s-pt1", Decimal("0.04"), Decimal(110))
+        stop = fake._by_client_id("mta-s-ps1")
+        assert stop is not None and stop.status == "EXPIRED"  # OCO: sibling goes
         cancelled = (
             await trade.delete_order_list(
                 symbol="BTCUSDT", list_client_order_id="mta-s-pl1"
             )
         ).data
         reports = {r.client_order_id: r.status for r in cancelled.order_reports or []}
-        assert reports == {"mta-s-pt1": "CANCELED", "mta-s-ps1": "CANCELED"}
+        assert reports == {"mta-s-pt1": "CANCELED", "mta-s-ps1": "EXPIRED"}
         assert fake.balance("BTC") == (Decimal("0.06"), Decimal(0))
         leg = fake._by_client_id("mta-s-pt1")
         assert leg is not None and leg.executed == Decimal("0.04")
@@ -337,5 +339,28 @@ def test_market_data_answers_with_sdk_models() -> None:
             list[Any], spot.rest_api.get_trades(symbol="BTCUSDT", limit=1).data()
         )
         assert last[0].price == "100.00000000"
+
+    asyncio.run(scenario())
+
+
+def test_partial_tp_then_price_through_the_stop_sells_nothing_more() -> None:
+    # Review 2026-09-30 (EXEC-12): TP filled 0.04 of 0.1, then the price fell
+    # through the stop: the stop sold the full 0.10 (0.14 sold, locked -0.04).
+    async def scenario() -> None:
+        fake = exchange()
+        trade = client(fake)
+        await buy(trade)
+        await protect(trade)
+        fake.fill_leg("mta-s-pt1", Decimal("0.04"), Decimal(110))
+        fake.set_price("BTCUSDT", Decimal(80))
+        sold = sum(o.executed for o in fake.orders_of("BTCUSDT", "SELL"))
+        assert sold == Decimal("0.04")
+        free, locked = fake.balance("BTC")
+        assert locked == Decimal("0.06") and free == Decimal(0)
+        [order_list] = fake.lists.values()
+        assert order_list.status == "EXECUTING"  # TP still open for 0.06
+        fake.fill_leg("mta-s-pt1", Decimal("0.06"), Decimal(110))
+        assert order_list.status == "ALL_DONE"
+        assert fake.balance("BTC") == (Decimal(0), Decimal(0))
 
     asyncio.run(scenario())
