@@ -37,8 +37,11 @@ from execution_world import CONTEXT, Stack, World, run
 from redis.exceptions import RedisError
 from sqlalchemy import select, text
 from test_execution_service import service
+from test_market_streams import isolate_sdk_state  # noqa: F401
+from test_monitor_feed import Sdks
 
 from agent.engine import Engine
+from agent.exchange.hub import StreamHub
 from agent.execution.admission import record_signal
 from agent.execution.models import (
     INTENT_HOLDING_STATES,
@@ -550,3 +553,67 @@ def test_daily_limit_and_the_utc_reset() -> None:
 async def _only(state: World, stack: Stack) -> Position:
     async with stack.runtime.session() as session:
         return (await session.scalars(select(Position))).one()
+
+
+# --- monitor feed and trailing (a process with a real StreamHub) --------------------
+
+
+M15 = 900_000
+
+
+async def settle_feed(recovered: ExecutionService) -> None:
+    """Let the feed's backfills and the trailing work they start finish."""
+    for _ in range(5):
+        feed = recovered.feed
+        assert feed is not None
+        pending = [*feed._backfills.values(), *recovered._busy]
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def test_trailing_reprice_lost_then_crash_recovers_through_the_feed() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        before = await state.position(stack, position_id)
+        assert before.exchange_stop is not None
+        await state.kill(stack)
+        state.clock.advance(90 * 60)
+        # Closed 15m bars after the fill whose lows raise the stop.
+        base = state.clock.ms() // M15 * M15
+        lows = ["99", "101.0", "101.2", "101.5"]
+        state.fake.klines_data[("BTCUSDT", "15m")] = [
+            [base - M15 * k, "101", "102", low, "101.6", "1", base - M15 * (k - 1) - 1]
+            for k, low in zip(range(len(lows), 0, -1), lows, strict=True)
+        ]
+        state.fake.set_price("BTCUSDT", Decimal("101.6"))
+        state.fake.fault("order_list_oco", "timeout_after")  # the replacement's answer
+
+        first = service(state, StreamHub(factory=Sdks().factory))
+        await first.runtime.boot()
+        await first.tick()  # follow → backfill → trailer → reprice
+        await settle_feed(first)
+        raised = await state.position(stack, position_id)
+        assert raised.desired_stop is not None
+        assert raised.desired_stop > before.exchange_stop
+        # The replacement went out and its answer was lost: still repricing.
+        assert raised.operation == "reprice"
+        assert state.fake.calls_to("order_list_oco") == 2
+        await first.stop()
+        await first.runtime.shutdown()  # dies mid-reprice or right after it
+
+        state.clock.advance(70)
+        second = service(state, StreamHub(factory=Sdks().factory))
+        await second.runtime.boot()
+        for _ in range(4):
+            await second.tick()
+            await settle_feed(second)
+        position = await state.position(stack, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        assert position.exchange_stop == raised.desired_stop
+        live = [ol for ol in state.fake.lists.values() if ol.status == "EXECUTING"]
+        assert len(live) == 1
+        await finish(state, second)
+
+    matrix(scenario)

@@ -9,6 +9,7 @@ from typing import Any
 from execution_world import World, run
 
 from agent.exchange.budget import RequestBudget
+from agent.exchange.hub import StreamHub
 from agent.exchange.rest import ExchangeRest
 from agent.exchange.trade import TradeClient
 from agent.execution.admission import Admission
@@ -20,7 +21,7 @@ from agent.execution.runtime import ExecutionRuntime
 from agent.execution.service import ExecutionService
 
 
-def service(state: World) -> ExecutionService:
+def service(state: World, hub: StreamHub | None = None) -> ExecutionService:
     """A fresh process: runtime, admission and service, not yet booted."""
     fake, clock = state.fake, state.clock
     runtime = ExecutionRuntime(
@@ -56,7 +57,7 @@ def service(state: World) -> ExecutionService:
         runtime,
         admission=admission,
         market=lambda network: rest,
-        hub=None,
+        hub=hub,
         filters=filters,
         clock=clock.now,
         sleep=clock.sleep,
