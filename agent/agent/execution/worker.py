@@ -35,7 +35,7 @@ from agent.execution.attempts import Role
 from agent.execution.ledger import lock_position, record_event
 from agent.execution.models import Position, PositionStatus
 from agent.execution.outcome import ExitMechanism, ExitReason
-from agent.execution.protection import TERMINAL, Protector, Step, StepResult
+from agent.execution.protection import Protector, Step, StepResult
 
 logger = logging.getLogger(__name__)
 
@@ -231,9 +231,24 @@ class PositionWorker:
         await self._note(position.id, cancel="done")
         return None
 
+    async def adopt_finished_list(
+        self, position_id: uuid.UUID, list_id: str, stop: Decimal | None
+    ) -> None:
+        """A protecting list found finished (by the reconciler): make its legs
+        an operation of this worker, so they are proven before anything else.
+
+        Recorded as a reprice to ``stop`` whose cancel is moot. The caller
+        holds the position's lock.
+        """
+        await self._record(position_id, Operation.REPRICE, {"stop": str(stop)})
+        await self._note(position_id, list=list_id, cancel="done")
+
+    async def barrier(self, position_id: uuid.UUID, list_id: str) -> StepResult | None:
+        """:meth:`_barrier` for a caller that holds the position's lock."""
+        return await self._barrier(position_id, list_id)
+
     async def _barrier(self, position_id: uuid.UUID, list_id: str) -> StepResult | None:
         """Step 3: both legs terminal and fully booked, or wait."""
-        position = await self.protector._position(position_id)
         trade = self.protector._trade()
         try:
             order_list = (
@@ -243,36 +258,12 @@ class PositionWorker:
             ).data
         except TradeCallError as exc:
             return StepResult(Step.WAITING, f"list not readable: {exc.message}")
-        executed: dict[int, Decimal] = {}
-        for leg in order_list.orders or []:
-            try:
-                order = (
-                    await trade.get_order(
-                        symbol=position.symbol,
-                        client_order_id=str(leg.client_order_id),
-                        priority=Priority.PROTECT,
-                    )
-                ).data
-            except TradeCallError as exc:
-                return StepResult(Step.WAITING, f"leg not readable: {exc.message}")
-            if str(order.status) not in TERMINAL:
-                return StepResult(
-                    Step.WAITING, f"leg {leg.client_order_id} still {order.status}"
-                )
-            if order.order_id is None:
-                return StepResult(Step.WAITING, "leg without an order id")
-            executed[order.order_id] = Decimal(order.executed_qty or "0")
-        filled_type = await self.protector._book_orders(
-            position_id, [order_id for order_id, qty in executed.items() if qty > 0]
-        )
-        async with self.runtime.session() as session:
-            locked = await lock_position(session, position_id)
-            proven = await self.orders.applier.proven(session, locked, executed)
-        if not proven:
-            return StepResult(Step.WAITING, "leg fills not proven yet")
+        proof = await self.protector.prove_legs(position_id, order_list)
+        if not proof.proven:
+            return StepResult(Step.WAITING, proof.reason)
         position = await self.protector._position(position_id)
         if await self.protector.nothing_to_sell(position):
-            above = filled_type == "LIMIT_MAKER"
+            above = proof.filled_type == "LIMIT_MAKER"
             await self.protector._finalize(
                 position_id,
                 ExitReason.TP if above else ExitReason.STOP,

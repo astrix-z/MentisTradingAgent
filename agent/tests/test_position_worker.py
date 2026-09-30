@@ -136,7 +136,9 @@ def test_late_ack_of_the_replacement_is_found_by_the_protection_loop() -> None:
         state.fake.fault("order_list_oco", "timeout_after")
         result = await stack.worker.reprice(position_id, Decimal("99.50"))
         assert result.step is Step.WAITING
-        found = await stack.protector.protect(position_id)
+        # The operation owns the position: protect() waits, resume finds it.
+        assert (await stack.protector.protect(position_id)).step is Step.WAITING
+        found = await stack.worker.resume(position_id)
         assert found.step is Step.PROTECTED
         assert (await state.position(stack, position_id)).exchange_stop == Decimal(
             "99.50"

@@ -74,6 +74,15 @@ class Step(StrEnum):
 
 
 @dataclass(frozen=True)
+class LegsProof:
+    """Whether a finished list's legs are terminal and fully booked."""
+
+    proven: bool
+    reason: str = ""
+    filled_type: str | None = None  # the type of the leg that sold, if any
+
+
+@dataclass(frozen=True)
 class StepResult:
     step: Step
     reason: str | None = None
@@ -107,6 +116,11 @@ class Protector:
                 return StepResult(Step.PROTECTED)
             if not self.runtime.may_mutate():
                 return StepResult(Step.WAITING, "no execution lock")
+            if position.operation is not None:
+                # The worker owns the position until its operation is done:
+                # an old list's legs may still be unproven (PositionWorker).
+                await self.check_deadline(position_id)
+                return StepResult(Step.WAITING, f"{position.operation} in progress")
             await self.check_deadline(position_id)
             pending = await self._open_attempts(position, (Role.LIST,))
             if pending:
@@ -295,26 +309,74 @@ class Protector:
             await self.check_deadline(position.id)
             return StepResult(Step.WAITING, "OCO outcome unknown")
         order_list = lookup.data
-        await self.orders.journal.resolve(cid, AttemptState.RESOLVED, data=order_list)
-        if str(order_list.list_order_status) == "EXECUTING":
-            request = attempt.request
-            await self._mark_protected(
-                position.id,
-                stop=Decimal(request["stop"]),
-                take_profit=Decimal(request["take_profit"]),
-                list_id=cid,
+        if str(order_list.list_order_status) != "EXECUTING":
+            # The list finished (a leg filled, or it was cancelled) while its
+            # outcome was unknown. The attempt stays open, and so blocks every
+            # new list, until both legs are terminal and fully booked.
+            proof = await self.prove_legs(position.id, order_list)
+            if not proof.proven:
+                await self.check_deadline(position.id)
+                return StepResult(Step.WAITING, proof.reason)
+            await self.orders.journal.resolve(
+                cid, AttemptState.RESOLVED, data=order_list
             )
-            return StepResult(Step.PROTECTED)
-        # The list is done: a leg filled (or it was cancelled) while unknown.
-        return await self.settle_list(position.id, order_list)
+            return await self._after_list(position.id, proof.filled_type)
+        await self.orders.journal.resolve(cid, AttemptState.RESOLVED, data=order_list)
+        request = attempt.request
+        await self._mark_protected(
+            position.id,
+            stop=Decimal(request["stop"]),
+            take_profit=Decimal(request["take_profit"]),
+            list_id=cid,
+        )
+        return StepResult(Step.PROTECTED)
 
-    async def settle_list(self, position_id: uuid.UUID, order_list: Any) -> StepResult:
-        """Book the fills of a finished list and close the position if sold."""
-        order_ids = [int(o.order_id) for o in order_list.orders or []]
-        filled_leg = await self._book_orders(position_id, order_ids)
+    async def prove_legs(self, position_id: uuid.UUID, order_list: Any) -> LegsProof:
+        """Both legs of a finished list terminal and fully in the ledger.
+
+        Each leg is read from the exchange (``ALL_DONE`` of the list says
+        nothing about how much a leg sold), its trades are booked, and the
+        booked quantity must equal its ``executedQty``, commissions included.
+        Until then no new order may be sized from the remainder.
+        """
+        position = await self._position(position_id)
+        trade = self._trade()
+        executed: dict[int, Decimal] = {}
+        for leg in order_list.orders or []:
+            try:
+                order = (
+                    await trade.get_order(
+                        symbol=position.symbol,
+                        client_order_id=str(leg.client_order_id),
+                        priority=Priority.PROTECT,
+                    )
+                ).data
+            except TradeCallError as exc:
+                return LegsProof(False, f"leg not readable: {exc.message}")
+            if str(order.status) not in TERMINAL:
+                return LegsProof(
+                    False, f"leg {leg.client_order_id} still {order.status}"
+                )
+            if order.order_id is None:
+                return LegsProof(False, "leg without an order id")
+            executed[order.order_id] = Decimal(order.executed_qty or "0")
+        filled_type = await self._book_orders(
+            position_id, [order_id for order_id, qty in executed.items() if qty > 0]
+        )
+        async with self.runtime.session() as session:
+            locked = await lock_position(session, position_id)
+            proven = await self.orders.applier.proven(session, locked, executed)
+        if not proven:
+            return LegsProof(False, "leg fills not proven yet")
+        return LegsProof(True, "", filled_type)
+
+    async def _after_list(
+        self, position_id: uuid.UUID, filled_type: str | None
+    ) -> StepResult:
+        """A finished, proven list: closed if it sold everything."""
         position = await self._position(position_id)
         if await self.nothing_to_sell(position):
-            above = filled_leg == "LIMIT_MAKER"
+            above = filled_type == "LIMIT_MAKER"
             return await self._finalize(
                 position_id,
                 ExitReason.TP if above else ExitReason.STOP,

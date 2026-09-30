@@ -188,9 +188,12 @@ def test_a_list_gone_with_a_remainder_goes_back_to_protection() -> None:
         report = await reconciler(stack).run()
         assert report.unprotected == ["BTCUSDT"]
         position = await state.position(stack, position_id)
-        assert position.status == PositionStatus.UNPROTECTED
+        # Held by the worker until the old legs are proven, then replaced.
+        assert position.operation == "reprice"
+        assert position.op_state is not None
+        assert position.op_state["list"] == list_id
         assert position.unprotected_since is not None
-        assert (await stack.protector.protect(position_id)).step.value == "protected"
+        assert (await stack.worker.resume(position_id)).step.value == "protected"
 
     run(scenario)
 
@@ -263,5 +266,47 @@ def test_an_unread_check_keeps_the_previous_finding() -> None:
         await reconciler(stack).run()
         assert "divergence:balance:SOLUSDT" in stack.runtime.alerts
         assert stack.runtime.admission_block() == "divergence"
+
+    run(scenario)
+
+
+def test_finished_list_with_hidden_leg_fills_blocks_the_replacement() -> None:
+    # Review 2026-09-30 (EXEC-11): TP filled 0.1, the list was cancelled and
+    # the leg's trades were not visible yet. The replacement used to be sized
+    # from the full quantity against a smaller free balance.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        position = await state.position(stack, position_id)
+        list_id = position.protection_list_id
+        assert list_id is not None and position.take_profit is not None
+        before = position.quantity
+        take_profit = list_id.replace("-pl", "-pt")
+        state.fake.fill_leg(take_profit, Decimal("0.1"), position.take_profit)
+        leg = state.fake._by_client_id(take_profit)
+        assert leg is not None
+        state.fake.hide_trades(leg.order_id)
+        outside = TradeClient("live", state.fake.spot(), budget=RequestBudget())
+        await outside.delete_order_list(symbol="BTCUSDT", list_client_order_id=list_id)
+        sent = state.fake.calls_to("order_list_oco")
+
+        report = await reconciler(stack).run()
+        assert report.unprotected == ["BTCUSDT"]
+        for _ in range(2):  # neither the protector nor the worker may size it
+            assert (await stack.protector.protect(position_id)).step.value == "waiting"
+            result = await stack.worker.resume(position_id)
+            assert result.step.value == "waiting"
+            assert result.reason == "leg fills not proven yet"
+        assert state.fake.calls_to("order_list_oco") == sent
+        assert [
+            o for o in state.fake.orders_of("BTCUSDT", "SELL") if o.type == "MARKET"
+        ] == []
+
+        state.fake.reveal_trades()
+        assert (await stack.worker.resume(position_id)).step.value == "protected"
+        position = await state.position(stack, position_id)
+        assert position.quantity == before - Decimal("0.1")
+        [live] = [ol for ol in state.fake.lists.values() if ol.status == "EXECUTING"]
+        assert live.orders[0].quantity == position.quantity
 
     run(scenario)

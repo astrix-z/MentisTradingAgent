@@ -42,7 +42,7 @@ from sqlalchemy.dialects.postgresql import insert
 from agent.exchange.budget import Priority
 from agent.exchange.trade import TradeCallError
 from agent.execution.attempts import Role
-from agent.execution.ledger import FillRecord, lock_position, record_event
+from agent.execution.ledger import FillRecord, lock_position
 from agent.execution.models import (
     OrderAttempt,
     Position,
@@ -268,33 +268,20 @@ class Reconciler:
             return
         if str(order_list.list_order_status) == "EXECUTING":
             return
+        # A leg executed while nobody watched. The list is recorded as an
+        # operation of the worker (reprice to the same stop, cancel already
+        # moot), so the old legs stay an obligation: nothing — no new OCO, no
+        # sale — is sized from the remainder until both legs are terminal and
+        # every fill of theirs is booked, and a restart resumes from there.
+        list_id = position.protection_list_id
+        stop = position.desired_stop or position.exchange_stop
         async with self.worker.orders.lock_for(position.id):
-            result = await self.protector.settle_list(position.id, order_list)
-        if result.step is Step.CLOSED:
+            await self.worker.adopt_finished_list(position.id, list_id, stop)
+            proven = await self.worker.barrier(position.id, list_id)
+        if proven is not None and proven.step is Step.CLOSED:
             report.closed.append(position.symbol)
             return
-        await self._unprotect(position.id)
         report.unprotected.append(position.symbol)
-
-    async def _unprotect(self, position_id: uuid.UUID) -> None:
-        """The list is gone with a remainder left: back to the protection loop."""
-        async with self.runtime.session() as session, session.begin():
-            position = await lock_position(session, position_id)
-            if position.status != PositionStatus.PROTECTED:
-                return
-            position.status = PositionStatus.UNPROTECTED
-            position.protection_list_id = None
-            position.exchange_stop = None
-            if position.unprotected_since is None:
-                position.unprotected_since = self.worker.orders.clock()
-            await record_event(
-                session,
-                account=position.account,
-                network=position.network,
-                kind="protection_lost",
-                payload={"reason": "list finished with a remainder"},
-                position=position,
-            )
 
     # --- quarantine and divergence --------------------------------------------------------
 
