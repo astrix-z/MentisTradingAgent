@@ -459,6 +459,11 @@ def plan_entry(
         stop=stop,
         limit_price=limit,
     )
+    if limit is not None:
+        # A STOP_LOSS_LIMIT leg was checked as a limit order, but the guard,
+        # time exit and emergency sale of this position are MARKET sells; a
+        # quantity MARKET_LOT_SIZE refuses would leave no way out.
+        problems += validate_market_sell(filters, quote, now, params, qty=qty)
     if problems:
         first = problems[0]
         raise EntryRejected(first.reason, "; ".join(p.detail for p in problems))

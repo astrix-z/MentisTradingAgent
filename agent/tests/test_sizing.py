@@ -41,6 +41,7 @@ from agent.execution.sizing import (
     plan_entry,
     sellable,
     slots_for,
+    stop_order_type,
     validate_market_sell,
     validate_protection,
 )
@@ -367,6 +368,27 @@ def test_stop_rounds_down_and_fallback_limit_is_below_it() -> None:
     with pytest.raises(EntryRejected) as caught:
         check_symbol(none, PARAMS)
     assert caught.value.reason is Skip.ORDER_TYPE_NOT_ALLOWED
+
+
+def test_stop_limit_fallback_still_needs_a_valid_market_exit() -> None:
+    # Review 2026-09-30 (EXEC-03): BTC without STOP_LOSS and a MARKET_LOT_SIZE
+    # max of 0.0001. The OCO fits as limit orders, but the guard/emergency
+    # exit is a MARKET sell of 0.00015 the exchange would refuse.
+    filters = replace(
+        REAL["BTCUSDT"],
+        order_types=REAL["BTCUSDT"].order_types - {"STOP_LOSS"},
+        market_max_qty=Decimal("0.00010"),
+    )
+    assert stop_order_type(filters) == "STOP_LOSS_LIMIT"
+    with pytest.raises(EntryRejected) as caught:
+        plan(filters, Decimal("84448.01"), Decimal("13.86"))
+    assert caught.value.reason is Skip.FILTER_VIOLATION
+    assert "market sell" in caught.value.detail
+    # The same symbol with a MARKET max that fits is admitted.
+    roomy = replace(filters, market_max_qty=Decimal("100"))
+    assert plan(roomy, Decimal("84448.01"), Decimal("13.86")).quantity == Decimal(
+        "0.00015000"
+    )
 
 
 def test_symbol_level_refusals() -> None:
