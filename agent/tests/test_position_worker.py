@@ -213,3 +213,83 @@ def test_manual_close_goes_through_the_same_protocol() -> None:
         assert state.fake.balance("BTC") == (Decimal(0), Decimal(0))
 
     run(scenario)
+
+
+# --- review 2026-09-30 (EXEC-09): resume goes through the replacement first ---------
+
+
+def test_resume_does_not_send_a_new_list_over_an_unknown_replacement() -> None:
+    # timeout_before: pl2 never reached the exchange, but that is not proven
+    # yet. resume used to send pl3 straight away.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        state.fake.fault("order_list_oco", "timeout_before")
+        assert (await stack.worker.reprice(position_id, Decimal("99.50"))).step is (
+            Step.WAITING
+        )
+        sent = state.fake.calls_to("order_list_oco")
+        result = await stack.worker.resume(position_id)
+        assert result.step is Step.WAITING
+        assert state.fake.calls_to("order_list_oco") == sent  # no pl3
+        assert market_sells(state) == []
+        for _ in range(3):  # absence becomes provable, long past 30 s
+            state.clock.advance(70)
+            result = await stack.worker.resume(position_id)
+            if result.step is not Step.WAITING:
+                break
+        # Only now, pl2 proven absent and the deadline gone, is it sold.
+        assert result.step is Step.CLOSED
+        assert state.fake.calls_to("order_list_oco") == sent
+        assert live_lists(state) == []
+        assert len(market_sells(state)) == 1
+        position = await state.position(stack, position_id)
+        assert position.outcome is not None
+        assert position.outcome["mechanism"] == "market_unprotected"
+
+    run(scenario)
+
+
+def test_resume_after_restart_adopts_a_live_replacement_instead_of_selling() -> None:
+    # timeout_after: pl2 is live on the exchange, the answer was lost; the
+    # process restarts past the 30 s deadline. It used to try MARKET sells
+    # against the balance pl2 holds.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        state.fake.fault("order_list_oco", "timeout_after")
+        await first.worker.reprice(position_id, Decimal("99.50"))
+        await state.kill(first)
+        state.clock.advance(31)
+        second = await state.stack()
+        result = await second.worker.resume(position_id)
+        assert result.step is Step.PROTECTED
+        position = await state.position(second, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        assert position.protection_list_id is not None
+        assert position.protection_list_id.endswith("-pl2")
+        assert position.operation is None and position.op_state is None
+        assert market_sells(state) == []
+        assert len(live_lists(state)) == 1
+
+    run(scenario)
+
+
+def test_exit_over_a_live_replacement_cancels_it_before_selling() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        state.fake.fault("order_list_oco", "timeout_after")
+        await stack.worker.reprice(position_id, Decimal("99.50"))
+        result = await stack.worker.close(
+            position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
+        )
+        assert result.step is Step.CLOSED
+        assert live_lists(state) == []
+        [sale] = market_sells(state)
+        assert sale.status == "FILLED"
+        position = await state.position(stack, position_id)
+        assert position.outcome is not None
+        assert position.outcome["mechanism"] == "manual_close"
+
+    run(scenario)

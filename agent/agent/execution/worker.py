@@ -31,6 +31,7 @@ from typing import Any
 
 from agent.exchange.budget import Priority
 from agent.exchange.trade import Outcome, TradeCallError
+from agent.execution.attempts import Role
 from agent.execution.ledger import lock_position, record_event
 from agent.execution.models import Position, PositionStatus
 from agent.execution.outcome import ExitMechanism, ExitReason
@@ -109,10 +110,13 @@ class PositionWorker:
                 position.unprotected_since = self.orders.clock()
             position.operation = operation.value
             position.op_version += 1
+            previous = position.op_state or {}
+            same_list = previous.get("list") == position.protection_list_id
             position.op_state = {
                 **target,
                 "list": position.protection_list_id,
-                "cancel": (position.op_state or {}).get("cancel"),
+                # A cancel already done counts only for the list it was for.
+                "cancel": previous.get("cancel") if same_list else None,
             }
             if position.status in (PositionStatus.PROTECTED, PositionStatus.REPRICING):
                 position.status = (
@@ -134,7 +138,9 @@ class PositionWorker:
             )
         return None
 
-    async def _continue(self, position_id: uuid.UUID) -> StepResult:
+    async def _continue(
+        self, position_id: uuid.UUID, *, again: bool = True
+    ) -> StepResult:
         position = await self.protector._position(position_id)
         state = dict(position.op_state or {})
         list_id = state.get("list")
@@ -151,6 +157,20 @@ class PositionWorker:
         if position.status == PositionStatus.CLOSED:
             return StepResult(Step.CLOSED)
         operation = Operation(position.operation or Operation.EXIT)
+        replacement = await self._settle_replacement(position_id)
+        if replacement is not None:
+            if replacement.step is Step.PROTECTED and operation is Operation.EXIT:
+                # The replacement OCO is live after all: the exit now has to
+                # cancel it (and prove its legs) before it may sell.
+                await self._record(position_id, Operation.EXIT, _exit_target(state))
+                if again:
+                    return await self._continue(position_id, again=False)
+                return StepResult(Step.WAITING, "exit restarted on the live list")
+            if replacement.step is Step.PROTECTED:
+                await self._clear(position_id)
+            else:
+                await self.protector.check_deadline(position_id)
+            return replacement
         if operation is Operation.EXIT:
             result = await self.protector._exit(
                 position_id,
@@ -172,6 +192,22 @@ class PositionWorker:
         if result.step in (Step.PROTECTED, Step.CLOSED):
             await self._clear(position_id)
         return result
+
+    async def _settle_replacement(self, position_id: uuid.UUID) -> StepResult | None:
+        """Resolve a replacement OCO of unproven outcome before anything is sent.
+
+        A previous round may have sent the new list and lost the answer. It
+        may be live and hold the asset: neither another OCO nor a market sale
+        may go out until it is proven absent (``None``), live (PROTECTED) or
+        finished (its fills booked).
+        """
+        position = await self.protector._position(position_id)
+        for attempt in await self.protector._open_attempts(position, (Role.LIST,)):
+            resolved = await self.protector._resolve_list(position, attempt)
+            if resolved is not None:
+                return resolved
+            position = await self.protector._position(position_id)
+        return None
 
     async def _cancel(
         self, position: Position, list_id: str, state: dict[str, Any]
@@ -267,6 +303,13 @@ class PositionWorker:
             position = await lock_position(session, position_id)
             position.operation = None
             position.op_state = None
+
+
+def _exit_target(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "reason": state.get("reason", ExitReason.MANUAL.value),
+        "mechanism": state.get("mechanism", ExitMechanism.MANUAL_CLOSE.value),
+    }
 
 
 __all__ = ["Operation", "PositionWorker"]
