@@ -139,6 +139,7 @@ class ExecutionService:
         runtime.on_leadership(self._startup_reconcile)
         runtime.close_position = self.exits.close_symbol
         admission.on_reserved = self._on_reserved
+        runtime.on_watch(self._check_deadlines)
         self.orders.on_filled = self._on_filled
 
     # --- lifecycle -----------------------------------------------------------------------
@@ -182,6 +183,18 @@ class ExecutionService:
             report.quarantined,
             report.divergence,
         )
+
+    async def _check_deadlines(self, context: ExecutionContext) -> None:
+        """The 30 s protection deadline, from the runtime watchdog.
+
+        The execution round may be stuck on an OCO answer for the very
+        position that is running out of time, so the deadline is not left to
+        it. This only marks the position overdue and alerts; it never sells
+        through an OCO whose outcome is not known.
+        """
+        for position in await self._open():
+            if position.status in UNSAFE:
+                await self.protector.check_deadline(position.id)
 
     async def _on_reserved(self, signal_id: uuid.UUID) -> None:
         await self.orders.execute_entry(signal_id)

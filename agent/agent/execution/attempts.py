@@ -17,9 +17,13 @@ outcome is proven. Resolution asks the exchange by client id. A single
 not-found proves nothing — a new order may take a moment to become visible.
 Absence is accepted only when the order is still not found at least twice and
 the request's ``recvWindow`` plus a margin has passed since it was prepared: the
-exchange rejects a request older than its ``recvWindow``, so it cannot appear
-after that. Until then the attempt stays UNKNOWN; after ``unknown_escalate_s``
-it is escalated (heartbeat), and it is never retried blindly.
+exchange rejects a request older than its ``recvWindow``, so an unprocessed one
+cannot appear after that. That does not cover a request the exchange already
+accepted whose order is not yet visible to queries, so callers whose mistake
+would cost money add their own evidence (an entry also requires that no BUY of
+an order we cannot name filled since the attempt, see ``orders.py``). Until
+then the attempt stays UNKNOWN; after ``unknown_escalate_s`` it is escalated
+(heartbeat), and it is never retried blindly.
 
 Client ids are ``mta-<24 hex of the signal id>-<role><n>``, at most 36
 characters; a counter that would not fit is refused, never truncated.

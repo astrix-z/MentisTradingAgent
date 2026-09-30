@@ -123,6 +123,7 @@ class ExecutionRuntime:
         self.alerts: dict[str, str] = {}
         self.open_positions = 0
         self._hooks: list[LeadershipHook] = []
+        self._watches: list[LeadershipHook] = []
         self._watchdog: asyncio.Task[None] | None = None
         self._context_lock = asyncio.Lock()
         self._last_clock_check: datetime | None = None
@@ -140,6 +141,14 @@ class ExecutionRuntime:
     def on_leadership(self, hook: LeadershipHook) -> None:
         """Run ``hook`` each time the lock is taken, before any mutation."""
         self._hooks.append(hook)
+
+    def on_watch(self, check: LeadershipHook) -> None:
+        """Run ``check`` on every watchdog round while this process leads.
+
+        For safety checks that must not wait on the execution round, which
+        can be blocked on an exchange call (the protection deadline).
+        """
+        self._watches.append(check)
 
     def session(self) -> AsyncSession:
         if self._sessions is None:
@@ -589,6 +598,12 @@ class ExecutionRuntime:
                     self.alerts["database"] = f"cannot read execution state: {exc}"
                 else:
                     self.alerts.pop("database", None)
+            if self.context is not None and self.lock is not None and self.lock.held:
+                for check in self._watches:
+                    try:
+                        await check(self.context)
+                    except Exception:  # noqa: BLE001 - one check must not stop others
+                        logger.exception("execution watch check failed")
 
     async def _watch(self) -> None:
         while True:

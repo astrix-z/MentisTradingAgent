@@ -30,6 +30,7 @@ from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.exchange.budget import Priority
 from agent.exchange.trade import Outcome, TradeCallError, TradeResult
@@ -52,6 +53,8 @@ from agent.strategies.base import ExitPolicy, PositionEvent
 
 logger = logging.getLogger(__name__)
 
+#: Clock difference tolerated between our attempt time and a trade's time.
+_TRADE_TIME_SLACK_MS = 5_000
 #: ``error_type`` of the refusal raised when the send deadline has passed.
 _EXPIRED = "Expired"
 
@@ -402,8 +405,11 @@ class OrderManager:
             attempts = await self.journal.open_of(
                 session, signal_id=intent.signal_id, roles=(Role.ENTRY,)
             )
+            answered = None if attempts else await self._answered(session, intent)
         if not attempts:
-            return EntryResult(EntryOutcome.DEFERRED, "no open attempt")
+            if answered is None:
+                return EntryResult(EntryOutcome.DEFERRED, "no open attempt")
+            return await self._finish_answered(intent, answered)
         attempt = attempts[-1]
         cid = attempt.client_order_id
         lookup = await self.journal.lookup(
@@ -412,6 +418,14 @@ class OrderManager:
                 symbol=intent.symbol, client_order_id=cid, priority=Priority.RECONCILE
             ),
         )
+        if lookup.found is Found.ABSENT and await self._unexplained_buy(
+            intent, attempt
+        ):
+            # Not found by id, but a BUY nobody accounts for filled since the
+            # attempt: an accepted order may be invisible to queries for a
+            # while, and recvWindow does not bound that. Stay UNKNOWN.
+            self._escalate(attempt)
+            return EntryResult(EntryOutcome.UNKNOWN, "not found; unexplained BUY")
         if lookup.found is Found.ABSENT:
             await self.journal.resolve(cid, AttemptState.RESOLVED)
             await self._release(intent.signal_id, "entry_not_placed")
@@ -423,6 +437,89 @@ class OrderManager:
         await self.journal.resolve(cid, AttemptState.RESOLVED, data=order)
         return await self._settle(
             intent.signal_id, cid, order, detected_at=self.clock()
+        )
+
+    async def _answered(
+        self, session: AsyncSession, intent: ExecutionIntent
+    ) -> OrderAttempt | None:
+        """The last entry attempt with a recorded answer, for an unsettled intent.
+
+        The answer (``acked``, or ``resolved`` from an UNKNOWN) is committed
+        before it is acted on; a crash in between leaves the intent SUBMITTED
+        or UNKNOWN with no open attempt.
+        """
+        return (
+            await session.scalars(
+                select(OrderAttempt)
+                .where(
+                    OrderAttempt.signal_id == intent.signal_id,
+                    OrderAttempt.role == Role.ENTRY.value,
+                    OrderAttempt.state.in_([AttemptState.ACKED, AttemptState.RESOLVED]),
+                )
+                .order_by(OrderAttempt.created_at.desc())
+            )
+        ).first()
+
+    async def _finish_answered(
+        self, intent: ExecutionIntent, attempt: OrderAttempt
+    ) -> EntryResult:
+        """Act on an entry answer that was recorded but never applied."""
+        cid = attempt.client_order_id
+        if attempt.state == AttemptState.RESOLVED and attempt.order_id is None:
+            # Resolved as proven absent; only the release was lost.
+            await self._release(intent.signal_id, "entry_not_placed")
+            return EntryResult(EntryOutcome.RELEASED, "entry_not_placed")
+        trade = self.runtime.trade
+        assert trade is not None
+        try:
+            order = (
+                await trade.get_order(
+                    symbol=intent.symbol,
+                    client_order_id=cid,
+                    priority=Priority.RECONCILE,
+                )
+            ).data
+        except TradeCallError as error:
+            # The exchange answered once; a miss now is lag, never absence.
+            self._escalate(attempt)
+            return EntryResult(EntryOutcome.UNKNOWN, f"answered; {error.message}")
+        logger.warning("ENTRY %s answered but not applied; settling", cid)
+        return await self._settle(
+            intent.signal_id, cid, order, detected_at=self.clock()
+        )
+
+    async def _unexplained_buy(
+        self, intent: ExecutionIntent, attempt: OrderAttempt
+    ) -> bool:
+        """Whether a BUY of an order we cannot name filled since ``attempt``.
+
+        Any doubt (the history cannot be read) counts as yes.
+        """
+        trade = self.runtime.trade
+        assert trade is not None
+        try:
+            trades = (
+                await trade.my_trades(symbol=intent.symbol, priority=Priority.RECONCILE)
+            ).data
+        except TradeCallError:
+            return True
+        async with self.runtime.session() as session:
+            known = set(
+                (
+                    await session.scalars(
+                        select(OrderAttempt.order_id).where(
+                            OrderAttempt.account == attempt.account,
+                            OrderAttempt.network == attempt.network,
+                            OrderAttempt.symbol == intent.symbol,
+                            OrderAttempt.order_id.is_not(None),
+                        )
+                    )
+                ).all()
+            )
+        since = int(attempt.created_at.timestamp() * 1000) - _TRADE_TIME_SLACK_MS
+        return any(
+            t.is_buyer and t.order_id not in known and (t.time or 0) >= since
+            for t in trades
         )
 
     def _escalate(self, attempt: OrderAttempt) -> None:

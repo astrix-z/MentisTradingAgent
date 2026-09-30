@@ -807,7 +807,8 @@ class FakeExchange:
                 and (from_id is None or t["id"] >= from_id)
                 and (order_id is None or t["orderId"] == order_id)
             ]
-            payload = rows[:limit]
+            # Like Binance: from fromId forward, else the most recent trades.
+            payload = rows[:limit] if from_id is not None else rows[-limit:]
         return response(MyTradesResponse, payload)
 
     def get_account(self, **kwargs: Any) -> ApiResponse[GetAccountResponse]:

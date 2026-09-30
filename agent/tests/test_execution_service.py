@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from typing import Any
 
@@ -12,7 +13,7 @@ from agent.exchange.rest import ExchangeRest
 from agent.exchange.trade import TradeClient
 from agent.execution.admission import Admission
 from agent.execution.filters import FilterCache
-from agent.execution.models import IntentState, PositionStatus
+from agent.execution.models import AttemptState, IntentState, PositionStatus
 from agent.execution.orders import EntryOutcome
 from agent.execution.quotes import QuoteProvider
 from agent.execution.runtime import ExecutionRuntime
@@ -167,5 +168,130 @@ def test_reserved_entry_left_by_a_dead_process_is_executed_once() -> None:
         assert len(state.fake.orders_of("BTCUSDT", "BUY")) == 1
         await restarted.stop()
         await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+# --- review 2026-09-30 (EXEC-08) ---------------------------------------------------
+
+
+def test_crash_after_the_ack_commit_is_settled_after_restart() -> None:
+    # The ACK was committed, the process died before _settle(): intent
+    # submitted, attempt acked, a filled BUY and no position.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("process killed")
+
+        first.orders._settle = crash  # type: ignore[method-assign]
+        try:
+            await first.orders.execute_entry(signal_id)
+        except RuntimeError:
+            pass
+        await state.kill(first)
+        [attempt] = await state.attempts(first, signal_id)
+        assert attempt.state == AttemptState.ACKED
+        assert (await state.intent(first, signal_id)).state == IntentState.SUBMITTED
+
+        restarted = service(state)
+        await restarted.runtime.boot()
+        for _ in range(4):
+            await restarted.tick()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.FILLED
+        position = await state.position_of(first, signal_id)
+        assert position is not None and position.status == PositionStatus.PROTECTED
+        assert len(state.fake.orders_of("BTCUSDT", "BUY")) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_not_found_past_recv_window_is_not_absence_when_a_buy_filled() -> None:
+    # timeout_after (the BUY filled), then get_order misses twice past the
+    # recvWindow: that used to prove absence and release a filled entry.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+        state.fake.fault("new_order", "timeout_after")
+        assert (
+            await first.orders.execute_entry(signal_id)
+        ).outcome is EntryOutcome.UNKNOWN
+        await state.kill(first)
+
+        restarted = service(state)
+        state.fake.fault("get_order", "not_found", times=1000)
+        await restarted.runtime.boot()
+        for _ in range(6):  # well past recvWindow + grace, misses every time
+            state.clock.advance(60)
+            await restarted.tick()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.UNKNOWN  # still unproven, not released
+        assert intent.quote_reserved > 0
+        state.fake.faults.pop("get_order")  # the order becomes visible
+        for _ in range(3):
+            state.clock.advance(5)
+            await restarted.tick()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.FILLED
+        position = await state.position_of(first, signal_id)
+        assert position is not None
+        assert len(state.fake.orders_of("BTCUSDT", "BUY")) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_entry_never_placed_is_still_released() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+        state.fake.fault("new_order", "timeout_before")  # never reached matching
+        assert (
+            await first.orders.execute_entry(signal_id)
+        ).outcome is EntryOutcome.UNKNOWN
+        for _ in range(3):
+            state.clock.advance(60)
+            await first.orders.resolve_entries()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.NO_FILL
+        assert state.fake.orders_of("BTCUSDT", "BUY") == []
+
+    run(scenario)
+
+
+def test_protection_deadline_is_checked_while_the_round_is_blocked() -> None:
+    # The execution round is stuck on the OCO answer; the runtime watchdog
+    # must still mark the position overdue, without selling anything.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+        await state.kill(first)  # reserved, not executed
+        built = service(state)
+        await built.runtime.boot()
+        built.runtime.open_admission("tripple_screen")
+        entered, release = state.fake.gate("order_list_oco")
+        round_ = asyncio.create_task(built.tick())  # executes, fills, protects
+        assert await asyncio.to_thread(entered.wait, 5)
+        state.clock.advance(31)
+        await built.runtime.tick()  # one watchdog round
+        assert not round_.done()
+        position = await state.position_of(first, signal_id)
+        assert position is not None
+        assert position.status == PositionStatus.PROTECTION_OVERDUE
+        assert "overdue:BTCUSDT" in built.runtime.alerts
+        assert [
+            o for o in state.fake.orders_of("BTCUSDT", "SELL") if o.type == "MARKET"
+        ] == []
+        release.set()
+        await round_
+        position = await state.position_of(first, signal_id)
+        assert position is not None and position.status == PositionStatus.PROTECTED
+        await built.stop()
+        await built.runtime.shutdown()
 
     run(scenario)
