@@ -1207,3 +1207,124 @@ test("indicators monitor explains a failed read instead of an empty table", asyn
   )
   await expect(page.getByRole("table")).toHaveCount(0)
 })
+
+// --- Option list editor (PRESET-08, plan §4.4, §4.5.7) ---
+
+test("the list editor normalizes entries, keeps unsupported ones (D3) and saves regardless of the form", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  await page.goto("/strategy")
+  // An invalid form does not block saving a list.
+  await page.getByLabel("Take profit %").fill("0")
+  await expectBlocked(page)
+
+  const toggle = page.getByRole("button", { name: "Edit option lists" })
+  await expect(toggle).toHaveAttribute("aria-expanded", "false")
+  await expect(page.getByLabel("Add to Wave interval")).toHaveCount(0)
+  await toggle.click()
+  const wave = page.getByRole("region", { name: "Wave interval options" })
+  const add = async (text: string) => {
+    await wave.getByLabel("Add to Wave interval").fill(text)
+    await wave.getByRole("button", { name: "Add", exact: true }).click()
+  }
+  // A label and its code are one value.
+  await add("H1")
+  await expect(wave.getByText("1h is already in the list.")).toBeVisible()
+  await add(" 1h ")
+  await expect(wave.getByText("1h is already in the list.")).toBeVisible()
+  await add("W1")
+  await expect(wave.locator('[data-option="1w"]')).toContainText("W1")
+  await expect(wave.locator('[data-option="1w"]')).not.toHaveAttribute(
+    "data-unsupported",
+  )
+  // Kept as typed and marked: `1M` is a month, not `1m`.
+  await add("custom")
+  await add("1M")
+  for (const value of ["custom", "1M"])
+    await expect(wave.locator(`[data-option="${value}"]`)).toHaveAttribute(
+      "data-unsupported",
+      "true",
+    )
+  await expect(
+    wave.getByText(/Not supported by the agent: custom, 1M/),
+  ).toBeVisible()
+  // Order is the list's own: W1 moved to the front.
+  for (let step = 0; step < 9; step += 1)
+    await wave.getByRole("button", { name: "Move W1 earlier" }).click()
+  await wave.getByRole("button", { name: "Save Wave interval" }).click()
+  await expect(wave.getByText("Saved.")).toBeVisible()
+  expect(api.presets.writes.at(-1)).toEqual({
+    method: "PUT",
+    path: "options/wave_interval",
+    body: {
+      options: [
+        "1w",
+        "1d",
+        "12h",
+        "6h",
+        "4h",
+        "2h",
+        "1h",
+        "30m",
+        "15m",
+        "5m",
+        "custom",
+        "1M",
+      ],
+    },
+  })
+  // The select offers the saved list: an unsupported entry is disabled.
+  await page.getByLabel("Wave interval", { exact: true }).click()
+  await expect(
+    page.getByRole("option", { name: "custom — not supported by the agent" }),
+  ).toHaveAttribute("aria-disabled", "true")
+  await expect(
+    page.getByRole("option", { name: "W1", exact: true }),
+  ).toBeEnabled()
+})
+
+test("removing M5 in the editor invalidates Fast, with a warning before saving", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  await page.goto("/strategy")
+  await choose(page, "Preset", "Fast · built-in")
+  await page.getByRole("button", { name: "Edit option lists" }).click()
+  const ripple = page.getByRole("region", { name: "Ripple interval options" })
+  await ripple.getByRole("button", { name: "Remove M5" }).click()
+  await expect(
+    ripple.getByText(
+      "Presets using a removed value will become invalid: Fast.",
+    ),
+  ).toBeVisible()
+  await ripple.getByRole("button", { name: "Save Ripple interval" }).click()
+  await expect(ripple.getByText("Saved.")).toBeVisible()
+  expect(api.presets.options.ripple_interval).not.toContain("5m")
+  await expect(
+    page.getByText("Ripple interval: 5m is not in the option list").first(),
+  ).toBeVisible()
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "Fast · built-in (invalid)",
+  )
+  await expectBlocked(page)
+  expect(api.posts).toEqual([])
+})
+
+test("an emptied list cannot be saved and a discarded edit restores it", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  await page.goto("/strategy")
+  await page.getByRole("button", { name: "Edit option lists" }).click()
+  const quote = page.getByRole("region", { name: "Quote asset options" })
+  await quote.getByRole("button", { name: "Remove USDT" }).click()
+  await quote.getByRole("button", { name: "Remove USDC" }).click()
+  await expect(quote.getByText("A list cannot be empty.")).toBeVisible()
+  await expect(
+    quote.getByRole("button", { name: "Save Quote asset" }),
+  ).toBeDisabled()
+  await quote.getByRole("button", { name: "Discard" }).click()
+  await expect(quote.locator("[data-option]")).toHaveText(["USDT", "USDC"])
+  expect(api.presets.writes).toEqual([])
+})

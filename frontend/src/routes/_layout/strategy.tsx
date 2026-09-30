@@ -10,6 +10,7 @@ import {
   UsersService,
 } from "@/client"
 import { CommandTrackingView } from "@/components/CommandTrackingView"
+import { OptionListsEditor } from "@/components/strategy-form/OptionListsEditor"
 import {
   CURRENT_PARAMS,
   type PresetEntry,
@@ -838,6 +839,26 @@ function Strategy() {
           )}
         </CardContent>
       </Card>
+
+      {strategyName !== "" && (
+        <OptionListsEditor
+          strategy={strategyName}
+          fields={fields}
+          lists={optionsQuery.data}
+          loadFailed={optionsQuery.isError}
+          presets={presets ?? []}
+          onSaved={async () => {
+            await Promise.all([
+              queryClient.invalidateQueries({
+                queryKey: ["field-options", strategyName],
+              }),
+              queryClient.invalidateQueries({
+                queryKey: ["strategy-presets", strategyName],
+              }),
+            ])
+          }}
+        />
+      )}
 
       <Dialog
         open={pendingLiveStart !== null}

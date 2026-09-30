@@ -250,6 +250,12 @@ export async function mock(
           }
         body = out
         code = presets.optionsStatus
+      } else if (tail.startsWith("options/") && method === "PUT") {
+        const field = tail.slice("options/".length)
+        const payload = request.postDataJSON() as { options: string[] }
+        presets.writes.push({ method, path: tail, body: payload })
+        presets.options[field] = payload.options
+        body = { options: payload.options, unsupported: [] }
       } else if (tail === "presets/" && method === "GET") {
         body = presets.list
       } else if (tail === "presets/" && method === "POST") {

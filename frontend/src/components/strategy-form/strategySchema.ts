@@ -712,3 +712,35 @@ export function requiredHistory(
   }
   return hints
 }
+
+// --- Option list editor (§4.4) ---------------------------------------------------
+
+/**
+ * One entry of an option list as the editor stores it, the backend's rule:
+ * trimmed; for an interval field an exact code of S is kept as is (case
+ * matters: `1m` is a minute, `1M` a month), a strict label becomes its code
+ * (`H1` → `1h`, `W1` → `1w`), anything else is kept as typed and shown as
+ * unsupported (D3). Other fields are only trimmed.
+ */
+export function normalizeOption(
+  field: StrategyField | undefined,
+  raw: string,
+): string {
+  const value = raw.trim()
+  if (field?.widget !== "interval") return value
+  if ((field.options ?? []).includes(value)) return value
+  const match = /^([MHDW])([0-9]+)$/.exec(value)
+  if (!match) return value
+  return `${match[2].replace(/^0+/, "") || "0"}${match[1].toLowerCase()}`
+}
+
+/** Why an entry cannot join a list, or `null`: empty, or a duplicate after
+ * normalization (`H1` and `1h` are one value). */
+export function optionEntryProblem(
+  value: string,
+  list: string[],
+): string | null {
+  if (value === "") return "Enter a value."
+  if (list.includes(value)) return `${value} is already in the list.`
+  return null
+}
