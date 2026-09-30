@@ -1,5 +1,5 @@
 {
-  "$comment": "Граничные случаи валидации params, общие для агента, backend и UI (docs/STRATEGY_PRESETS_PLAN.md §6). Раннеры: agent/tests/test_validation_edge_cases.py, backend/tests/test_validation_edge_cases.py; UI — PRESET-07.",
+  "$comment": "Граничные случаи валидации params, общие для агента, backend и UI (docs/STRATEGY_PRESETS_PLAN.md §6). Раннеры: agent/tests/test_validation_edge_cases.py, backend/tests/test_validation_edge_cases.py; frontend/tests/validation-edge-cases.spec.ts (UI).",
   "baseline": {
     "catalog": "frontend/tests/fixtures/strategy-catalog.json",
     "options": {
@@ -152,6 +152,21 @@
           "category": "constraint"
         }
       ]
+    },
+    "ui": {
+      "$comment": "Типы ошибок UI (strategySchema.ts, IssueType) → категории; field пустой — правило формы.",
+      "types": {
+        "required": "type",
+        "integer_format": "type",
+        "unsafe_integer": "type",
+        "decimal_format": "type",
+        "item_count": "type",
+        "too_large": "too_large",
+        "bound": "bound",
+        "unsupported": "unsupported",
+        "option": "option",
+        "constraint": "constraint"
+      }
     }
   },
   "cases": [
@@ -3379,7 +3394,6 @@
     }
   ],
   "stages": {
-    "$comment": "Точки входа, чей раннер ещё не существует: кейс их объявляет, раннер показывает skip «deferred» с задачей-владельцем.",
-    "ui": "PRESET-07"
+    "$comment": "Точки входа, чей раннер ещё не существует: кейс их объявляет, раннер показывает skip «deferred» с задачей-владельцем."
   }
 }

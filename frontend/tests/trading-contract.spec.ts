@@ -1,202 +1,18 @@
-import { expect, type Page, test } from "@playwright/test"
-import type {
-  CommandEnvelope,
-  CommandResult,
-  PositionsList,
-  StrategyCatalog,
-  SymbolEntry,
-  TradingStatus,
-  WorkingSymbols,
-} from "../src/client"
+import { expect, test } from "@playwright/test"
+import type { TradingStatus } from "../src/client"
 import strategyCatalog from "./fixtures/strategy-catalog.json"
-
-const firstId = "11111111-1111-4111-8111-111111111111"
-const secondId = "22222222-2222-4222-8222-222222222222"
-const at = "2026-09-12T12:00:00Z"
-
-// The agent publishes this document (see fixtures/strategy-catalog.json); the
-// backend serves it wrapped in a StrategyCatalog with `available: true`.
-function catalog(body: unknown = strategyCatalog): StrategyCatalog {
-  return { available: true, ...(body as object) }
-}
-function snapshot(): TradingStatus {
-  return {
-    desired: {
-      running: true,
-      network: "live",
-      strategy: "tripple_screen",
-      symbols: ["ETHUSDT"],
-      // Saved before the rename (old names) and by an older agent (future_param).
-      params: {
-        tp_pct: 17,
-        ema_tide_periods: [6, 14, 35],
-        swing_low_h1_n: 7,
-        trail_m15_n: 9,
-        future_param: 42,
-      },
-      updated_at: at,
-      revision: 3,
-    },
-    actual: {
-      state: "running",
-      network: "live",
-      strategy: "tripple_screen",
-      balances: { USDT: 123 },
-      updated_at: at,
-    },
-    online: true,
-  }
-}
-// The agent publishes the tradeable universe with the marks merged in; the
-// backend serves it verbatim. ETHUSDT is marked so a Start still carries it.
-function workingSymbols(
-  overrides: Partial<WorkingSymbols> = {},
-): WorkingSymbols {
-  const entry = (
-    symbol: string,
-    baseAsset: string,
-    extra: Partial<SymbolEntry> = {},
-  ): SymbolEntry => ({
-    symbol,
-    base_asset: baseAsset,
-    quote_asset: "USDT",
-    status: "TRADING",
-    spot_allowed: true,
-    quote_volume_24h: "1000",
-    classification: "crypto",
-    classification_label: null,
-    excluded_reason: null,
-    monitoring: false,
-    selected: false,
-    ...extra,
-  })
-  return {
-    available: true,
-    quote_asset: "USDT",
-    generated_at: at,
-    prices_updated_at: "2026-09-15T11:30:00Z",
-    monitoring_updated_at: "2026-09-15T09:05:00Z",
-    total: 3,
-    usable: 2,
-    selected: 1,
-    selected_unusable: 0,
-    symbols: [
-      entry("AAPLBUSDT", "AAPLB", {
-        classification: "tokenized_equity",
-        classification_label: "tokenized equity",
-        excluded_reason: "tokenized equity",
-        last_price: "180.25",
-      }),
-      // Deliberately huge: 2500000000 must sort after 900, which only happens
-      // if the Decimal strings are compared as numbers.
-      entry("BTCUSDT", "BTC", {
-        quote_volume_24h: "2500000000",
-        last_price: "64000.10",
-      }),
-      // No price, and under Binance's Monitoring tag: the column has to show "no
-      // reading" rather than zero, and the tag is a label rather than a verdict.
-      entry("ETHUSDT", "ETH", {
-        quote_volume_24h: "900",
-        selected: true,
-        monitoring: true,
-      }),
-    ],
-    ...overrides,
-  }
-}
-
-//: A universe long enough to need pagination, for the rows-per-page control.
-function manySymbols(count: number): WorkingSymbols {
-  const symbols: SymbolEntry[] = []
-  for (let index = 0; index < count; index += 1) {
-    const name = `SYM${index.toString().padStart(3, "0")}`
-    symbols.push({
-      symbol: `${name}USDT`,
-      base_asset: name,
-      quote_asset: "USDT",
-      status: "TRADING",
-      spot_allowed: true,
-      quote_volume_24h: `${count - index}`,
-      classification: "crypto",
-      classification_label: null,
-      excluded_reason: null,
-      selected: index < 3,
-    })
-  }
-  return {
-    ...workingSymbols(),
-    total: count,
-    usable: count,
-    selected: 3,
-    symbols,
-  }
-}
-
-// A just-issued command, before its result arrives. The tracker polls every
-// 1.5 s on a timer the test clock cannot hold back, so "accepted" can already
-// read "pending" when a slow run asserts; both mean "accepted and tracked".
-function accepted(type: string): RegExp {
-  return new RegExp(`^${type} — (accepted|pending)$`)
-}
-
-async function mock(
-  page: Page,
-  status = snapshot(),
-  published: StrategyCatalog = catalog(),
-  universe: WorkingSymbols = workingSymbols(),
-) {
-  const posts: { path: string; body: Record<string, unknown> | null }[] = []
-  const results = new Map<string, CommandResult | null>()
-  const reads: string[] = []
-  await page.addInitScript(() =>
-    localStorage.setItem("access_token", "mock-token"),
-  )
-  await page.route("**/api/v1/**", async (route) => {
-    const request = route.request()
-    const url = new URL(request.url())
-    let body: unknown
-    let code = 200
-    if (url.pathname.endsWith("/users/me")) {
-      body = {
-        id: firstId,
-        email: "test@example.com",
-        is_superuser: true,
-        is_active: true,
-      }
-    } else if (url.pathname.endsWith("/trading/status/")) {
-      body = status
-    } else if (url.pathname.endsWith("/trading/result/")) {
-      const id = url.searchParams.get("command_id") ?? "MISSING"
-      reads.push(id)
-      body = results.get(id) ?? null
-    } else if (url.pathname.endsWith("/trading/strategies/")) {
-      body = published
-    } else if (url.pathname.endsWith("/trading/positions/")) {
-      // The dashboard at "/" reads positions; none have been recorded here.
-      body = { positions: [] } satisfies PositionsList
-    } else if (
-      request.method() === "GET" &&
-      url.pathname.endsWith("/trading/symbols/")
-    ) {
-      body = universe
-    } else if (request.method() === "POST") {
-      const payload = request.postDataJSON()
-      posts.push({ path: url.pathname, body: payload })
-      const envelope: CommandEnvelope = {
-        id: posts.length === 1 ? firstId : secondId,
-        type: url.pathname.split("/").at(-2) ?? "",
-        payload: payload ?? {},
-        issued_at: at,
-      }
-      body = envelope
-      code = 202
-    } else {
-      throw new Error(`Unexpected API request: ${request.method()} ${url}`)
-    }
-    await route.fulfill({ status: code, json: body })
-  })
-  return { posts, results, reads, status, universe }
-}
+import {
+  accepted,
+  at,
+  catalog,
+  choose,
+  expectBlocked,
+  firstId,
+  manySymbols,
+  mock,
+  secondId,
+  snapshot,
+} from "./utils/tradingMock"
 
 test("legacy /trading route redirects to /balance", async ({ page }) => {
   await mock(page)
@@ -280,7 +96,15 @@ test("strategy seeds desired config, preserves dirty draft and reports rejected 
   ).toBeVisible()
   await expect(page.getByLabel("Symbols", { exact: true })).toHaveCount(0)
   await expect(page.getByLabel("Take profit %")).toHaveValue("17")
-  await expect(page.getByLabel("EMA tide periods")).toHaveValue("6, 14, 35")
+  // One input per EMA period (§4.5.6).
+  for (const [index, period] of ["6", "14", "35"].entries())
+    await expect(page.getByLabel(`EMA tide periods #${index + 1}`)).toHaveValue(
+      period,
+    )
+  // Desired params that match no preset keep the selector on them.
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "— current launch params —",
+  )
   // Old parameter names are read through the catalog's legacy_keys.
   await expect(page.getByLabel("Swing low WAVE N")).toHaveValue("7")
   await expect(page.getByLabel("Trail RIPPLE N")).toHaveValue("9")
@@ -822,30 +646,35 @@ test("invalid numeric, list and domain values block Start without sending a requ
 
   // Non-finite number.
   await page.getByLabel("Take profit %").fill("Infinity")
-  await page.getByRole("button", { name: "Start", exact: true }).click()
-  await expect(page.getByText(/Take profit % must be/)).toBeVisible()
+  await expectBlocked(page)
+  await expect(page.getByText(/Take profit % must be/).first()).toBeVisible()
   expect(api.posts).toEqual([])
   await page.getByLabel("Take profit %").fill("10")
 
-  // List with one bad element rejects the whole list, not just that element.
-  await page.getByLabel("EMA tide periods").fill("5, oops, 34")
-  await page.getByRole("button", { name: "Start", exact: true }).click()
+  // One bad EMA element is named by its position.
+  await page.getByLabel("EMA tide periods #2").fill("oops")
+  await expectBlocked(page)
   await expect(
-    page.getByText(/EMA tide periods must be a comma-separated list/),
+    page.getByText("EMA tide periods #2 must be a whole number").first(),
   ).toBeVisible()
   expect(api.posts).toEqual([])
 
   // Domain rule: EMA periods must be strictly increasing.
-  await page.getByLabel("EMA tide periods").fill("34, 13, 5")
-  await page.getByRole("button", { name: "Start", exact: true }).click()
+  await page.getByLabel("EMA tide periods #1").fill("34")
+  await page.getByLabel("EMA tide periods #2").fill("13")
+  await page.getByLabel("EMA tide periods #3").fill("5")
+  await expectBlocked(page)
   await expect(page.getByText(/strictly increasing/)).toBeVisible()
   expect(api.posts).toEqual([])
-  await page.getByLabel("EMA tide periods").fill("5, 13, 34")
+  await page.getByLabel("EMA tide periods #1").fill("5")
+  await page.getByLabel("EMA tide periods #3").fill("34")
 
   // Domain rule: timeframes must satisfy tide > wave > ripple.
-  await page.getByLabel("Wave interval").fill("4h")
-  await page.getByRole("button", { name: "Start", exact: true }).click()
+  // The live check shows it without a click, and a known-invalid draft
+  // keeps Start disabled.
+  await choose(page, "Wave interval", "H4")
   await expect(page.getByText(/tide > wave > ripple/)).toBeVisible()
+  await expectBlocked(page)
   expect(api.posts).toEqual([])
 })
 
@@ -960,6 +789,305 @@ test("unpublished catalog shows a message and blocks Start instead of an empty f
   ).toBeDisabled()
   await expect(page.getByLabel("Take profit %")).toHaveCount(0)
   expect(api.posts).toEqual([])
+})
+
+// --- Presets, option lists and the live check (PRESET-07, plan §4.5, §7.1) ---
+
+/** A stopped agent: Start is a fresh launch, not a repeat of a running one. */
+function stopped(): TradingStatus {
+  const state = snapshot()
+  state.desired.running = false
+  state.desired.network = "testnet"
+  state.actual!.state = "idle"
+  return state
+}
+
+const fastParams = strategyCatalog.strategies[0].presets[1].params
+
+function sentParams(api: { posts: { body: unknown }[] }, index = 0) {
+  return (api.posts[index].body as { params: Record<string, unknown> }).params
+}
+
+test("Fast fills every setting, an edit marks it modified, and Save as keeps it", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  await page.goto("/strategy")
+  await choose(page, "Preset", "Fast · built-in")
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "Fast · built-in",
+  )
+  await expect(page.getByLabel("Take profit %")).toHaveValue("5")
+  await expect(page.getByLabel("Ripple interval")).toHaveText("M5")
+  await page.getByRole("button", { name: "Start", exact: true }).click()
+  await expect(page.getByText(accepted("start"))).toBeVisible()
+  // All 22 editable settings of the preset and the pinned volume window;
+  // nothing from the previous desired params (old names, future_param).
+  expect(Object.keys(fastParams)).toHaveLength(22)
+  expect(sentParams(api)).toEqual({ ...fastParams, volume_window: "24h" })
+
+  await page.getByLabel("Take profit %").fill("6")
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "Fast · built-in (modified)",
+  )
+  // `5.0` is the same value as `5`: not a modification.
+  await page.getByLabel("Take profit %").fill("5.0")
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "Fast · built-in",
+  )
+  await page.getByLabel("Take profit %").fill("6")
+
+  // A built-in preset is read-only.
+  await expect(page.getByRole("button", { name: "Update" })).toHaveCount(0)
+  await expect(page.getByRole("button", { name: "Delete" })).toHaveCount(0)
+  await page.getByRole("button", { name: "Save as…" }).click()
+  await page.getByLabel("Preset name").fill("My fast")
+  await page.getByRole("button", { name: "Save", exact: true }).click()
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText("My fast")
+  expect(api.presets.writes[0]).toMatchObject({
+    method: "POST",
+    body: {
+      name: "My fast",
+      params: { ...fastParams, tp_pct: "6", volume_window: "24h" },
+    },
+  })
+
+  await page.reload()
+  await choose(page, "Preset", "My fast")
+  await expect(page.getByLabel("Take profit %")).toHaveValue("6")
+  await page.getByLabel("Take profit %").fill("7")
+  await page.getByRole("button", { name: "Update", exact: true }).click()
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText("My fast")
+  expect(api.presets.writes[1]).toMatchObject({
+    method: "PUT",
+    body: { name: "My fast", params: { tp_pct: "7" } },
+  })
+  await page.getByRole("button", { name: "Delete", exact: true }).click()
+  await page.getByRole("button", { name: "Delete preset" }).click()
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "— current launch params —",
+  )
+  expect(api.presets.writes[2].method).toBe("DELETE")
+  await page.getByLabel("Preset", { exact: true }).click()
+  await expect(page.getByRole("option", { name: "My fast" })).toHaveCount(0)
+})
+
+test("without a snapshot the form starts from Default; a matching snapshot selects its preset", async ({
+  page,
+}) => {
+  const empty = stopped()
+  empty.desired.params = {}
+  empty.desired.strategy = null
+  await mock(page, empty)
+  await page.goto("/strategy")
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "Default · built-in",
+  )
+
+  const onFast = stopped()
+  // Written before the rename, and with a decimal as a JSON number.
+  const { swing_low_wave_n, trail_ripple_n, ...rest } = fastParams
+  onFast.desired.params = {
+    ...rest,
+    tp_pct: 5,
+    swing_low_h1_n: swing_low_wave_n,
+    trail_m15_n: trail_ripple_n,
+  }
+  await mock(page, onFast)
+  await page.goto("/strategy")
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "Fast · built-in",
+  )
+})
+
+test("a click on Start before the live check runs still checks the exact draft", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  await page.clock.install()
+  await page.goto("/strategy")
+  await expect(
+    page.getByRole("button", { name: "Start", exact: true }),
+  ).toBeEnabled()
+  // Hold the debounce timer: only the check on the click can catch it.
+  await page.clock.pauseAt(Date.now() + 60_000)
+  await page.getByLabel("Take profit %").fill("0")
+  await page.getByRole("button", { name: "Start", exact: true }).click()
+  await expect(
+    page.getByText("Take profit % must be greater than 0").first(),
+  ).toBeVisible()
+  expect(api.posts).toEqual([])
+})
+
+test("changed option lists cancel a live Start awaiting confirmation", async ({
+  page,
+}) => {
+  const api = await mock(page)
+  await page.clock.install()
+  await page.goto("/strategy")
+  await page.getByRole("button", { name: "LIVE", exact: true }).click()
+  await page.getByRole("button", { name: "Start", exact: true }).click()
+  await expect(
+    page.getByRole("heading", { name: "Confirm live Start" }),
+  ).toBeVisible()
+  api.presets.options.quote_asset = ["USDT"]
+  await page.clock.runFor(31_000)
+  await expect(
+    page.getByRole("heading", { name: "Confirm live Start" }),
+  ).toHaveCount(0)
+  await expect(
+    page.getByText(/awaiting confirmation; it was cancelled/),
+  ).toBeVisible()
+  expect(api.posts).toEqual([])
+})
+
+test("invalid desired params show their errors without an edit and keep Start off", async ({
+  page,
+}) => {
+  const state = stopped()
+  state.desired.params = { ...fastParams, tp_pct: "0", ripple_interval: "1M" }
+  const api = await mock(page, state)
+  await page.goto("/strategy")
+  await expect(
+    page.getByText("Take profit % must be greater than 0").first(),
+  ).toBeVisible()
+  await expect(
+    page.getByText("Ripple interval: the agent does not support 1M").first(),
+  ).toBeVisible()
+  await expect(page.getByLabel("Ripple interval")).toHaveText(
+    "1M — not in the list",
+  )
+  await expectBlocked(page)
+  expect(api.posts).toEqual([])
+})
+
+test("option lists that fail to load make the check unavailable", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  api.presets.optionsStatus = 503
+  await page.goto("/strategy")
+  await expect(page.getByText(/option lists could not be loaded/)).toBeVisible({
+    timeout: 20_000,
+  })
+  await expectBlocked(page)
+  await expect(page.getByRole("button", { name: "Save as…" })).toBeDisabled()
+})
+
+test("an option removed from a list invalidates the preset that uses it", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  api.presets.options.tide_interval = [
+    "1M",
+    ...api.presets.options.tide_interval,
+  ]
+  await page.clock.install()
+  await page.goto("/strategy")
+  await choose(page, "Preset", "Fast · built-in")
+  await expect(page.getByLabel("Ripple interval")).toHaveText("M5")
+
+  api.presets.options.ripple_interval =
+    api.presets.options.ripple_interval.filter((option) => option !== "5m")
+  await page.clock.runFor(31_000)
+  await expect(
+    page.getByText("Ripple interval: 5m is not in the option list").first(),
+  ).toBeVisible()
+  await expect(page.getByLabel("Ripple interval")).toHaveText(
+    "M5 — not in the list",
+  )
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "Fast · built-in (invalid)",
+  )
+  await expectBlocked(page)
+  expect(api.posts).toEqual([])
+
+  // Weekly and daily are offered for the tide; a listed value the agent does
+  // not support is shown but cannot be chosen.
+  await page.getByLabel("Tide interval").click()
+  for (const option of ["W1", "D1"])
+    await expect(
+      page.getByRole("option", { name: option, exact: true }),
+    ).toBeEnabled()
+  await expect(
+    page.getByRole("option", { name: "1M — not supported by the agent" }),
+  ).toHaveAttribute("aria-disabled", "true")
+})
+
+test("required history is shown per timeframe and warns past a year without blocking", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  await page.goto("/strategy")
+  await choose(page, "Preset", "Default · built-in")
+  const tide = page.locator('[data-history="tide_interval"]')
+  await expect(tide).toHaveText("History: 166.7 days")
+  await expect(page.locator('[data-history="wave_interval"]')).toHaveText(
+    "History: 41.7 days",
+  )
+  await expect(page.locator('[data-history="ripple_interval"]')).toHaveText(
+    "History: 10.4 days",
+  )
+  await choose(page, "Tide interval", "D1")
+  await expect(tide).toContainText("1000 days — more than a year")
+  await choose(page, "Tide interval", "W1")
+  await expect(tide).toContainText("7000 days — more than a year")
+  await page.getByRole("button", { name: "Start", exact: true }).click()
+  await expect(page.getByText(accepted("start"))).toBeVisible()
+  expect(sentParams(api).tide_interval).toBe("1w")
+})
+
+test("a dirty draft survives a new schema: renamed keys move, a banner says so", async ({
+  page,
+}) => {
+  // The catalog of an agent from before the rename: old names, no legacy_keys.
+  const old = JSON.parse(
+    JSON.stringify(strategyCatalog)
+      .replaceAll("swing_low_wave_n", "swing_low_h1_n")
+      .replaceAll("trail_ripple_n", "trail_m15_n"),
+  )
+  delete old.strategies[0].legacy_keys
+  old.strategies[0].presets = []
+  old.schema_hash = "before-the-rename"
+  const published = catalog(old)
+  const api = await mock(page, stopped(), published)
+  api.presets.list.items = []
+  await page.clock.install()
+  await page.goto("/strategy")
+  await expect(page.getByLabel("Swing low WAVE N")).toHaveValue("7")
+  await page.getByLabel("Take profit %").fill("19")
+
+  Object.assign(published, catalog())
+  await page.clock.runFor(61_000)
+  await expect(page.getByText(/settings schema changed/)).toBeVisible()
+  await expect(page.getByLabel("Take profit %")).toHaveValue("19")
+  await expect(page.getByLabel("Swing low WAVE N")).toHaveValue("7")
+  await expect(page.getByLabel("Trail RIPPLE N")).toHaveValue("9")
+  await page.getByRole("button", { name: "Start", exact: true }).click()
+  await expect(page.getByText(accepted("start"))).toBeVisible()
+  const sent = sentParams(api)
+  expect(sent).toMatchObject({
+    tp_pct: "19",
+    swing_low_wave_n: 7,
+    trail_ripple_n: 9,
+  })
+  for (const key of ["swing_low_h1_n", "trail_m15_n", "future_param"])
+    expect(sent).not.toHaveProperty(key)
+})
+
+test("a partial built-in sync is reported with its errors", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  api.presets.list.builtin_sync = {
+    status: "partial",
+    errors: [{ index: 1, name: "Fast", type: "name_conflict" }],
+  }
+  await page.goto("/strategy")
+  await expect(
+    page.getByText("Some built-in presets from the agent were not accepted:"),
+  ).toBeVisible()
+  await expect(page.getByText("Fast: name_conflict")).toBeVisible()
 })
 
 test("indicators monitor reads on request and renders the strategy's own groups", async ({

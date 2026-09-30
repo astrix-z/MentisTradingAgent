@@ -1077,7 +1077,8 @@ D3 при этом не нарушается: неподдерживаемые �
   границ, EMA, `CONSTRAINTS`, `future_param`, `{}` и невалидный JSON (сделано: 18 кейсов).
   PRESET-04a: кейсы строгих типов, `1M`, unsafe integer, точности decimal, обоих примеров
   арифметики и `too_large` — вместе с конвейером, который их даёт. PRESET-06: исполнение
-  `backend_preset_post` и `backend_preset_put` по всем кейсам. PRESET-07: раннер UI.
+  `backend_preset_post` и `backend_preset_put` по всем кейсам. PRESET-07: раннер UI
+  (`frontend/tests/validation-edge-cases.spec.ts`, `error_map.ui`; строка `ui` из `stages` снята).
 - Oracle точности — не тестовый evaluator агента: он точен (целые/`Decimal`, PRESET-03), но
   сверяет только согласованность `CONSTRAINTS` с моделью. JSON number в decimal-поле он
   берёт по десятичной записи, как модель (`0.5` → `Decimal("0.5")`), без float-арифметики.
