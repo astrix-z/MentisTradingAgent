@@ -8,11 +8,12 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from execution_world import Stack, World, run
+from execution_world import CONTEXT, Stack, World, run
 from sqlalchemy import func, select
 
 from agent.exchange.budget import RequestBudget
 from agent.exchange.trade import TradeClient
+from agent.execution.admission import record_signal
 from agent.execution.ledger import FillRecord, lock_position
 from agent.execution.models import Fill, PositionStatus, SymbolCooldown, TradeCursor
 from agent.execution.reconcile import Reconciler
@@ -219,5 +220,48 @@ def test_unknown_orders_are_quarantined_or_divergent_but_never_touched() -> None
             len([ol for ol in state.fake.lists.values() if ol.status == "EXECUTING"])
             == 2
         )
+
+    run(scenario)
+
+
+def test_divergence_closes_admission_until_a_check_no_longer_finds_it() -> None:
+    # Review 2026-09-30 (EXEC-06): an unexplained SOL balance was reported,
+    # yet a following ETH ENTRY was admitted and bought.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        await state.protected(stack)
+        state.fake.free["SOL"] = Decimal(1)  # 100 USDT, no position explains it
+        report = await reconciler(stack).run()
+        assert report.divergence == ["SOLUSDT"]
+        assert stack.runtime.admission_block() == "divergence"
+        signal = state.entry("ETHUSDT")
+        async with stack.runtime.session() as session:
+            await record_signal(
+                session, signal, context=CONTEXT, strategy="tripple_screen"
+            )
+        [decision] = await stack.admission.drain()
+        assert decision.reason == "divergence"
+        assert state.fake.orders_of("ETHUSDT", "BUY") == []
+
+        del state.fake.free["SOL"]  # the owner sold it
+        report = await reconciler(stack).run()
+        assert report.divergence == []
+        assert not any(k.startswith("divergence:") for k in stack.runtime.alerts)
+        assert stack.runtime.admission_block() is None
+        await state.reserve(stack, "ETHUSDT")
+
+    run(scenario)
+
+
+def test_an_unread_check_keeps_the_previous_finding() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        await state.protected(stack)
+        state.fake.free["SOL"] = Decimal(1)
+        await reconciler(stack).run()
+        state.fake.fault("get_account", "timeout_before")
+        await reconciler(stack).run()
+        assert "divergence:balance:SOLUSDT" in stack.runtime.alerts
+        assert stack.runtime.admission_block() == "divergence"
 
     run(scenario)

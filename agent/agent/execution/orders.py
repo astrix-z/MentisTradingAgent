@@ -32,7 +32,7 @@ from typing import Any
 from sqlalchemy import select
 
 from agent.exchange.budget import Priority
-from agent.exchange.trade import Outcome, TradeCallError
+from agent.exchange.trade import Outcome, TradeCallError, TradeResult
 from agent.execution.admission import release_intent
 from agent.execution.attempts import AttemptJournal, Found, Role
 from agent.execution.filters import FilterCache
@@ -51,6 +51,13 @@ from agent.execution.sizing import validate_entry
 from agent.strategies.base import ExitPolicy, PositionEvent
 
 logger = logging.getLogger(__name__)
+
+#: ``error_type`` of the refusal raised when the send deadline has passed.
+_EXPIRED = "Expired"
+
+
+def _expired(signal: SignalInbox, now: datetime) -> bool:
+    return signal.valid_until is not None and now >= signal.valid_until
 
 
 class EntryOutcome(StrEnum):
@@ -111,7 +118,7 @@ class OrderManager:
             return EntryResult(EntryOutcome.DEFERRED, "not reserved")
         if not runtime.may_mutate() or runtime.trade is None:
             return EntryResult(EntryOutcome.DEFERRED, "no execution lock")
-        reason = await self._presubmit(intent, signal)
+        reason, deadline = await self._presubmit(intent, signal)
         if reason is not None:
             await self._release(signal_id, reason)
             return EntryResult(EntryOutcome.RELEASED, reason)
@@ -141,24 +148,37 @@ class OrderManager:
             locked.state = IntentState.SUBMITTED
             cid = attempt.client_order_id
         trade = runtime.trade
-        try:
-            result = await self.journal.send(
-                cid,
-                lambda: trade.new_order(
-                    symbol=intent.symbol,
-                    side="BUY",
-                    order_type="LIMIT",
-                    quantity=intent.quantity,
-                    price=intent.cap_price,
-                    time_in_force="FOK",
-                    client_order_id=cid,
-                    priority=Priority.ENTRY,
-                ),
+
+        async def place() -> TradeResult[Any]:
+            # Last look at the clock: the journal writes above took time, and
+            # the budget may make the request wait; neither may carry the BUY
+            # past the signal's validity or the quote's freshness.
+            left = (deadline - self.clock()).total_seconds()
+            if left <= 0:
+                raise TradeCallError(
+                    Outcome.REJECTED, "expired before send", error_type=_EXPIRED
+                )
+            return await trade.new_order(
+                symbol=intent.symbol,
+                side="BUY",
+                order_type="LIMIT",
+                quantity=intent.quantity,
+                price=intent.cap_price,
+                time_in_force="FOK",
+                client_order_id=cid,
+                priority=Priority.ENTRY,
+                max_wait=left,
             )
+
+        try:
+            result = await self.journal.send(cid, place)
         except TradeCallError as error:
             if error.outcome is Outcome.UNKNOWN:
                 await self._mark_unknown(signal_id)
                 return EntryResult(EntryOutcome.UNKNOWN, error.message)
+            if error.error_type == _EXPIRED:
+                await self._release(signal_id, "expired")
+                return EntryResult(EntryOutcome.RELEASED, "expired")
             if error.outcome is Outcome.REJECTED:
                 self.filters.invalidate(intent.network, intent.symbol)
             reason = f"entry_{error.outcome.value}:{error.exchange_code}"
@@ -171,31 +191,40 @@ class OrderManager:
 
     async def _presubmit(
         self, intent: ExecutionIntent, signal: SignalInbox
-    ) -> str | None:
-        """The checks right before the BUY (plan §6.1); a reason means release."""
+    ) -> tuple[str | None, datetime]:
+        """The checks right before the BUY (plan §6.1).
+
+        Returns a reason to release (or ``None``) and the moment after which
+        the BUY must not be sent: the signal's ``valid_until`` or the quote's
+        freshness limit, whichever is first. Time is read after the awaited
+        reads, never before them.
+        """
         runtime = self.runtime
+        settings = runtime.settings
+        max_fetch_age = timedelta(seconds=settings.quote_max_fetch_age_s)
         blocked = runtime.admission_block()
         if blocked is not None:
-            return blocked
-        now = self.clock()
-        if signal.valid_until is not None and now >= signal.valid_until:
-            return "expired"
+            return blocked, self.clock()
+        if _expired(signal, self.clock()):
+            return "expired", self.clock()
         policy = ExitPolicy.from_transport(signal.payload["exit_policy"])
-        settings = runtime.settings
         try:
             quote = await self.quotes(intent.network).snapshot(intent.symbol)
+            filters = await self.filters.get(intent.network, intent.symbol)
+            now = self.clock()
+            if _expired(signal, now):
+                return "expired", now
             quote.check_fresh(
                 now,
-                max_fetch_age=timedelta(seconds=settings.quote_max_fetch_age_s),
+                max_fetch_age=max_fetch_age,
                 max_trade_age=timedelta(seconds=settings.quote_max_trade_age_s),
             )
             if quote.last_price() <= policy.stop_ref:
-                return "stop_above_price"
-            filters = await self.filters.get(intent.network, intent.symbol)
+                return "stop_above_price", now
         except ReferenceUnverified as exc:
-            return f"quote_unverified: {exc}"
+            return f"quote_unverified: {exc}", self.clock()
         except Exception as exc:  # noqa: BLE001 - any read failure: do not buy
-            return f"market_data_unavailable: {exc}"
+            return f"market_data_unavailable: {exc}", self.clock()
         assert intent.quantity is not None and intent.cap_price is not None
         problems = validate_entry(
             filters,
@@ -206,8 +235,11 @@ class OrderManager:
             price=intent.cap_price,
         )
         if problems:
-            return f"{problems[0].reason.value}: {problems[0].detail}"
-        return None
+            return f"{problems[0].reason.value}: {problems[0].detail}", now
+        deadline = quote.fetched_at + max_fetch_age
+        if signal.valid_until is not None:
+            deadline = min(deadline, signal.valid_until)
+        return None, deadline
 
     # --- outcomes ------------------------------------------------------------------
 

@@ -61,6 +61,10 @@ ACCOUNT_CHECK_EVERY = timedelta(minutes=5)
 #: Past this offset admission closes: signed requests would start failing.
 CLOCK_SKEW_LIMIT = timedelta(milliseconds=RECV_WINDOW_MS // 2)
 CLOCK_SKEW_WARN = timedelta(seconds=1)
+#: Alerts for exchange state no position or attempt explains (reconcile.py).
+_UNRESOLVED = ("divergence:", "quarantine:")
+#: Reconcile findings about one account/network, dropped when it is left.
+_CONTEXT_PREFIXES = (*_UNRESOLVED, "foreign_trades:")
 
 LeadershipHook = Callable[["ExecutionContext"], Awaitable[None]]
 
@@ -325,6 +329,9 @@ class ExecutionRuntime:
         )
         if blocking:
             return sorted(blocking)[0]
+        # Unexplained exchange state (reconcile.py): nothing new until resolved.
+        if any(key.startswith(_UNRESOLVED) for key in self.alerts):
+            return "divergence"
         return None
 
     # --- heartbeat ---------------------------------------------------------------
@@ -457,8 +464,10 @@ class ExecutionRuntime:
         self.context = None
         self.reconciled = False
         self.open_positions = 0
-        for name in ("lock", "key", "clock", "bnb", "account"):
+        for name in ("lock", "key", "clock", "bnb", "account", "reconcile"):
             self.alerts.pop(name, None)
+        for key in [k for k in self.alerts if k.startswith(_CONTEXT_PREFIXES)]:
+            del self.alerts[key]
 
     async def _verify_account(self, expected: str) -> None:
         assert self.trade is not None

@@ -270,6 +270,10 @@ class Admission:
                 "market_data_unavailable",
                 detail=str(exc),
             )
+        # Planning awaited the exchange; the signal may have run out meanwhile.
+        now = self._clock()
+        if signal.valid_until is not None and now >= signal.valid_until:
+            return await self._record(signal, context, IntentState.EXPIRED, "expired")
         return await self._reserve(signal, context, plan, free, now)
 
     # --- checks -----------------------------------------------------------------

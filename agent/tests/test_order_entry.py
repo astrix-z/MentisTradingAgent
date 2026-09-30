@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 from decimal import Decimal
+from typing import Any
 
-from execution_world import World, run
+from execution_world import CONTEXT, World, run
 
+from agent.execution.admission import record_signal
 from agent.execution.models import AttemptState, IntentState, PositionStatus
 from agent.execution.orders import EntryOutcome
 
@@ -181,5 +183,92 @@ def test_cancelled_wait_keeps_the_entry_unknown() -> None:
         [found] = await stack.orders.resolve_entries()
         assert found.outcome is EntryOutcome.FILLED
         assert len(state.fake.orders_of("BTCUSDT", "BUY")) == 1
+
+    run(scenario)
+
+
+# --- review 2026-09-30 (EXEC-06/EXEC-14): time read after awaited work ------------
+
+
+class _Slow:
+    """A quote provider whose fetch lets ``seconds`` pass on the clock."""
+
+    def __init__(self, inner: Any, state: World, seconds: float) -> None:
+        self.inner, self.state, self.seconds = inner, state, seconds
+
+    async def snapshot(self, symbol: str) -> Any:
+        quote = await self.inner.snapshot(symbol)
+        self.state.clock.advance(self.seconds)
+        return quote
+
+
+def test_signal_expiring_during_the_quote_fetch_is_not_bought() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack, valid_for=timedelta(seconds=1))
+        real = stack.orders.quotes
+        stack.orders.quotes = lambda network: _Slow(real(network), state, 1.2)
+        result = await stack.orders.execute_entry(signal_id)
+        assert (result.outcome, result.reason) == (EntryOutcome.RELEASED, "expired")
+        assert state.fake.orders == {}
+
+    run(scenario)
+
+
+def test_quote_gone_stale_during_the_filter_fetch_is_not_bought() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack)
+        real = stack.orders.filters.get
+
+        async def slow_filters(network: str, symbol: str) -> Any:
+            filters = await real(network, symbol)
+            state.clock.advance(6)  # past quote_max_fetch_age_s (5)
+            return filters
+
+        stack.orders.filters.get = slow_filters  # type: ignore[method-assign]
+        result = await stack.orders.execute_entry(signal_id)
+        assert result.outcome is EntryOutcome.RELEASED
+        assert (result.reason or "").startswith("quote_unverified")
+        assert state.fake.orders == {}
+
+    run(scenario)
+
+
+def test_deadline_passing_between_prepare_and_send_releases_unsent() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack, valid_for=timedelta(seconds=2))
+        journal = stack.orders.journal
+        mark = journal._mark
+
+        async def slow_mark(attempt_id: str, *, sent: bool) -> None:
+            await mark(attempt_id, sent=sent)
+            state.clock.advance(3)
+
+        journal._mark = slow_mark  # type: ignore[method-assign]
+        result = await stack.orders.execute_entry(signal_id)
+        assert (result.outcome, result.reason) == (EntryOutcome.RELEASED, "expired")
+        [attempt] = await state.attempts(stack, signal_id)
+        assert attempt.state == AttemptState.REJECTED
+        intent = await state.intent(stack, signal_id)
+        assert intent.state != IntentState.SUBMITTED and intent.quote_reserved == 0
+        assert state.fake.orders == {}
+
+    run(scenario)
+
+
+def test_signal_expiring_during_admission_planning_is_not_reserved() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        real = stack.admission._quotes
+        stack.admission._quotes = lambda network: _Slow(real(network), state, 1.2)
+        signal = state.entry(valid_for=timedelta(seconds=1))
+        async with stack.runtime.session() as session:
+            await record_signal(
+                session, signal, context=CONTEXT, strategy="tripple_screen"
+            )
+        [decision] = await stack.admission.drain()
+        assert (decision.state, decision.reason) == (IntentState.EXPIRED, "expired")
 
     run(scenario)

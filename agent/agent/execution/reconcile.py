@@ -20,9 +20,11 @@ operation left half-done resumes it.
 
 **Quarantine and divergence** (dedicated account, Q16). An open order with our
 ``mta-`` prefix that no attempt knows is quarantined — reported, never
-touched. Any other open order, a trade of an order we did not place, or a
-balance of a traded asset that no position explains is a divergence. The
-agent does not act on either; it keeps admission closed and says so.
+touched. Any other open order, or a balance of a traded asset that no
+position explains, is a divergence. The agent does not act on either; it
+keeps admission closed and says so until a later check no longer finds it.
+A trade of an order we did not place is reported (``foreign_trades``); what
+it left behind shows up as one of the two.
 """
 
 from __future__ import annotations
@@ -164,7 +166,9 @@ class Reconciler:
                 )
             )
         if strangers:
-            self.runtime.alerts[f"divergence:{symbol}"] = (
+            # Informational: what such a trade left behind (a balance, an open
+            # order) is what the balance and order checks gate admission on.
+            self.runtime.alerts[f"foreign_trades:{symbol}"] = (
                 f"trades of orders not placed by the agent: {strangers[:5]}"
             )
         return applied
@@ -335,22 +339,39 @@ class Reconciler:
                 orders = (await trade.open_orders(symbol=symbol)).data
             except TradeCallError as exc:
                 logger.warning("open orders of %s unavailable: %s", symbol, exc.message)
-                continue
+                continue  # unread: whatever was found before still stands
+            fresh: dict[str, str] = {}
             for order in orders:
                 cid = str(order.client_order_id)
                 if cid in known:
                     continue
                 if cid.startswith("mta-"):
                     report.quarantined.append(cid)
-                    self.runtime.alerts[f"quarantine:{cid}"] = (
+                    fresh[f"quarantine:{symbol}:{cid}"] = (
                         f"{symbol} order {cid} is ours by name but unknown; not touched"
                     )
                 else:
                     report.divergence.append(cid)
-                    self.runtime.alerts[f"divergence:{symbol}"] = (
+                    fresh[f"divergence:orders:{symbol}"] = (
                         f"{symbol} has an order the agent did not place ({cid})"
                     )
+            self._refresh(
+                (f"quarantine:{symbol}:", f"divergence:orders:{symbol}"), fresh
+            )
         await self._balances(context, report)
+
+    def _refresh(self, stale: tuple[str, ...], fresh: dict[str, str]) -> None:
+        """Replace the alerts one completed check owns with what it found now.
+
+        These alerts close admission (:meth:`ExecutionRuntime.admission_block`),
+        so they must describe the current state: a divergence the owner has
+        resolved clears on the next successful check, and a check that could
+        not read the exchange leaves the previous finding in place.
+        """
+        alerts = self.runtime.alerts
+        for key in [k for k in alerts if k.startswith(stale)]:
+            del alerts[key]
+        alerts.update(fresh)
 
     async def _balances(
         self, context: ExecutionContext, report: ReconcileReport
@@ -364,6 +385,7 @@ class Reconciler:
         except TradeCallError:
             return
         held = {p.symbol: p.quantity for p in await self._open_positions(context)}
+        fresh: dict[str, str] = {}
         for row in account.balances or []:
             asset = str(row.asset)
             if asset in ("USDT", "BNB"):
@@ -377,9 +399,10 @@ class Reconciler:
             if price is None or extra * price < Decimal(5):
                 continue  # dust (plan §8.4)
             report.divergence.append(symbol)
-            self.runtime.alerts[f"divergence:{symbol}"] = (
+            fresh[f"divergence:balance:{symbol}"] = (
                 f"{extra} {asset} held without a position"
             )
+        self._refresh(("divergence:balance:",), fresh)
 
     # --- reads ------------------------------------------------------------------------------
 
