@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -52,6 +53,26 @@ _RECONNECT_BACKOFF_S: tuple[float, ...] = (1, 2, 5, 10, 30, 60)
 # With any kline stream subscribed, Binance pushes an update every ~1-2s; this
 # long without one means the data path is dead even if the socket looks open.
 _STALE_AFTER = timedelta(minutes=2)
+KLINE = "klines"
+TRADE = "trades"
+
+
+def _kind(stream: str) -> str:
+    return KLINE if "@kline_" in stream else TRADE
+
+
+@dataclass
+class _Freshness:
+    """When data of one stream kind last arrived, and the grace it started with."""
+
+    last: datetime | None = None
+    grace_until: datetime | None = None
+
+    def stale(self, now: datetime) -> bool:
+        if self.grace_until is not None and now <= self.grace_until:
+            return False
+        return self.last is None or now - self.last > _STALE_AFTER
+
 
 KlineCallback = Callable[[KlineResponse], None]
 TradeCallback = Callable[[TradeResponse], None]
@@ -101,7 +122,13 @@ class MarketDataStreams:
         self._trade_callbacks: dict[str, TradeCallback] = {}
         self._reconnect_listeners: list[Callable[[], None]] = []
         self._recovery: asyncio.Task[None] | None = None
-        self._last_message_at: datetime | None = None
+        #: Per stream kind: when data last arrived, and the grace a kind gets
+        #: when it goes from nothing subscribed to something. A subscription
+        #: is not data: adding or re-subscribing streams never counts as fresh.
+        self._fresh: dict[str, _Freshness] = {
+            KLINE: _Freshness(),
+            TRADE: _Freshness(),
+        }
 
     @property
     def network(self) -> Network:
@@ -121,15 +148,29 @@ class MarketDataStreams:
 
     def health_warning(self) -> str | None:
         """Why market data is not flowing, or ``None`` while it is (or while
-        nothing is subscribed, so nothing is expected)."""
-        last = self._last_message_at
-        subscribed = self._kline_callbacks or self._trade_callbacks
-        if self._stopping or not subscribed or last is None:
+        nothing is subscribed, so nothing is expected).
+
+        Klines and trades are judged separately: trades arriving do not make
+        missing candles fresh, and the other way round.
+        """
+        if self._stopping:
             return None
-        if datetime.now(UTC) - last <= _STALE_AFTER:
-            return None
+        now = datetime.now(UTC)
         link = "connected" if self._client.connections else "disconnected, reconnecting"
-        return f"no market data since {last:%Y-%m-%d %H:%M:%S} UTC (stream {link})"
+        for kind, subscribed in (
+            (KLINE, bool(self._kline_callbacks)),
+            (TRADE, bool(self._trade_callbacks)),
+        ):
+            fresh = self._fresh[kind]
+            if not subscribed or not fresh.stale(now):
+                continue
+            since = (
+                f"since {fresh.last:%Y-%m-%d %H:%M:%S} UTC"
+                if fresh.last is not None
+                else "since subscribing"
+            )
+            return f"no market data ({kind}) {since} (stream {link})"
+        return None
 
     def on_reconnect(self, listener: Callable[[], None]) -> None:
         """Call ``listener`` after a dropped connection has been restored and
@@ -258,6 +299,15 @@ class MarketDataStreams:
         self, streams: dict[str, tuple[Any, Callable[[Any], None]]]
     ) -> None:
         """Subscribe named streams, each with its SDK model and callback."""
+        now = datetime.now(UTC)
+        for kind, registered in (
+            (KLINE, self._kline_callbacks),
+            (TRADE, self._trade_callbacks),
+        ):
+            if not registered and any(_kind(s) == kind for s in streams):
+                # First streams of this kind: a full window before silence
+                # counts. Later additions and re-subscriptions get none.
+                self._fresh[kind] = _Freshness(grace_until=now + _STALE_AFTER)
         # Entries left behind by a dropped connection would make the SDK skip
         # these streams as "already subscribed".
         self._forget_streams(list(streams), dead_only=True)
@@ -285,13 +335,13 @@ class MarketDataStreams:
             for stream in fresh:
                 model, callback = streams[stream]
                 handle = RequestStreamHandle(self._client, stream, model)
-                handle.on("message", self._track(callback))
-            # New streams get a full staleness window before they count as silent.
-            self._last_message_at = datetime.now(UTC)
+                handle.on("message", self._track(callback, _kind(stream)))
 
-    def _track(self, callback: Callable[[Any], None]) -> Callable[[Any], None]:
+    def _track(
+        self, callback: Callable[[Any], None], kind: str
+    ) -> Callable[[Any], None]:
         def tracked(data: Any) -> None:
-            self._last_message_at = datetime.now(UTC)
+            self._fresh[kind].last = datetime.now(UTC)
             callback(data)
 
         return tracked
