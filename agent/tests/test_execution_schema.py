@@ -130,8 +130,33 @@ def test_legacy_database_is_adopted_and_keeps_its_rows() -> None:
         ],
         # Foreign: an unknown table next to nothing we know.
         ["create table something_else (id int primary key)"],
+        # Same columns and keys, plus a unique index the baseline lacks: it
+        # would reject BTCUSDT and BTCUSDC sharing a base asset.
+        [
+            "create table working_symbol (symbol varchar(32) primary key, "
+            "base_asset varchar(32), updated_at timestamptz not null)",
+            "create table monitored_symbol (symbol varchar(32) primary key, "
+            "updated_at timestamptz not null)",
+            "create unique index ws_base on working_symbol (base_asset)",
+        ],
+        # Same again with a plain (non-unique) index.
+        [
+            "create table working_symbol (symbol varchar(32) primary key, "
+            "base_asset varchar(32), updated_at timestamptz not null)",
+            "create table monitored_symbol (symbol varchar(32) primary key, "
+            "updated_at timestamptz not null)",
+            "create index ms_updated on monitored_symbol (updated_at)",
+        ],
+        # Same again with a check constraint.
+        [
+            "create table working_symbol (symbol varchar(32) primary key, "
+            "base_asset varchar(32), updated_at timestamptz not null, "
+            "check (symbol <> ''))",
+            "create table monitored_symbol (symbol varchar(32) primary key, "
+            "updated_at timestamptz not null)",
+        ],
     ],
-    ids=["partial", "different", "foreign"],
+    ids=["partial", "different", "foreign", "unique-index", "index", "check"],
 )
 def test_mismatched_schema_is_refused_not_stamped(ddl: list[str]) -> None:
     async def scenario(engine: AsyncEngine) -> None:

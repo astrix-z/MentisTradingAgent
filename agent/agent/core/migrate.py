@@ -34,7 +34,8 @@ BASELINE_REVISION = "0001_baseline"
 _MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
 
 #: The legacy schema the baseline revision stands for: table → column →
-#: (type name, nullable). Primary keys are checked separately.
+#: (type name, nullable). Primary keys are checked separately; any other index
+#: or constraint is a mismatch, since the baseline has none.
 _BASELINE: dict[str, dict[str, tuple[str, bool]]] = {
     "working_symbol": {
         "symbol": ("VARCHAR(32)", False),
@@ -96,6 +97,22 @@ def _baseline_problems(connection: Connection) -> list[str]:
         keys = inspector.get_pk_constraint(table).get("constrained_columns")
         if keys != _BASELINE_KEYS[table]:
             problems.append(f"{table} primary key {keys}")
+        # The baseline has nothing beyond the primary key. An extra unique
+        # index would survive adoption and reject rows the code expects to
+        # write (e.g. BTCUSDT and BTCUSDC sharing base_asset).
+        extras = {
+            "indexes": [i.get("name") for i in inspector.get_indexes(table)],
+            "unique constraints": [
+                u.get("name") for u in inspector.get_unique_constraints(table)
+            ],
+            "foreign keys": [f.get("name") for f in inspector.get_foreign_keys(table)],
+            "check constraints": [
+                c.get("name") for c in inspector.get_check_constraints(table)
+            ],
+        }
+        for kind, names in extras.items():
+            if names:
+                problems.append(f"{table} has {kind} {sorted(map(str, names))}")
     return problems
 
 
