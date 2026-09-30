@@ -51,6 +51,7 @@ from binance_sdk_spot.rest_api.models import (
     DeleteOrderResponse,
     ExchangeInfoResponse,
     GetAccountResponse,
+    GetOpenOrdersResponse,
     GetOrderListResponse,
     GetOrderResponse,
     GetTradesResponse,
@@ -778,7 +779,9 @@ class FakeExchange:
             ]
         return response(OpenOrderListResponse, payload)
 
-    def get_open_orders(self, **kwargs: Any) -> ApiResponse[list[Any]]:
+    def get_open_orders(
+        self, **kwargs: Any
+    ) -> ApiResponse[list[GetOpenOrdersResponse]]:
         with self._lock:
             self._before("get_open_orders", kwargs)
             symbol = kwargs.get("symbol")
@@ -787,7 +790,7 @@ class FakeExchange:
                 for o in self.orders.values()
                 if o.open and (symbol is None or o.symbol == symbol)
             ]
-        return response(None, payload)
+        return response(GetOpenOrdersResponse, payload)
 
     def my_trades(self, **kwargs: Any) -> ApiResponse[list[MyTradesResponse]]:
         with self._lock:

@@ -51,6 +51,7 @@ from binance_sdk_spot.rest_api.models import (
     DeleteOrderListResponse,
     DeleteOrderResponse,
     GetAccountResponse,
+    GetOpenOrdersResponse,
     GetOrderListResponse,
     GetOrderResponse,
     MyTradesResponse,
@@ -66,9 +67,11 @@ from binance_sdk_spot.rest_api.models import (
     OrderListOcoNewOrderRespTypeEnum,
     OrderListOcoResponse,
     OrderListOcoSideEnum,
+    OrderTestResponse,
     OrderTestSideEnum,
     OrderTestTimeInForceEnum,
     OrderTestTypeEnum,
+    TimeResponse,
 )
 from binance_sdk_spot.spot import Spot
 
@@ -90,6 +93,52 @@ MY_TRADES_PAGE = 1000
 #: Binance codes that mean "sent, outcome unknown" whatever HTTP status or SDK
 #: exception class carries them (errors.md: -1006 UNEXPECTED_RESP, -1007 TIMEOUT).
 _UNKNOWN_CODES = frozenset({-1006, -1007})
+
+
+@dataclass(frozen=True, slots=True)
+class _Shape:
+    """What a successful answer of one SDK method must look like."""
+
+    model: type
+    #: Fields that must be present (not ``None``) for the answer to confirm
+    #: anything — an empty ``{}`` parses into a model of all ``None``.
+    required: tuple[str, ...] = ()
+    many: bool = False
+
+
+#: The SDK falls back to the raw JSON when its model rejects a 200 body
+#: (``binance_common.utils.send_request``), so ``data()`` does not raise on an
+#: answer like ``{"orderId": "not-an-integer"}``. Every call is checked against
+#: its shape; a mismatch is UNKNOWN, never success.
+_SHAPES: dict[str, _Shape] = {
+    "new_order": _Shape(NewOrderResponse, ("order_id", "status")),
+    "order_test": _Shape(OrderTestResponse),
+    "order_list_oco": _Shape(OrderListOcoResponse, ("order_list_id",)),
+    "delete_order_list": _Shape(DeleteOrderListResponse, ("order_list_id",)),
+    "delete_order": _Shape(DeleteOrderResponse, ("order_id", "status")),
+    "get_order": _Shape(GetOrderResponse, ("order_id", "status")),
+    "get_order_list": _Shape(GetOrderListResponse, ("order_list_id",)),
+    "get_open_orders": _Shape(GetOpenOrdersResponse, many=True),
+    "open_order_list": _Shape(OpenOrderListResponse, many=True),
+    "my_trades": _Shape(MyTradesResponse, many=True),
+    "get_account": _Shape(GetAccountResponse),
+    "time": _Shape(TimeResponse),
+}
+
+
+def _shape_problem(name: str, data: Any) -> str | None:
+    """Why ``data`` is not a confirmed answer of ``name``; ``None`` if it is."""
+    shape = _SHAPES[name]
+    items = data if shape.many else [data]
+    if shape.many and not isinstance(data, list):
+        return f"{name}: expected a list, got {type(data).__name__}"
+    for item in items:
+        if not isinstance(item, shape.model):
+            return f"{name}: unparsable answer ({type(item).__name__})"
+        missing = [f for f in shape.required if getattr(item, f, None) is None]
+        if missing:
+            return f"{name}: answer lacks {missing}"
+    return None
 
 
 class Outcome(StrEnum):
@@ -256,6 +305,9 @@ class TradeClient:
         self._client = client
         self.budget = budget if budget is not None else budget_for(network)
         self._secrets = secrets
+        #: Requests whose thread is still running; held so an abandoned one is
+        #: not collected before its feedback is applied.
+        self._inflight: set[asyncio.Future[Any]] = set()
 
     @classmethod
     def connect(cls, network: Network) -> TradeClient:
@@ -289,16 +341,36 @@ class TradeClient:
         method: Callable[..., ApiResponse[T]] = getattr(self._client.rest_api, name)
         if signed:
             kwargs["recv_window"] = RECV_WINDOW_MS
-        try:
-            response = await asyncio.to_thread(self._invoke, method, kwargs)
-        except TradeCallError as error:
+        # The request runs in a thread that cancelling the caller cannot stop,
+        # so the budget feedback (429/418/weight headers) is applied by the
+        # task itself when the thread finishes, awaited or not.
+        call = asyncio.ensure_future(asyncio.to_thread(self._invoke, method, kwargs))
+        self._inflight.add(call)
+        call.add_done_callback(self._feedback)
+        response = await asyncio.shield(call)
+        data = response.data()
+        problem = _shape_problem(name, data)
+        if problem is not None:
+            raise TradeCallError(
+                Outcome.UNKNOWN,
+                problem,
+                http_status=response.status,
+                error_type="UnexpectedResponse",
+            )
+        return TradeResult(data, response.status, list(response.rate_limits))
+
+    def _feedback(self, call: asyncio.Future[ApiResponse[Any]]) -> None:
+        self._inflight.discard(call)
+        if call.cancelled():
+            return
+        error = call.exception()
+        if error is None:
+            self.budget.observe(call.result().rate_limits)
+        elif isinstance(error, TradeCallError):
             if error.outcome is Outcome.RATE_LIMITED:
                 self.budget.on_rate_limited(error.retry_after)
             elif error.outcome is Outcome.BANNED:
                 self.budget.on_banned(error.retry_after)
-            raise
-        self.budget.observe(response.rate_limits)
-        return TradeResult(response.data(), response.status, list(response.rate_limits))
 
     def _invoke[T](
         self, method: Callable[..., ApiResponse[T]], kwargs: dict[str, Any]
@@ -452,7 +524,7 @@ class TradeClient:
 
     async def open_orders(
         self, *, symbol: str, priority: Priority = Priority.RECONCILE
-    ) -> TradeResult[list[Any]]:
+    ) -> TradeResult[list[GetOpenOrdersResponse]]:
         """Open orders of one symbol (for quarantine and divergence checks)."""
         return await self._call("get_open_orders", priority, symbol=symbol)
 

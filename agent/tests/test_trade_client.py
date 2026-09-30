@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
@@ -222,7 +223,10 @@ def test_oco_fallback_stop_limit_leg_is_gtc_with_a_price() -> None:
 
 
 def test_every_signed_call_carries_recv_window_and_time_does_not() -> None:
-    transport = Transport(_response(200, {}))
+    # One body that confirms every single-object call below.
+    transport = Transport(
+        _response(200, {"orderId": 1, "status": "NEW", "orderListId": 1})
+    )
     client = make_client(transport)
 
     async def calls() -> None:
@@ -533,3 +537,108 @@ def test_retry_after_zero_is_zero_not_the_default_pause() -> None:
     assert not budget.paused()
     budget.on_rate_limited(None)
     assert budget.paused()
+
+
+# --- review 2026-09-30: unparsable success, cancelled waiters --------------------
+
+
+def _oco(client: TradeClient) -> Callable[[], Any]:
+    return lambda: client.order_list_oco(
+        symbol="BTCUSDT",
+        quantity=Decimal("0.001"),
+        take_profit=Decimal("71500"),
+        stop=Decimal("64350"),
+        stop_limit_price=None,
+        list_client_order_id="mta-abc-pl1",
+        above_client_order_id="mta-abc-pt1",
+        below_client_order_id="mta-abc-ps1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("call", "body"),
+    [
+        (_place, {"orderId": "not-an-integer"}),
+        (_place, {}),
+        (_oco, {"orderListId": "not-an-integer"}),
+        (_oco, {}),
+        (
+            lambda c: lambda: c.get_order(symbol="BTCUSDT", client_order_id="x"),
+            {"orderId": 7},
+        ),
+        (
+            lambda c: lambda: c.my_trades(symbol="BTCUSDT", from_id=1),
+            [{"id": "not-an-integer"}],
+        ),
+    ],
+    ids=[
+        "order-bad-id",
+        "order-empty",
+        "oco-bad-id",
+        "oco-empty",
+        "get-no-status",
+        "trades-bad-item",
+    ],
+)
+def test_a_200_the_model_rejects_is_unknown_not_success(
+    call: Callable[[TradeClient], Callable[[], Any]], body: Any
+) -> None:
+    # The SDK hands back the raw JSON when its model fails; that must never
+    # read as a confirmed order (the protector would mark a position protected).
+    client = make_client(Transport(_response(200, body)))
+    with pytest.raises(TradeCallError) as caught:
+        run(call(client))
+    assert caught.value.outcome is Outcome.UNKNOWN
+    assert caught.value.http_status == 200
+
+
+def test_weight_headers_of_an_unparsable_answer_still_count() -> None:
+    budget = RequestBudget()
+    headers = {"X-MBX-USED-WEIGHT-1M": "4321"}
+    client = make_client(Transport(_response(200, {}, headers=headers)), budget)
+    with pytest.raises(TradeCallError):
+        run(_place(client))
+    assert budget.used() >= 4321
+
+
+@pytest.mark.parametrize(
+    ("status", "check"),
+    [
+        (429, lambda b: b.paused()),
+        (418, lambda b: b.banned()),
+    ],
+    ids=["429", "418"],
+)
+def test_feedback_lands_even_when_the_waiter_was_cancelled(
+    status: int, check: Callable[[RequestBudget], bool]
+) -> None:
+    release = threading.Event()
+    sent = threading.Event()
+    answer = _response(
+        status, {"code": -1003, "msg": "x"}, headers={"Retry-After": "120"}
+    )
+
+    class Blocking(Transport):
+        def __call__(self, **kwargs: Any) -> requests.Response:
+            sent.set()
+            release.wait(5)
+            return super().__call__(**kwargs)
+
+    budget = RequestBudget()
+    client = make_client(Blocking(answer), budget)
+
+    async def scenario() -> None:
+        waiter = asyncio.create_task(client.get_account())
+        await asyncio.to_thread(sent.wait, 5)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert not check(budget)  # the transport has not answered yet
+        release.set()
+        for _ in range(200):
+            if check(budget):
+                return
+            await asyncio.sleep(0.01)
+
+    run(scenario)
+    assert check(budget)

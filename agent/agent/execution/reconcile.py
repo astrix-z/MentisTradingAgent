@@ -337,11 +337,7 @@ class Reconciler:
                 logger.warning("open orders of %s unavailable: %s", symbol, exc.message)
                 continue
             for order in orders:
-                cid = str(
-                    order.get("clientOrderId")
-                    if isinstance(order, dict)
-                    else order.client_order_id
-                )
+                cid = str(order.client_order_id)
                 if cid in known:
                     continue
                 if cid.startswith("mta-"):
