@@ -452,3 +452,78 @@ def test_fill_of_another_symbol_is_refused() -> None:
             await apply(sessions, position_id, replace(fill(2), symbol="ETHUSDT"))
 
     run(scenario)
+
+
+async def revalue(
+    sessions: async_sessionmaker[AsyncSession], position_id: uuid.UUID
+) -> bool:
+    async with sessions() as session:
+        position = await lock_position(session, position_id)
+        done = await FINALIZER.revalue(session, position)
+        await session.commit()
+        return done
+
+
+def test_unpriced_fees_keep_the_close_provisional_and_losing_until_revalued() -> None:
+    # Review 2026-09-30 (EXEC-15): BNB fees, entry 100, exit 100.01, no BNB
+    # price through the close: recorded as a profit, not a losing trade.
+    async def scenario(sessions: async_sessionmaker[AsyncSession]) -> None:
+        BNB["price"] = None  # type: ignore[assignment]
+        try:
+            position_id = await open_position(
+                sessions, fill(1, commission="0.00001667")
+            )
+            await apply(
+                sessions,
+                position_id,
+                fill(
+                    5, order_id=2, side="SELL", price="100.01", commission="0.00001667"
+                ),
+            )
+            await close(sessions, position_id)
+            position = await get(sessions, position_id)
+            assert position.outcome is not None
+            assert position.outcome["commission_pending"] == [1, 5]
+            assert position.outcome["counted_losing"] is True
+            async with sessions() as session:
+                assert await losing_trades_today(session, "1001", "live", T0) == 1
+            assert not await revalue(sessions, position_id)  # still no price
+        finally:
+            BNB["price"] = Decimal(600)
+        assert await revalue(sessions, position_id)
+        position = await get(sessions, position_id)
+        assert position.realized_pnl is not None and position.realized_pnl < 0
+        assert position.outcome is not None
+        assert position.outcome["commission_pending"] == []
+        assert Decimal(position.outcome["realized_pnl"]) == position.realized_pnl
+        async with sessions() as session:
+            assert await losing_trades_today(session, "1001", "live", T0) == 1
+
+    run(scenario)
+
+
+def test_revalued_profit_gives_back_the_provisional_losing_count() -> None:
+    async def scenario(sessions: async_sessionmaker[AsyncSession]) -> None:
+        BNB["price"] = None  # type: ignore[assignment]
+        try:
+            position_id = await open_position(sessions, fill(1))
+            await apply(
+                sessions, position_id, fill(5, order_id=2, side="SELL", price="110")
+            )
+            await close(sessions, position_id)
+            async with sessions() as session:
+                assert await losing_trades_today(session, "1001", "live", T0) == 1
+        finally:
+            BNB["price"] = Decimal(600)
+        assert await revalue(sessions, position_id)
+        position = await get(sessions, position_id)
+        assert position.realized_pnl is not None and position.realized_pnl > 0
+        assert position.outcome is not None
+        assert position.outcome["counted_losing"] is False
+        async with sessions() as session:
+            assert await losing_trades_today(session, "1001", "live", T0) == 0
+        assert await revalue(sessions, position_id)  # nothing left: no change
+        async with sessions() as session:
+            assert await losing_trades_today(session, "1001", "live", T0) == 0
+
+    run(scenario)

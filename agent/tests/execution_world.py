@@ -117,6 +117,8 @@ class World:
             return fake.last.get(symbol)
 
         async def asset_price(asset: str, at: datetime) -> Decimal | None:
+            if fake.valuation_down:
+                return None
             return fake.bnb_price if asset == "BNB" else None
 
         filters = FilterCache(fetch)

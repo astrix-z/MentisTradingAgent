@@ -16,6 +16,7 @@ from agent.execution.admission import Admission
 from agent.execution.filters import FilterCache
 from agent.execution.models import AttemptState, IntentState, PositionStatus
 from agent.execution.orders import EntryOutcome
+from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.quotes import QuoteProvider
 from agent.execution.runtime import ExecutionRuntime
 from agent.execution.service import ExecutionService
@@ -42,7 +43,7 @@ def service(state: World, hub: StreamHub | None = None) -> ExecutionService:
         return fake.last.get(symbol)
 
     async def bnb(asset: str, at: Any) -> Decimal | None:
-        return fake.bnb_price
+        return None if fake.valuation_down else fake.bnb_price
 
     filters = FilterCache(fetch)
     admission = Admission(
@@ -294,5 +295,39 @@ def test_protection_deadline_is_checked_while_the_round_is_blocked() -> None:
         assert position is not None and position.status == PositionStatus.PROTECTED
         await built.stop()
         await built.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_fees_unpriced_at_close_are_revalued_by_a_later_round() -> None:
+    # Review 2026-09-30 (EXEC-15): restoring prices and reconciling did not
+    # correct a position closed with unvalued fees.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        state.fake.valuation_down = True  # the commission price source is down
+        position_id = await state.protected(first)
+        result = await first.worker.close(
+            position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
+        )
+        assert result.step.value == "closed"
+        position = await state.position(first, position_id)
+        assert position.outcome is not None and position.outcome["commission_pending"]
+        assert position.outcome["counted_losing"] is True
+        await state.kill(first)
+
+        state.fake.valuation_down = False
+        restarted = service(state)
+        await restarted.runtime.boot()
+        await restarted.runtime.prepare_start(
+            network="live", settings=state.settings, params={"quote_asset": "USDT"}
+        )
+        state.clock.advance(state.settings.reconcile_interval_s + 1)
+        await restarted.tick()  # the periodic reconcile round revalues
+        position = await state.position(first, position_id)
+        assert position.outcome is not None
+        assert position.outcome["commission_pending"] == []
+        assert position.commission_quote > 0
+        await restarted.stop()
+        await restarted.runtime.shutdown()
 
     run(scenario)

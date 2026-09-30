@@ -37,9 +37,15 @@ from agent.exchange.rest import ExchangeRest
 from agent.execution.admission import Admission
 from agent.execution.exits import Exits
 from agent.execution.filters import FilterCache
-from agent.execution.ledger import CommissionConverter, Finalizer, PositionApplier
+from agent.execution.ledger import (
+    CommissionConverter,
+    Finalizer,
+    PositionApplier,
+    lock_position,
+)
 from agent.execution.models import (
     ExecutionIntent,
+    Fill,
     IntentState,
     MonitorWatermark,
     Position,
@@ -229,6 +235,7 @@ class ExecutionService:
         interval = timedelta(seconds=runtime.settings.reconcile_interval_s)
         if self._last_reconcile is None or now - self._last_reconcile >= interval:
             await self.reconciler.run()
+            await self._revalue_commissions()
             self._last_reconcile = now
         await self.orders.resolve_entries()
         for signal_id in await self._reserved():
@@ -281,6 +288,32 @@ class ExecutionService:
         await self.feed.follow(self.runtime.context.network, followed)
 
     # --- reads ---------------------------------------------------------------------------------
+
+    async def _revalue_commissions(self) -> None:
+        """Retry the fees closed positions could not value when they closed."""
+        context = self.runtime.context
+        if context is None:
+            return
+        async with self.runtime.session() as session:
+            ids = (
+                await session.scalars(
+                    select(Fill.position_id)
+                    .join(Position, Position.id == Fill.position_id)
+                    .where(
+                        Position.account == context.account,
+                        Position.network == context.network,
+                        Position.status == PositionStatus.CLOSED,
+                        Fill.commission_quote.is_(None),
+                    )
+                    .distinct()
+                )
+            ).all()
+        for position_id in ids:
+            if position_id is None:
+                continue
+            async with self.runtime.session() as session, session.begin():
+                position = await lock_position(session, position_id)
+                await self.finalizer.revalue(session, position)
 
     async def _open(self) -> list[Position]:
         context = self.runtime.context

@@ -288,6 +288,8 @@ class FakeExchange:
         #: "quote".
         self.commission_asset = commission_asset
         self.bnb_price = bnb_price
+        #: Tests: the agent's commission price source (not the exchange) is down.
+        self.valuation_down = False
         self._clock = clock or (lambda: 1_800_000_000_000)
         self.rules: dict[str, SymbolRules] = {}
         self.last: dict[str, Decimal] = {}

@@ -397,7 +397,7 @@ class Finalizer:
         """Close ``position`` (locked by the caller); ``None`` if already closed."""
         if position.status == PositionStatus.CLOSED:
             return None
-        estimated = await self._fill_missing_commissions(session, position)
+        estimated, pending = await self._fill_missing_commissions(session, position)
         last_sell = await session.scalar(
             select(func.max(Fill.trade_time)).where(
                 Fill.position_id == position.id, Fill.side == "SELL"
@@ -428,11 +428,19 @@ class Finalizer:
             order_ids=tuple(order_ids),
             exit_policy=position.exit_policy,
         )
+        # A fee without a price is not zero: the result stays provisional and,
+        # since a profit cannot be proven, counts as losing until revalued.
+        losing = outcome.losing or bool(pending)
         position.status = PositionStatus.CLOSED
         position.closed_at = closed_at
         position.realized_pnl = pnl
         position.operation = None
-        position.outcome = {**outcome.transport(), "commission_estimated": estimated}
+        position.outcome = {
+            **outcome.transport(),
+            "commission_estimated": estimated,
+            "commission_pending": pending,
+            "counted_losing": losing,
+        }
         cooldown_until = closed_at + timedelta(minutes=policy.cooldown_minutes)
         await session.execute(
             insert(SymbolCooldown)
@@ -455,24 +463,8 @@ class Finalizer:
                 },
             )
         )
-        if outcome.losing:
-            await session.execute(
-                insert(RiskState)
-                .values(
-                    account=position.account,
-                    network=position.network,
-                    utc_date=closed_at.astimezone(UTC).date(),
-                    losing_trades=1,
-                    updated_at=func.now(),
-                )
-                .on_conflict_do_update(
-                    index_elements=["account", "network", "utc_date"],
-                    set_={
-                        "losing_trades": RiskState.losing_trades + 1,
-                        "updated_at": func.now(),
-                    },
-                )
-            )
+        if losing:
+            await _count_losing(session, position, closed_at, 1)
         await record_event(
             session,
             account=position.account,
@@ -483,39 +475,106 @@ class Finalizer:
         )
         return outcome
 
+    async def revalue(self, session: AsyncSession, position: Position) -> bool:
+        """Value the fees a closed position still lacks; True once none is left.
+
+        Recomputes the result and, if its losing/not-losing verdict changes,
+        moves the count of the day it closed on. ``position`` is locked by the
+        caller.
+        """
+        if position.status != PositionStatus.CLOSED or position.outcome is None:
+            return True
+        _, pending = await self._fill_missing_commissions(session, position)
+        outcome = dict(position.outcome)
+        if pending == outcome.get("commission_pending"):
+            return not pending
+        pnl = position.sold_quote - position.bought_quote - position.commission_quote
+        losing = pnl < 0 or bool(pending)
+        closed_at = position.closed_at or datetime.now(UTC)
+        if losing != bool(outcome.get("counted_losing")):
+            await _count_losing(session, position, closed_at, 1 if losing else -1)
+        position.realized_pnl = pnl
+        position.outcome = {
+            **outcome,
+            "realized_pnl": transport_value(pnl),
+            "commission_quote": transport_value(position.commission_quote),
+            "commission_estimated": True,
+            "commission_pending": pending,
+            "counted_losing": losing,
+        }
+        await record_event(
+            session,
+            account=position.account,
+            network=position.network,
+            kind="position_revalued",
+            payload={"realized_pnl": pnl, "pending": pending, "losing": losing},
+            position=position,
+        )
+        return not pending
+
     async def _fill_missing_commissions(
         self, session: AsyncSession, position: Position
-    ) -> bool:
-        """Convert commissions that had no price at their fill time.
+    ) -> tuple[bool, list[int]]:
+        """Convert commissions that had no price when they were booked.
 
-        Returns whether any of them is now an estimate (current price).
+        Priced at their own trade time. Returns whether any was converted now
+        and the trade ids that still have no price.
         """
         missing = (
             await session.scalars(
-                select(Fill).where(
-                    Fill.position_id == position.id, Fill.commission_quote.is_(None)
-                )
+                select(Fill)
+                .where(Fill.position_id == position.id, Fill.commission_quote.is_(None))
+                .order_by(Fill.trade_id)
             )
         ).all()
         estimated = False
+        pending: list[int] = []
         for fill in missing:
-            price = (
-                await self._fallback_price(fill.commission_asset, datetime.now(UTC))
-                if self._fallback_price is not None
-                else None
-            )
+            try:
+                price = (
+                    await self._fallback_price(fill.commission_asset, fill.trade_time)
+                    if self._fallback_price is not None
+                    else None
+                )
+            except Exception as exc:  # noqa: BLE001 - unpriced, retried later
+                logger.warning("commission price of %s failed: %s", fill.trade_id, exc)
+                price = None
             if price is None:
                 logger.warning(
-                    "commission of trade %s (%s %s) has no quote price",
+                    "commission of trade %s (%s %s) has no quote price yet",
                     fill.trade_id,
                     fill.commission,
                     fill.commission_asset,
                 )
+                pending.append(int(fill.trade_id))
                 continue
             fill.commission_quote = fill.commission * price
             position.commission_quote += fill.commission_quote
             estimated = True
-        return estimated
+        return estimated, pending
+
+
+async def _count_losing(
+    session: AsyncSession, position: Position, closed_at: datetime, delta: int
+) -> None:
+    """Move the losing-trade count of the UTC day ``closed_at`` falls on."""
+    await session.execute(
+        insert(RiskState)
+        .values(
+            account=position.account,
+            network=position.network,
+            utc_date=closed_at.astimezone(UTC).date(),
+            losing_trades=max(delta, 0),
+            updated_at=func.now(),
+        )
+        .on_conflict_do_update(
+            index_elements=["account", "network", "utc_date"],
+            set_={
+                "losing_trades": func.greatest(RiskState.losing_trades + delta, 0),
+                "updated_at": func.now(),
+            },
+        )
+    )
 
 
 async def losing_trades_today(
