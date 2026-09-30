@@ -272,3 +272,30 @@ def test_signal_expiring_during_admission_planning_is_not_reserved() -> None:
         assert (decision.state, decision.reason) == (IntentState.EXPIRED, "expired")
 
     run(scenario)
+
+
+def test_the_quote_and_its_spread_are_persisted_for_the_audit() -> None:
+    # Review 2026-09-30 (EXEC-14): the spread was computed, then discarded.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        state.fake.book["BTCUSDT"] = (Decimal("99.9"), Decimal("100.1"))
+        signal_id = await state.reserve(stack)
+        intent = await state.intent(stack, signal_id)
+        assert intent.plan is not None
+        quote = intent.plan["quote"]
+        assert (Decimal(quote["bid"]), Decimal(quote["ask"])) == (
+            Decimal("99.9"),
+            Decimal("100.1"),
+        )
+        assert Decimal(quote["spread_pct"]) == Decimal("0.2")
+        assert quote["last"] is not None and quote["fetched_at"]
+        await stack.orders.execute_entry(signal_id)
+        [attempt] = await state.attempts(stack, signal_id)
+        sent = attempt.request["quote"]
+        assert (Decimal(sent["bid"]), Decimal(sent["ask"])) == (
+            Decimal("99.9"),
+            Decimal("100.1"),
+        )
+        assert Decimal(sent["spread_pct"]) == Decimal("0.2")
+
+    run(scenario)

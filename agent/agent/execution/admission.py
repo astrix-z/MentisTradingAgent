@@ -50,7 +50,7 @@ from agent.execution.models import (
     SignalInbox,
     SymbolCooldown,
 )
-from agent.execution.quotes import QuoteProvider, ReferenceUnverified
+from agent.execution.quotes import QuoteProvider, QuoteSnapshot, ReferenceUnverified
 from agent.execution.runtime import ExecutionContext, ExecutionRuntime
 from agent.execution.sizing import EntryPlan, EntryRejected, Skip, equity, plan_entry
 from agent.strategies.base import ExitPolicy, Signal
@@ -245,7 +245,7 @@ class Admission:
             return await self._record(signal, context, IntentState.REJECTED, reason)
         self._runtime.alerts.pop("daily_limit", None)
         try:
-            plan, free = await self._plan(signal, context, now)
+            plan, free, quote = await self._plan(signal, context, now)
         except EntryRejected as exc:
             return await self._record(
                 signal,
@@ -274,7 +274,7 @@ class Admission:
         now = self._clock()
         if signal.valid_until is not None and now >= signal.valid_until:
             return await self._record(signal, context, IntentState.EXPIRED, "expired")
-        return await self._reserve(signal, context, plan, free, now)
+        return await self._reserve(signal, context, plan, free, now, quote)
 
     # --- checks -----------------------------------------------------------------
 
@@ -312,8 +312,11 @@ class Admission:
 
     async def _plan(
         self, signal: SignalInbox, context: ExecutionContext, now: datetime
-    ) -> tuple[EntryPlan, Decimal]:
-        """Size the entry from fresh exchange data; returns the plan and free quote."""
+    ) -> tuple[EntryPlan, Decimal, QuoteSnapshot]:
+        """Size the entry from fresh exchange data.
+
+        Returns the plan, the free quote balance and the quote it was sized on.
+        """
         payload = signal.payload
         policy = ExitPolicy.from_transport(payload["exit_policy"])
         entry_ref = Decimal(payload["entry_ref"])
@@ -354,6 +357,7 @@ class Admission:
                 occupied_slots=occupied,
             ),
             free,
+            quote,
         )
 
     async def _account(self) -> Any:
@@ -418,12 +422,15 @@ class Admission:
         plan: EntryPlan,
         free: Decimal,
         now: datetime,
+        quote: QuoteSnapshot,
     ) -> Decision:
         """Take quote, symbol and slot, re-checking occupancy under the lock.
 
         ``free`` is the quote balance read before the transaction; inside it
         only database state is re-read, so no exchange call holds the lock.
         """
+        # The plan is stored with the quote it was sized on (spread included).
+        record = {**plan.as_record(), "quote": quote.as_record()}
         async with self._runtime.session() as session, session.begin():
             await session.execute(
                 text("select pg_advisory_xact_lock(:key)"),
@@ -446,7 +453,7 @@ class Admission:
                     symbol=signal.symbol,
                     state=state,
                     reason=reason,
-                    plan=plan.as_record(),
+                    plan=record,
                     quantity=plan.quantity,
                     cap_price=plan.cap_price,
                     quote_reserved=plan.quote_cost if reason is None else Decimal(0),
@@ -463,7 +470,7 @@ class Admission:
                     "symbol": signal.symbol,
                     "state": state.value,
                     "reason": reason,
-                    "plan": plan.as_record(),
+                    "plan": record,
                 },
             )
         if reason is None:

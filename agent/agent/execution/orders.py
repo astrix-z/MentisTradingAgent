@@ -46,7 +46,7 @@ from agent.execution.models import (
     Position,
     SignalInbox,
 )
-from agent.execution.quotes import QuoteProvider, ReferenceUnverified
+from agent.execution.quotes import QuoteProvider, QuoteSnapshot, ReferenceUnverified
 from agent.execution.runtime import ExecutionRuntime
 from agent.execution.sizing import validate_entry
 from agent.strategies.base import ExitPolicy, PositionEvent
@@ -121,7 +121,7 @@ class OrderManager:
             return EntryResult(EntryOutcome.DEFERRED, "not reserved")
         if not runtime.may_mutate() or runtime.trade is None:
             return EntryResult(EntryOutcome.DEFERRED, "no execution lock")
-        reason, deadline = await self._presubmit(intent, signal)
+        reason, deadline, quote = await self._presubmit(intent, signal)
         if reason is not None:
             await self._release(signal_id, reason)
             return EntryResult(EntryOutcome.RELEASED, reason)
@@ -146,6 +146,8 @@ class OrderManager:
                     "timeInForce": "FOK",
                     "quantity": locked.quantity,
                     "price": locked.cap_price,
+                    # Audit: the quote the send was checked against.
+                    "quote": quote.as_record() if quote is not None else None,
                 },
             )
             locked.state = IntentState.SUBMITTED
@@ -194,40 +196,40 @@ class OrderManager:
 
     async def _presubmit(
         self, intent: ExecutionIntent, signal: SignalInbox
-    ) -> tuple[str | None, datetime]:
+    ) -> tuple[str | None, datetime, QuoteSnapshot | None]:
         """The checks right before the BUY (plan §6.1).
 
-        Returns a reason to release (or ``None``) and the moment after which
-        the BUY must not be sent: the signal's ``valid_until`` or the quote's
-        freshness limit, whichever is first. Time is read after the awaited
-        reads, never before them.
+        Returns a reason to release (or ``None``), the moment after which the
+        BUY must not be sent — the signal's ``valid_until`` or the quote's
+        freshness limit, whichever is first — and the quote checked. Time is
+        read after the awaited reads, never before them.
         """
         runtime = self.runtime
         settings = runtime.settings
         max_fetch_age = timedelta(seconds=settings.quote_max_fetch_age_s)
         blocked = runtime.admission_block()
         if blocked is not None:
-            return blocked, self.clock()
+            return blocked, self.clock(), None
         if _expired(signal, self.clock()):
-            return "expired", self.clock()
+            return "expired", self.clock(), None
         policy = ExitPolicy.from_transport(signal.payload["exit_policy"])
         try:
             quote = await self.quotes(intent.network).snapshot(intent.symbol)
             filters = await self.filters.get(intent.network, intent.symbol)
             now = self.clock()
             if _expired(signal, now):
-                return "expired", now
+                return "expired", now, quote
             quote.check_fresh(
                 now,
                 max_fetch_age=max_fetch_age,
                 max_trade_age=timedelta(seconds=settings.quote_max_trade_age_s),
             )
             if quote.last_price() <= policy.stop_ref:
-                return "stop_above_price", now
+                return "stop_above_price", now, quote
         except ReferenceUnverified as exc:
-            return f"quote_unverified: {exc}", self.clock()
+            return f"quote_unverified: {exc}", self.clock(), None
         except Exception as exc:  # noqa: BLE001 - any read failure: do not buy
-            return f"market_data_unavailable: {exc}", self.clock()
+            return f"market_data_unavailable: {exc}", self.clock(), None
         assert intent.quantity is not None and intent.cap_price is not None
         problems = validate_entry(
             filters,
@@ -238,11 +240,11 @@ class OrderManager:
             price=intent.cap_price,
         )
         if problems:
-            return f"{problems[0].reason.value}: {problems[0].detail}", now
+            return f"{problems[0].reason.value}: {problems[0].detail}", now, quote
         deadline = quote.fetched_at + max_fetch_age
         if signal.valid_until is not None:
             deadline = min(deadline, signal.valid_until)
-        return None, deadline
+        return None, deadline, quote
 
     # --- outcomes ------------------------------------------------------------------
 

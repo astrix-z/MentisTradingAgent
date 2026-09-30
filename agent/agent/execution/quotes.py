@@ -74,6 +74,24 @@ class QuoteSnapshot:
             return None
         return (self.ask - self.bid) / ((self.ask + self.bid) / 2) * 100
 
+    def as_record(self) -> dict[str, str | int | None]:
+        """What the decision was based on, JSON-safe, for the audit."""
+
+        def text(value: object) -> str | None:
+            return None if value is None else str(value)
+
+        return {
+            "fetched_at": self.fetched_at.isoformat(),
+            "last": text(self.last_trade and self.last_trade.price),
+            "last_at": text(self.last_trade and self.last_trade.time.isoformat()),
+            "bid": text(self.bid),
+            "ask": text(self.ask),
+            "spread_pct": text(self.spread_pct),
+            "avg": text(self.avg and self.avg.price),
+            "avg_mins": self.avg.mins if self.avg else None,
+            "reference": text(self.reference and self.reference.price),
+        }
+
     def check_fresh(
         self,
         now: datetime,
