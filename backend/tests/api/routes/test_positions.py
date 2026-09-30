@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -97,7 +98,8 @@ def test_record_exit_closes_the_open_position(db: Session) -> None:
             "symbol": "BTCUSDT",
             "exit_reason": "tp",
             "emitted_at": datetime.now(UTC).isoformat(),
-        }
+        },
+        "live",
     )
     row = db.exec(
         select(SignalPosition).where(SignalPosition.signal_id == "sig-3")
@@ -105,6 +107,31 @@ def test_record_exit_closes_the_open_position(db: Session) -> None:
     assert row is not None
     assert row.status == "hit_take"
     assert row.closed_at is not None
+
+
+def test_a_duplicate_exit_closes_one_position_on_its_network(db: Session) -> None:
+    # Review 2026-09-30: two open positions of one symbol plus a redelivered
+    # EXIT closed both; the query also ignored the network.
+    symbol = f"DUP{uuid.uuid4().hex[:8].upper()}USDT"
+    for signal_id, network in (("a", "live"), ("b", "live"), ("c", "testnet")):
+        _record_entry(
+            entry_payload(signal_id=f"{symbol}-{signal_id}", symbol=symbol), network
+        )
+    exit_payload = {
+        "symbol": symbol,
+        "exit_reason": "stop",
+        "emitted_at": datetime.now(UTC).isoformat(),
+    }
+    _record_exit(exit_payload, "live")
+    _record_exit(exit_payload, "live")  # redelivered
+    rows = {
+        row.signal_id: row.status
+        for row in db.exec(
+            select(SignalPosition).where(SignalPosition.symbol == symbol)
+        ).all()
+    }
+    assert sorted(rows.values()) == ["hit_stop", "open", "open"]
+    assert rows[f"{symbol}-c"] == "open"  # the other network is untouched
 
 
 def _universe_payload(last_price: str) -> str:

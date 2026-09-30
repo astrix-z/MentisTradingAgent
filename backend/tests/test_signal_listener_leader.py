@@ -8,6 +8,7 @@ the election makes (SET NX, the renew/release scripts, pubsub).
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
@@ -125,3 +126,117 @@ def test_leader_steps_down_when_its_lock_is_gone() -> None:
         await asyncio.gather(worker, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+class ExpiringRedis:
+    """A lock with a real TTL, renewals that can be made to hang, and
+    pub/sub that delivers a published message to every subscriber."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, tuple[str, float]] = {}
+        self.hang: set[str] = set()  # tokens whose calls never answer (stalled)
+        self.queues: list[tuple[asyncio.Queue[Any], BroadcastPubSub]] = []
+
+    def _live(self, key: str) -> str | None:
+        entry = self.values.get(key)
+        if entry is None or entry[1] <= time.monotonic():
+            self.values.pop(key, None)
+            return None
+        return entry[0]
+
+    async def set(self, key: str, value: str, nx: bool, px: int) -> bool:
+        if value in self.hang:
+            await asyncio.Event().wait()
+        if self._live(key) is not None:
+            return False
+        self.values[key] = (value, time.monotonic() + px / 1000)
+        return True
+
+    async def eval(self, script: str, _numkeys: int, key: str, *args: str) -> int:
+        if args[0] in self.hang:
+            await asyncio.Event().wait()  # the call never comes back
+        if self._live(key) != args[0]:
+            return 0
+        if script == sl._RELEASE_SCRIPT:
+            del self.values[key]
+        else:
+            self.values[key] = (args[0], time.monotonic() + int(args[1]) / 1000)
+        return 1
+
+    def pubsub(self) -> BroadcastPubSub:
+        return BroadcastPubSub(self)
+
+    def publish(self, data: str) -> None:
+        for queue, pubsub in self.queues:
+            if not pubsub.closed:
+                queue.put_nowait({"type": "message", "data": data})
+
+
+class BroadcastPubSub:
+    def __init__(self, redis: ExpiringRedis) -> None:
+        self.redis = redis
+        self.closed = False
+        self.queue: asyncio.Queue[Any] = asyncio.Queue()
+
+    async def subscribe(self, channel: str) -> None:
+        self.redis.queues.append((self.queue, self))
+
+    async def listen(self) -> Any:
+        while True:
+            yield await self.queue.get()
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_a_stalled_renewal_never_lets_two_workers_consume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review 2026-09-30: A's renewal hung, its lease expired, B took over,
+    # and a broadcast signal was handled by both.
+    monkeypatch.setattr(sl, "_LEADER_TTL_MS", 300)
+    monkeypatch.setattr(sl, "_LEASE_MARGIN_SECONDS", 0.05)
+    monkeypatch.setattr(sl, "_LEADER_RENEW_SECONDS", 0.05)
+    monkeypatch.setattr(sl, "_LEADER_RENEW_TIMEOUT_SECONDS", 0.1)
+    tokens = iter(["A", "B"])
+    monkeypatch.setattr(
+        sl.uuid, "uuid4", lambda: type("U", (), {"hex": next(tokens)})()
+    )
+    handled: list[str] = []
+
+    async def handle(_redis: Any, raw: str) -> None:
+        handled.append(raw)
+
+    monkeypatch.setattr(sl, "_handle_message", handle)
+
+    async def scenario() -> None:
+        redis = ExpiringRedis()
+        a = asyncio.create_task(sl.run_signal_listener(redis))  # type: ignore[arg-type]
+        await asyncio.sleep(0.02)
+        assert redis._live(sl.REDIS_LISTENER_LOCK_KEY) == "A"
+        redis.hang.add("A")  # A's connection stalls: no call of A answers
+        b = asyncio.create_task(sl.run_signal_listener(redis))  # type: ignore[arg-type]
+        await asyncio.sleep(0.5)  # A's lease runs out; B takes the lock
+        assert redis._live(sl.REDIS_LISTENER_LOCK_KEY) == "B"
+        redis.publish('{"kind": "signal"}')
+        await asyncio.sleep(0.05)
+        assert handled == ['{"kind": "signal"}']  # once, by B
+        for worker in (a, b):
+            worker.cancel()
+        await asyncio.gather(a, b, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_the_lease_counts_from_when_the_renewal_was_sent() -> None:
+    clock = [100.0]
+    lease = sl.Lease(clock=lambda: clock[0])
+    assert not lease.valid()
+    sent_at = clock[0]
+    clock[0] += 5  # the answer took 5 s
+    lease.extend(sent_at)
+    ttl = sl._LEADER_TTL_MS / 1000 - sl._LEASE_MARGIN_SECONDS
+    clock[0] = sent_at + ttl - 0.001
+    assert lease.valid()
+    clock[0] = sent_at + ttl
+    assert not lease.valid()

@@ -21,7 +21,9 @@ import asyncio
 import json
 import logging
 import re
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -49,6 +51,12 @@ _RECONNECT_DELAY_SECONDS = 2.0
 REDIS_LISTENER_LOCK_KEY = "backend:signal-listener:leader"
 _LEADER_TTL_MS = 15_000
 _LEADER_RENEW_SECONDS = 5.0
+# A renewal that has not answered by then counts as lost: the lease may be
+# expiring while we wait (the client has no socket timeout of its own).
+_LEADER_RENEW_TIMEOUT_SECONDS = 2.0
+# The lease is trusted until TTL minus this margin after the moment the last
+# successful SET/renew was *sent* — never after the answer arrived.
+_LEASE_MARGIN_SECONDS = 2.0
 # Renew/release only if the lock is still ours: another worker may have taken
 # it after ours expired, and that one must not be extended or deleted.
 _RENEW_SCRIPT = """
@@ -136,26 +144,43 @@ def _record_entry(payload: dict[str, Any], network: str) -> None:
     )
 
 
-def _record_exit(payload: dict[str, Any]) -> None:
-    """Close the open position for this symbol, if any.
+def _record_exit(payload: dict[str, Any], network: str) -> None:
+    """Close the open position for this symbol on this network, if any.
 
     Future-proofing: the strategy does not emit EXIT today (position
     monitoring is a separate, unbuilt lane), so this path is currently dead
     code in production but keeps the listener correct if/when it starts.
+
+    Idempotent: an EXIT is applied at most once. A position of the symbol
+    already closed at this EXIT's ``emitted_at`` means a redelivery (pub/sub
+    after a reconnect, or a leadership handover), which must not close the
+    next open position of the same symbol.
     """
+    closed_at = datetime.fromisoformat(payload["emitted_at"])
     with Session(engine) as session:
+        applied = session.exec(
+            select(SignalPosition)
+            .where(SignalPosition.symbol == payload["symbol"])
+            .where(SignalPosition.network == network)
+            .where(SignalPosition.status != "open")
+            .where(SignalPosition.closed_at == closed_at)
+        ).first()
+        if applied is not None:
+            return
         position = session.exec(
             select(SignalPosition)
             .where(SignalPosition.symbol == payload["symbol"])
+            .where(SignalPosition.network == network)
             .where(SignalPosition.status == "open")
             .order_by(col(SignalPosition.emitted_at).desc())
+            .with_for_update()
         ).first()
         if position is None:
             return
         position.status = (
             "hit_take" if payload.get("exit_reason") == "tp" else "hit_stop"
         )
-        position.closed_at = datetime.fromisoformat(payload["emitted_at"])
+        position.closed_at = closed_at
         session.add(position)
         session.commit()
 
@@ -176,6 +201,30 @@ async def _current_network(redis: Redis) -> str:
         return "unknown"
 
 
+class Lease:
+    """How long this worker may still act as the leader.
+
+    Set from the moment the lock was taken or renewed (the request's send
+    time), so a slow answer or a stalled renewal can only shorten it. The
+    listener checks it before every message: past it, another worker may
+    already be leading, and this one must not consume.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._valid_until = 0.0
+
+    def now(self) -> float:
+        return self._clock()
+
+    def extend(self, sent_at: float) -> None:
+        ttl = _LEADER_TTL_MS / 1000 - _LEASE_MARGIN_SECONDS
+        self._valid_until = max(self._valid_until, sent_at + ttl)
+
+    def valid(self) -> bool:
+        return self._clock() < self._valid_until
+
+
 async def _handle_message(redis: Redis, raw: str) -> None:
     try:
         payload = json.loads(raw)
@@ -186,16 +235,28 @@ async def _handle_message(redis: Redis, raw: str) -> None:
         return
     kind = payload.get("type")
     try:
+        # The database work is blocking: in a thread, it cannot hold up the
+        # event loop and with it the lease renewal.
         if kind == "ENTRY":
-            _record_entry(payload, await _current_network(redis))
+            network = await _current_network(redis)
+            await asyncio.to_thread(_record_entry, payload, network)
         elif kind == "EXIT":
-            _record_exit(payload)
+            network = await _current_network(redis)
+            await asyncio.to_thread(_record_exit, payload, network)
     except Exception:  # noqa: BLE001 - one bad message must not kill the listener
         logger.exception("failed to process signal payload: %s", payload)
 
 
-async def listen_for_signals(redis: Redis) -> None:
-    """Run forever, turning ENTRY/EXIT signals into DB rows as they arrive."""
+class LeaseLost(Exception):
+    """The lease ran out while listening; another worker may be leading."""
+
+
+async def listen_for_signals(redis: Redis, lease: Lease | None = None) -> None:
+    """Run forever, turning ENTRY/EXIT signals into DB rows as they arrive.
+
+    With a ``lease``, no message is handled once it is no longer known to be
+    valid: the listener stops (:class:`LeaseLost`) instead.
+    """
     while True:
         pubsub = redis.pubsub()
         try:
@@ -204,6 +265,8 @@ async def listen_for_signals(redis: Redis) -> None:
             async for message in pubsub.listen():
                 if message["type"] != "message":
                     continue
+                if lease is not None and not lease.valid():
+                    raise LeaseLost
                 await _handle_message(redis, message["data"])
         except asyncio.CancelledError:
             raise
@@ -221,19 +284,26 @@ async def listen_for_signals(redis: Redis) -> None:
 
 
 async def _hold_leadership(
-    redis: Redis, token: str, listener: asyncio.Task[None]
+    redis: Redis, token: str, listener: asyncio.Task[None], lease: Lease
 ) -> None:
     """Renew the lock until it is lost or the listener ends."""
     while not listener.done():
         await asyncio.wait({listener}, timeout=_LEADER_RENEW_SECONDS)
         if listener.done():
             return
+        sent_at = lease.now()
+        renew: Awaitable[int] = redis.eval(  # type: ignore[assignment]
+            _RENEW_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token, str(_LEADER_TTL_MS)
+        )
+        renewed: int
         try:
-            renewed = await redis.eval(  # type: ignore[misc]
-                _RENEW_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token, str(_LEADER_TTL_MS)
+            renewed = await asyncio.wait_for(
+                renew, timeout=_LEADER_RENEW_TIMEOUT_SECONDS
             )
-        except RedisError:
+        except RedisError, TimeoutError:
             renewed = 0
+        if renewed:
+            lease.extend(sent_at)
         if not renewed:
             logger.warning("signal listener lost leadership; stepping down")
             return
@@ -247,6 +317,8 @@ async def run_signal_listener(redis: Redis) -> None:
     """
     token = uuid.uuid4().hex
     while True:
+        lease = Lease()
+        sent_at = lease.now()
         try:
             acquired = await redis.set(
                 REDIS_LISTENER_LOCK_KEY, token, nx=True, px=_LEADER_TTL_MS
@@ -256,23 +328,27 @@ async def run_signal_listener(redis: Redis) -> None:
         if not acquired:
             await asyncio.sleep(_LEADER_RENEW_SECONDS)
             continue
+        lease.extend(sent_at)
         logger.info("signal listener leadership acquired")
-        listener = asyncio.create_task(listen_for_signals(redis))
+        listener = asyncio.create_task(listen_for_signals(redis, lease))
         try:
-            await _hold_leadership(redis, token, listener)
+            await _hold_leadership(redis, token, listener, lease)
         finally:
             listener.cancel()
             crashed = False
             try:
                 await listener
-            except asyncio.CancelledError:
+            except asyncio.CancelledError, LeaseLost:
                 pass
             except Exception:  # noqa: BLE001 - keep electing after a crash
                 logger.exception("signal listener crashed; re-electing")
                 crashed = True
-            with suppress(RedisError):
-                await redis.eval(  # type: ignore[misc]
-                    _RELEASE_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token
-                )
+            release: Awaitable[int] = redis.eval(  # type: ignore[assignment]
+                _RELEASE_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token
+            )
+            # A stalled release must not keep this worker from electing
+            # again; the lock expires by its TTL anyway.
+            with suppress(RedisError, TimeoutError):
+                await asyncio.wait_for(release, timeout=_LEADER_RENEW_TIMEOUT_SECONDS)
         if crashed:
             await asyncio.sleep(_RECONNECT_DELAY_SECONDS)
