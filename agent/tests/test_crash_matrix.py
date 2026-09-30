@@ -11,6 +11,9 @@ agent would after a crash — and then checks the same invariants:
   exchange, or closed — or explicitly UNKNOWN with an escalation;
 * reserves: only unresolved intents hold quote; a filled intent has its
   position; a position's events are numbered without gaps;
+* exchange → ledger completeness: every BUY and SELL of ours that executed on
+  the exchange is in the ledger of its position, whatever the local intent
+  says — a filled BUY with no position is orphaned exposure, not progress;
 * every client id fits 36 characters.
 
 Scenarios covered in depth by the per-component suites (entry, protection,
@@ -120,6 +123,9 @@ async def invariants(
                     position.status,
                 )
 
+    if progress:
+        exchange_to_ledger(fake, positions)
+
     for intent in intents:
         if intent.state not in INTENT_HOLDING_STATES:
             assert intent.quote_reserved == 0
@@ -130,6 +136,27 @@ async def invariants(
     for asset in ("BTC", "ETH", "SOL"):
         free, locked = fake.balance(asset)
         assert free >= 0 and locked >= 0
+
+
+def exchange_to_ledger(fake: Any, positions: Any) -> None:
+    """What executed on the exchange for our client ids is what the ledger holds.
+
+    Our ids are ``mta-<24 hex of the signal>-<role><n>``, so every order of
+    ours names its signal and so its position.
+    """
+    by_signal = {p.signal_id.hex[:24]: p for p in positions}
+    executed: dict[tuple[str, str], Decimal] = {}
+    for order in fake.orders.values():
+        cid = order.client_order_id
+        if not cid.startswith("mta-") or order.executed <= 0:
+            continue
+        key = (cid.split("-")[1], order.side)
+        executed[key] = executed.get(key, Decimal(0)) + order.executed
+    for (signal, side), quantity in sorted(executed.items()):
+        position = by_signal.get(signal)
+        assert position is not None, f"orphaned exchange {side} of {signal}"
+        booked = position.bought_qty if side == "BUY" else position.sold_qty
+        assert booked == quantity, (position.symbol, side, booked, quantity)
 
 
 async def recover(state: World, rounds: int = 4) -> ExecutionService:
@@ -218,7 +245,7 @@ def test_lost_buy_response_with_lagging_history_and_base_commission() -> None:
     matrix(scenario, commission_asset="base")
 
 
-@pytest.mark.parametrize("boundary", ["after_prepare", "after_send"])
+@pytest.mark.parametrize("boundary", ["after_prepare", "after_send", "after_ack"])
 def test_crash_at_each_boundary_of_the_entry(boundary: str) -> None:
     async def scenario(state: World) -> None:
         stack = await state.stack()
@@ -227,9 +254,17 @@ def test_crash_at_each_boundary_of_the_entry(boundary: str) -> None:
             state.fake.fault(
                 "new_order", "timeout_before"
             )  # never reached the exchange
-        else:
+        elif boundary == "after_send":
             state.fake.fault("new_order", "timeout_after")
-        await stack.orders.execute_entry(signal_id)
+        else:
+            # The ACK is committed, the process dies before applying it.
+            stack.orders._settle = AsyncMock(  # type: ignore[method-assign]
+                side_effect=RuntimeError("process killed")
+            )
+        try:
+            await stack.orders.execute_entry(signal_id)
+        except RuntimeError:
+            assert boundary == "after_ack"
         recovered = await recover(state, rounds=6)
         intent = await state.intent(stack, signal_id)
         expected = (
