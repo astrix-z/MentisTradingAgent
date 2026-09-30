@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -238,6 +238,59 @@ def test_reconnect_reloads_every_missed_bar_in_order() -> None:
         loader.gate.set()
         await asyncio.gather(*feed._backfills.values())
         assert [b.open_time for b in feed.bars_after(position, t4)] == [t3, t2, t1]
+
+    asyncio.run(scenario())
+
+
+class FlakyLoader(Loader):
+    """Fails the first ``failures`` calls, then answers like :class:`Loader`."""
+
+    def __init__(self, bars: dict[int, str], failures: int) -> None:
+        super().__init__(bars)
+        self.failures = failures
+
+    async def __call__(
+        self, symbol: str, interval: str, start: int | None, limit: int
+    ) -> list[list[Any]]:
+        if self.failures > 0:
+            self.failures -= 1
+            self.calls.append(start)
+            raise TimeoutError("klines read timed out")
+        return await super().__call__(symbol, interval, start, limit)
+
+
+def test_failed_backfill_is_retried_with_backoff_until_it_recovers() -> None:
+    # Review 2026-09-30 (EXEC-10): the loader failed once, then recovered, but
+    # four more follow() rounds never called it again: not ready for good.
+    async def scenario() -> None:
+        sdks = Sdks()
+        hub = StreamHub(factory=sdks.factory)
+        t2, t1 = times(2, 1)
+        loader = FlakyLoader({t2: "98", t1: "99"}, failures=2)
+        clock = [NOW]
+        feed = MonitorFeed(hub, loader, clock=lambda: clock[0])
+        position = uuid.uuid4()
+        followed = [Followed(position, "BTCUSDT", "15m", 2, t2)]
+
+        async def round_(advance: float = 0) -> None:
+            clock[0] += timedelta(seconds=advance)
+            await feed.follow("live", followed)
+            await asyncio.gather(*feed._backfills.values())
+
+        await round_()
+        assert len(loader.calls) == 1 and not feed.ready("BTCUSDT", "15m")
+        assert feed.degraded()["BTCUSDT"] == "bars not backfilled"
+        await round_(1)  # inside the first backoff (5 s): no new call
+        assert len(loader.calls) == 1
+        await round_(5)  # second try, fails again; backoff doubles to 10 s
+        assert len(loader.calls) == 2 and not feed.ready("BTCUSDT", "15m")
+        await round_(5)
+        assert len(loader.calls) == 2
+        await round_(6)  # recovers
+        assert len(loader.calls) == 3 and feed.ready("BTCUSDT", "15m")
+        assert [b.open_time for b in feed.bars_after(position, t2)] == [t1]
+        await round_(60)  # ready: not reloaded every round
+        assert len(loader.calls) == 3
 
     asyncio.run(scenario())
 

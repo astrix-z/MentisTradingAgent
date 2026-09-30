@@ -46,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 STALE_AFTER = timedelta(seconds=60)
 _KEEP_BARS = 200
+#: Retry of a failed backfill: doubling from the first delay, up to the cap.
+BACKFILL_RETRY_FIRST = timedelta(seconds=5)
+BACKFILL_RETRY_MAX = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,8 @@ class MonitorFeed:
         self._ready: set[tuple[str, str]] = set()
         self._trades: dict[str, LastTrade] = {}
         self._backfills: dict[tuple[str, str], asyncio.Task[None]] = {}
+        #: Failed backfills: consecutive failures and when the next try may run.
+        self._retry: dict[tuple[str, str], tuple[int, datetime]] = {}
         #: Called after new closed bars became available for a symbol.
         self.on_bars: Callable[[str, str], None] | None = None
 
@@ -145,6 +150,7 @@ class MonitorFeed:
             for key in removed:
                 self._bars.pop(key, None)
                 self._ready.discard(key)
+                self._retry.pop(key, None)
         gone = sorted(before_symbols - after_symbols)
         if gone:
             await self._view.unsubscribe_trades_batch(gone)
@@ -152,6 +158,13 @@ class MonitorFeed:
                 self._trades.pop(symbol, None)
         for key in added:
             self._schedule_backfill(key)
+        # A subscription whose backfill failed stays not ready; every round
+        # retries it once its backoff has passed.
+        now = self._clock()
+        for key in sorted(after - set(added) - self._ready):
+            failures = self._retry.get(key)
+            if failures is None or now >= failures[1]:
+                self._schedule_backfill(key)
         if not wanted:
             await self.close()
 
@@ -274,11 +287,23 @@ class MonitorFeed:
         marks = [p.watermark for p in followers if p.watermark is not None]
         now_ms = int(self._clock().timestamp() * 1000)
         start = min(marks) - step * context if marks else now_ms - step * (context + 2)
+        key = (symbol, interval)
         try:
             rows = await self._load(symbol, interval, start, 1000)
-        except Exception as exc:  # noqa: BLE001 - retried on the next round
-            logger.warning("backfill %s %s failed: %s", symbol, interval, exc)
+        except Exception as exc:  # noqa: BLE001 - retried by follow() after a backoff
+            count = self._retry[key][0] + 1 if key in self._retry else 1
+            delay = min(BACKFILL_RETRY_FIRST * 2 ** (count - 1), BACKFILL_RETRY_MAX)
+            self._retry[key] = (count, self._clock() + delay)
+            logger.warning(
+                "backfill %s %s failed (%s), retry in %ss: %s",
+                symbol,
+                interval,
+                count,
+                int(delay.total_seconds()),
+                exc,
+            )
             return
+        self._retry.pop(key, None)
         closed = [
             Bar(
                 open_time=int(r[0]),
