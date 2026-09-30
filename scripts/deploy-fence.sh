@@ -64,7 +64,11 @@ PHASE=before
 compose() { (cd "$APP_DIR" && "${COMPOSE[@]}" "$@"); }
 # Compose-файлы цели до установки в APP_DIR (проверки и сборка).
 stage_compose() { (cd "$STAGE/tree" && "${COMPOSE[@]}" "$@"); }
-redis_cli() { (cd "$APP_DIR" && timeout "$CALL_TIMEOUT_S" "${COMPOSE[@]}" exec -T redis redis-cli "$@"); }
+# -e: an error reply (OOM, WRONGTYPE, …) is a non-zero exit; without it
+# redis-cli prints the error and exits 0.
+redis_cli() { (cd "$APP_DIR" && timeout "$CALL_TIMEOUT_S" "${COMPOSE[@]}" exec -T redis redis-cli -e "$@"); }
+# A catalog the agent published: JSON carrying its schema_hash, not just text.
+catalog_ok() { grep -Eq '^\{.*"schema_hash": *"[^"]+"' <<<"$1"; }
 # Самый свежий непустой дамп базы $1 (пустой файл — не дамп, R123).
 latest_dump() {
   find "$BACKUP_DIR" -maxdepth 1 -name "pre-deploy-$1-*.dump" -size +0c -printf '%T@ %p\n' 2>/dev/null \
@@ -193,9 +197,11 @@ if [[ ! -s "$RELEASES/current" ]]; then
     [[ "${DEPLOY_T0_CONFIRM:-0}" == 1 ]] || fail "сверка T0 не пройдена; продолжить можно только с --t0-confirm после проверки человеком"
     echo "    сверка не пройдена, но есть --t0-confirm (решение человека)"
   fi
-  # Сначала оба образа, потом теги: сбой не оставляет T0 закреплённым наполовину.
-  # Образ без тега Docker (хранилище containerd) удаляет, даже если на нём ещё
-  # работает контейнер, — такой T0 закрепить нечем.
+  # Сначала оба образа, потом теги. T0 закрепляется (pinned/current) только
+  # после обоих тегов. Сбой второго тега оставляет первый: он указывает на
+  # работающий образ, а снимать его опасно — образ без тега Docker (хранилище
+  # containerd) удаляет даже под работающим контейнером. Повторный запуск
+  # ставит оба тега заново.
   t0_images=()
   for svc in "${SERVICES[@]}"; do
     cid="$(compose ps -q "$svc")"
@@ -296,7 +302,9 @@ rsync -a --delete --exclude=/.env.prod "$STAGE/tree/" "$APP_DIR/"
 
 # --- G4 --------------------------------------------------------------------------
 echo "==> (1) флаг $FENCE_KEY"
-redis_cli SET "$FENCE_KEY" "deploy $REVISION $ATTEMPT $(date -Is)" >/dev/null
+reply="$(redis_cli SET "$FENCE_KEY" "deploy $REVISION $ATTEMPT $(date -Is)")" \
+  || fail "флаг $FENCE_KEY не поставлен: ${reply:-нет ответа}"
+[[ "$reply" == OK ]] || fail "флаг $FENCE_KEY не поставлен: $reply"
 PHASE=fenced
 echo "==> (2) остановка агента"
 PHASE=stopped
@@ -315,12 +323,13 @@ echo "==> (5) ожидание каталога агента цели (до ${CA
 published=""
 deadline=$((SECONDS + CATALOG_WAIT_S))
 while :; do
-  published="$(redis_cli GET "$CATALOG_KEY" 2>/dev/null || true)"
-  [[ -n "$published" ]] && break
+  # An error reply is not a catalog, nor is text without a schema_hash.
+  published="$(redis_cli GET "$CATALOG_KEY" 2>/dev/null)" || published=""
+  catalog_ok "$published" && break
   ((SECONDS < deadline)) || break
   sleep "$PAUSE_S"
 done
-[[ -n "$published" ]] || fail "агент цели не опубликовал $CATALOG_KEY за ${CATALOG_WAIT_S} с"
+catalog_ok "$published" || fail "агент цели не опубликовал $CATALOG_KEY за ${CATALOG_WAIT_S} с"
 echo "    schema_hash: $(grep -o '"schema_hash": *"[^"]*"' <<<"$published" | head -n 1)"
 
 # Healthcheck — до снятия флага: неработающий backend оставляет Start закрытым (R130).

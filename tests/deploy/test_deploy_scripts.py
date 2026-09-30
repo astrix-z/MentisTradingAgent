@@ -144,13 +144,18 @@ STUBS: dict[str, str] = {
               fi ;;
             exec)
               shift 2; shift  # -T redis redis-cli
+              strict=0; [[ "$1" == -e ]] && { strict=1; shift; }
               op="$1"; key="$2"; mkdir -p "$STATE/redis"
               echo "redis $op $key" >>"$STATE/calls.log"
               [[ -f "$STATE/fail_redis_$op" ]] && exit 1
               [[ -f "$STATE/sleep_redis_$op" ]] && sleep "$(cat "$STATE/sleep_redis_$op")"
+              # Like redis-cli: an error reply is printed and exits 0 unless -e.
+              if [[ -f "$STATE/error_redis_$op" ]]; then
+                cat "$STATE/error_redis_$op"; exit "$strict"
+              fi
               case "$op" in
-                SET) echo "$3" >"$STATE/redis/$key" ;;
-                DEL) rm -f "$STATE/redis/$key" ;;
+                SET) echo "$3" >"$STATE/redis/$key"; echo OK ;;
+                DEL) rm -f "$STATE/redis/$key"; echo 1 ;;
                 GET) cat "$STATE/redis/$key" 2>/dev/null || true ;;
               esac ;;
             build)
@@ -167,8 +172,11 @@ STUBS: dict[str, str] = {
                 [[ "$*" == *remove-orphans* || " $* " == *" $s "* ]] || continue
                 cp "$(img "mentis-$s:latest")" "$STATE/containers/c-$s.image" 2>/dev/null || true
               done
-              if [[ ! -f "$STATE/agent_silent" ]]; then
-                mkdir -p "$STATE/redis"; echo '{"schema_hash": "h-new"}' >"$STATE/redis/agent:strategies"
+              mkdir -p "$STATE/redis"
+              if [[ -f "$STATE/catalog_payload" ]]; then
+                cp "$STATE/catalog_payload" "$STATE/redis/agent:strategies"
+              elif [[ ! -f "$STATE/agent_silent" ]]; then
+                echo '{"schema_hash": "h-new"}' >"$STATE/redis/agent:strategies"
               fi ;;
             ps)
               [[ -f "$STATE/containers/c-$2.image" ]] && echo "c-$2" ;;
@@ -362,6 +370,43 @@ def test_a_failure_before_up_starts_the_previous_agent_and_keeps_the_fence(
     assert "снимается только по runbook" in result.stdout
 
 
+def test_a_refused_fence_set_stops_before_the_agent_is_touched(server: Server) -> None:
+    # Review 2026-09-30 (PRESET-09a): SET answered OOM, redis-cli exited 0,
+    # and the deploy stopped the agent, advanced current and exited 0.
+    server.put(
+        "error_redis_SET", "OOM command not allowed when used memory > 'maxmemory'."
+    )
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1, result.stdout
+    assert "не поставлен" in result.stdout, result.stdout
+    assert not any("stop agent" in call for call in server.calls())
+    assert server.redis("trading:start_fence") is None
+    assert (server.releases / "current").read_text().strip() == T0
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    ["error", "text"],
+    ids=["wrongtype-error", "not-a-catalog"],
+)
+def test_the_catalog_gate_needs_a_real_catalog(server: Server, catalog: str) -> None:
+    # GET WRONGTYPE printed an error that counted as a publication: the fence
+    # was lifted and the deploy exited 0 with no catalog.
+    if catalog == "error":
+        server.put(
+            "error_redis_GET",
+            "WRONGTYPE Operation against a key holding the wrong kind of value",
+        )
+    else:
+        server.put("catalog_payload", "not json at all")  # nonempty, no schema_hash
+    server.env["DEPLOY_CATALOG_WAIT_S"] = "2"
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1, result.stdout
+    assert "не опубликовал agent:strategies" in result.stdout, result.stdout
+    assert server.redis("trading:start_fence") is not None  # Start stays closed
+    assert (server.releases / "current").read_text().strip() == T0
+
+
 def test_the_images_report_names_a_missing_container(server: Server) -> None:
     (server.state / "containers/c-backend.image").unlink()
     server.put("fail_redis_DEL")
@@ -373,8 +418,11 @@ def test_the_images_report_names_a_missing_container(server: Server) -> None:
 def test_files_of_old_finished_attempts_are_rotated(server: Server) -> None:
     for i in range(25):
         attempt = f"{1_600_000_000 + i}-1-0000000{i % 10}"
-        for name in (f"deploy-{T0}-{attempt}.log", f"deploy-{T0}-{attempt}.exit",
-                     f"deploy-fence-{attempt}.sh"):
+        for name in (
+            f"deploy-{T0}-{attempt}.log",
+            f"deploy-{T0}-{attempt}.exit",
+            f"deploy-fence-{attempt}.sh",
+        ):
             path = server.releases / name
             path.write_text("0\n")
             os.utime(path, (1_600_000_000 + i, 1_600_000_000 + i))
