@@ -181,12 +181,9 @@ class OrderManager:
             if error.outcome is Outcome.UNKNOWN:
                 await self._mark_unknown(signal_id)
                 return EntryResult(EntryOutcome.UNKNOWN, error.message)
-            if error.error_type == _EXPIRED:
-                await self._release(signal_id, "expired")
-                return EntryResult(EntryOutcome.RELEASED, "expired")
-            if error.outcome is Outcome.REJECTED:
+            if error.outcome is Outcome.REJECTED and error.error_type != _EXPIRED:
                 self.filters.invalidate(intent.network, intent.symbol)
-            reason = f"entry_{error.outcome.value}:{error.exchange_code}"
+            reason = _refusal(error.as_record())
             await self._release(signal_id, reason)
             return EntryResult(EntryOutcome.RELEASED, reason)
         except asyncio.CancelledError:
@@ -446,9 +443,9 @@ class OrderManager:
     ) -> OrderAttempt | None:
         """The last entry attempt with a recorded answer, for an unsettled intent.
 
-        The answer (``acked``, or ``resolved`` from an UNKNOWN) is committed
-        before it is acted on; a crash in between leaves the intent SUBMITTED
-        or UNKNOWN with no open attempt.
+        The answer (``acked``, ``rejected``, or ``resolved`` from an UNKNOWN)
+        is committed before it is acted on; a crash in between leaves the
+        intent SUBMITTED or UNKNOWN with no open attempt.
         """
         return (
             await session.scalars(
@@ -456,7 +453,13 @@ class OrderManager:
                 .where(
                     OrderAttempt.signal_id == intent.signal_id,
                     OrderAttempt.role == Role.ENTRY.value,
-                    OrderAttempt.state.in_([AttemptState.ACKED, AttemptState.RESOLVED]),
+                    OrderAttempt.state.in_(
+                        [
+                            AttemptState.ACKED,
+                            AttemptState.REJECTED,
+                            AttemptState.RESOLVED,
+                        ]
+                    ),
                 )
                 .order_by(OrderAttempt.created_at.desc())
             )
@@ -467,6 +470,11 @@ class OrderManager:
     ) -> EntryResult:
         """Act on an entry answer that was recorded but never applied."""
         cid = attempt.client_order_id
+        if attempt.state == AttemptState.REJECTED:
+            # The exchange provably did not act; only the release was lost.
+            reason = _refusal(attempt.error)
+            await self._release(intent.signal_id, reason)
+            return EntryResult(EntryOutcome.RELEASED, reason)
         if attempt.state == AttemptState.RESOLVED and attempt.order_id is None:
             # Resolved as proven absent; only the release was lost.
             await self._release(intent.signal_id, "entry_not_placed")
@@ -531,6 +539,14 @@ class OrderManager:
                 f"order {attempt.client_order_id} ({attempt.symbol}) outcome unknown "
                 f"for {int(age.total_seconds())}s; not retried"
             )
+
+
+def _refusal(error: dict[str, Any] | None) -> str:
+    """The release reason of a refused entry, from its recorded error."""
+    error = error or {}
+    if error.get("error_type") == _EXPIRED:
+        return "expired"
+    return f"entry_{error.get('outcome')}:{error.get('exchange_code')}"
 
 
 def _context(runtime: ExecutionRuntime) -> Any:

@@ -248,7 +248,9 @@ def test_lost_buy_response_with_lagging_history_and_base_commission() -> None:
     matrix(scenario, commission_asset="base")
 
 
-@pytest.mark.parametrize("boundary", ["after_prepare", "after_send", "after_ack"])
+@pytest.mark.parametrize(
+    "boundary", ["after_prepare", "after_send", "after_ack", "after_reject"]
+)
 def test_crash_at_each_boundary_of_the_entry(boundary: str) -> None:
     async def scenario(state: World) -> None:
         stack = await state.stack()
@@ -259,19 +261,28 @@ def test_crash_at_each_boundary_of_the_entry(boundary: str) -> None:
             )  # never reached the exchange
         elif boundary == "after_send":
             state.fake.fault("new_order", "timeout_after")
-        else:
+        elif boundary == "after_ack":
             # The ACK is committed, the process dies before applying it.
             stack.orders._settle = AsyncMock(  # type: ignore[method-assign]
+                side_effect=RuntimeError("process killed")
+            )
+        else:
+            # The refusal is committed, the process dies before the release.
+            assert boundary == "after_reject"
+            state.fake.fault("new_order", "reject", code=-2010)
+            stack.orders._release = AsyncMock(  # type: ignore[method-assign]
                 side_effect=RuntimeError("process killed")
             )
         try:
             await stack.orders.execute_entry(signal_id)
         except RuntimeError:
-            assert boundary == "after_ack"
+            assert boundary in ("after_ack", "after_reject")
         recovered = await recover(state, rounds=6)
         intent = await state.intent(stack, signal_id)
         expected = (
-            IntentState.NO_FILL if boundary == "after_prepare" else IntentState.FILLED
+            IntentState.FILLED
+            if boundary in ("after_send", "after_ack")
+            else IntentState.NO_FILL
         )
         assert intent.state == expected
         await finish(state, recovered)

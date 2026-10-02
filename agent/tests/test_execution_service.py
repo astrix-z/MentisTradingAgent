@@ -6,6 +6,7 @@ import asyncio
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from execution_world import World, run
 
 from agent.exchange.budget import RequestBudget
@@ -262,6 +263,60 @@ def test_entry_never_placed_is_still_released() -> None:
         intent = await state.intent(first, signal_id)
         assert intent.state == IntentState.NO_FILL
         assert state.fake.orders_of("BTCUSDT", "BUY") == []
+
+    run(scenario)
+
+
+# --- review 2026-10-01 (EXEC-08 P2) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("refusal", "reason"),
+    [("exchange", "entry_rejected:-2010"), ("expired", "expired")],
+)
+def test_crash_after_a_refusal_is_released_after_restart(
+    refusal: str, reason: str
+) -> None:
+    # The attempt is recorded REJECTED, the process dies before _release():
+    # intent submitted, no open attempt. That used to hold the reserve forever.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+        if refusal == "exchange":
+            state.fake.fault("new_order", "reject", code=-2010)
+        else:
+            mark = first.orders.journal._mark
+
+            async def slow_mark(*args: Any, **kwargs: Any) -> None:
+                await mark(*args, **kwargs)
+                state.clock.advance(600)  # past valid_until before the send
+
+            first.orders.journal._mark = slow_mark  # type: ignore[method-assign]
+
+        async def crash(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("process killed")
+
+        first.orders._release = crash  # type: ignore[method-assign]
+        try:
+            await first.orders.execute_entry(signal_id)
+        except RuntimeError:
+            pass
+        await state.kill(first)
+        [attempt] = await state.attempts(first, signal_id)
+        assert attempt.state == AttemptState.REJECTED
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.SUBMITTED and intent.quote_reserved > 0
+
+        restarted = service(state)
+        await restarted.runtime.boot()
+        await restarted.tick()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.NO_FILL
+        assert intent.reason == reason
+        assert intent.quote_reserved == 0
+        assert state.fake.orders_of("BTCUSDT", "BUY") == []
+        await restarted.stop()
+        await restarted.runtime.shutdown()
 
     run(scenario)
 
