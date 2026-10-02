@@ -508,9 +508,17 @@ class TradeClient:
         self,
         *,
         symbol: str,
-        client_order_id: str,
+        client_order_id: str | None = None,
+        order_id: int | None = None,
         priority: Priority = Priority.RECONCILE,
     ) -> TradeResult[GetOrderResponse]:
+        """One order, by our client id or by the exchange's order id."""
+        if (client_order_id is None) == (order_id is None):
+            raise ValueError("pass exactly one of client_order_id and order_id")
+        if order_id is not None:
+            return await self._call(
+                "get_order", priority, symbol=symbol, order_id=order_id
+            )
         return await self._call(
             "get_order", priority, symbol=symbol, orig_client_order_id=client_order_id
         )

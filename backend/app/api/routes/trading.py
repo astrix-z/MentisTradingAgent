@@ -135,6 +135,7 @@ CommandType = Literal[
     "execution_pause",
     "execution_resume",
     "close_position",
+    "release_entry",
 ]
 
 # Commands that describe the running intent and therefore rewrite the runtime
@@ -150,6 +151,8 @@ _SNAPSHOT_COMMANDS: tuple[CommandType, ...] = ("start", "stop")
 # drift from the agent. ``GET /strategies/`` serves that declaration to the UI.
 
 _SYMBOL_RE = re.compile(r"[A-Z0-9]+")
+#: Client id of an entry attempt (agent ``attempts.client_id``, role ``e``).
+_ENTRY_CLIENT_ID_RE = re.compile(r"mta-[0-9a-f]{24}-e[1-9][0-9]{0,5}")
 
 
 def _now() -> datetime:
@@ -992,6 +995,21 @@ async def issue_command(
                 ],
             )
         return await _apply_command("close_position", {"symbol": symbol})
+    if request.type == "release_entry":
+        # The agent proves the order absent itself; this only checks the shape.
+        cid = str(request.payload.get("client_order_id") or "").strip()
+        if _ENTRY_CLIENT_ID_RE.fullmatch(cid) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "loc": ["body", "payload", "client_order_id"],
+                        "msg": "an entry client order id is required",
+                        "type": "value_error",
+                    }
+                ],
+            )
+        return await _apply_command("release_entry", {"client_order_id": cid})
     if request.type in ("execution_pause", "execution_resume"):
         # Entries only; positions, protection and exits are not affected.
         return await _apply_command(request.type, {})

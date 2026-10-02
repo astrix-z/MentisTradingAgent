@@ -49,6 +49,7 @@ from agent.engine import (
     Engine,
 )
 from agent.exchange import ExchangeError
+from agent.execution.orders import ReleaseRefused
 from agent.selection import save_selected, validate_selection
 from agent.strategies import STRATEGIES
 from agent.symbols import (
@@ -386,6 +387,29 @@ async def _close_position(ctx: CommandContext, payload: dict[str, Any]) -> None:
             "step": getattr(getattr(result, "step", None), "value", None),
             "reason": getattr(result, "reason", None),
         },
+    )
+
+
+@command("release_entry")
+async def _release_entry(ctx: CommandContext, payload: dict[str, Any]) -> None:
+    """Release an UNKNOWN entry whose order the agent proves was never placed."""
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    runtime = ctx.engine.execution
+    if not client_order_id:
+        await ctx.report(ok=False, message="client_order_id is required")
+        return
+    if runtime is None or runtime.release_entry is None:
+        await ctx.report(ok=False, message="execution is not available")
+        return
+    try:
+        result = await runtime.release_entry(client_order_id)
+    except ReleaseRefused as exc:
+        await ctx.report(ok=False, message=f"not released: {exc}")
+        return
+    await ctx.engine.publish_heartbeat()  # the reserve and the slot are free
+    await ctx.report(
+        ok=True,
+        data={"client_order_id": client_order_id, "reason": result.reason},
     )
 
 

@@ -15,6 +15,11 @@ the cap price. The answer decides everything:
 
 Nothing is sent without the execution lock and a finished reconcile
 (:meth:`ExecutionRuntime.may_mutate`).
+
+An entry kept UNKNOWN only because some BUY of an order we cannot name filled
+after it (a manual purchase, say) is released by the operator's
+``release_entry`` command — after the agent proves for itself that the
+order is absent (:meth:`OrderManager.release_entry`).
 """
 
 from __future__ import annotations
@@ -33,9 +38,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.exchange.budget import Priority
-from agent.exchange.trade import Outcome, TradeCallError, TradeResult
+from agent.exchange.trade import RECV_WINDOW_MS, Outcome, TradeCallError, TradeResult
 from agent.execution.admission import release_intent
-from agent.execution.attempts import AttemptJournal, Found, Role
+from agent.execution.attempts import (
+    ABSENCE_GRACE,
+    NOT_FOUND_CODES,
+    AttemptJournal,
+    Found,
+    Role,
+)
 from agent.execution.filters import FilterCache
 from agent.execution.ledger import FillRecord, PositionApplier, lock_position
 from agent.execution.models import (
@@ -68,6 +79,10 @@ class EntryOutcome(StrEnum):
     RELEASED = "released"
     UNKNOWN = "unknown"
     DEFERRED = "deferred"  # not sent: no lock yet, try again later
+
+
+class ReleaseRefused(Exception):
+    """``release_entry`` did not release: the order's absence is not proven."""
 
 
 @dataclass(frozen=True)
@@ -505,6 +520,16 @@ class OrderManager:
 
         Any doubt (the history cannot be read) counts as yes.
         """
+        buys = await self._unexplained_buys(intent, attempt)
+        return buys is None or bool(buys)
+
+    async def _unexplained_buys(
+        self, intent: ExecutionIntent, attempt: OrderAttempt
+    ) -> list[Any] | None:
+        """The BUY trades of orders we cannot name since ``attempt``.
+
+        ``None`` when the history cannot be read.
+        """
         trade = self.runtime.trade
         assert trade is not None
         try:
@@ -512,7 +537,7 @@ class OrderManager:
                 await trade.my_trades(symbol=intent.symbol, priority=Priority.RECONCILE)
             ).data
         except TradeCallError:
-            return True
+            return None
         async with self.runtime.session() as session:
             known = set(
                 (
@@ -527,10 +552,109 @@ class OrderManager:
                 ).all()
             )
         since = int(attempt.created_at.timestamp() * 1000) - _TRADE_TIME_SLACK_MS
-        return any(
-            t.is_buyer and t.order_id not in known and (t.time or 0) >= since
+        return [
+            t
             for t in trades
-        )
+            if t.is_buyer and t.order_id not in known and (t.time or 0) >= since
+        ]
+
+    # --- the operator's release ---------------------------------------------------
+
+    async def release_entry(self, client_order_id: str) -> EntryResult:
+        """The ``release_entry`` command: release an entry proven never placed.
+
+        For an open entry attempt of the current context only. The agent
+        proves absence itself, whatever the operator saw: the request is older
+        than ``recvWindow`` plus a margin, the exchange does not know the
+        client id, and every BUY of an order we cannot name since the attempt
+        belongs to an order with someone else's client id. Any doubt raises
+        :class:`ReleaseRefused` and changes nothing.
+        """
+        runtime = self.runtime
+        context = runtime.context
+        if context is None or runtime.trade is None or not runtime.may_mutate():
+            raise ReleaseRefused("no execution lock")
+        async with runtime.session() as session:
+            attempt = await session.get(OrderAttempt, client_order_id)
+        if (
+            attempt is None
+            or attempt.role != Role.ENTRY.value
+            or (attempt.account, attempt.network) != (context.account, context.network)
+        ):
+            raise ReleaseRefused(f"no entry attempt {client_order_id} here")
+        signal_id = attempt.signal_id
+        async with self.lock_for(signal_id):
+            async with runtime.session() as session:
+                attempt = await session.get(OrderAttempt, client_order_id)
+                intent = await session.get(ExecutionIntent, signal_id)
+            assert attempt is not None and intent is not None
+            if attempt.state not in (
+                AttemptState.PREPARED,
+                AttemptState.SENT,
+                AttemptState.UNKNOWN,
+            ) or intent.state not in (IntentState.SUBMITTED, IntentState.UNKNOWN):
+                raise ReleaseRefused(
+                    f"attempt {attempt.state}, intent {intent.state}: nothing to release"
+                )
+            await self._prove_absent(intent, attempt)
+            await self.journal.resolve(client_order_id, AttemptState.RESOLVED)
+            await self._release(intent.signal_id, "released_by_operator")
+        alert = runtime.alerts.get("unknown")
+        if alert is not None and client_order_id in alert:
+            del runtime.alerts["unknown"]
+        logger.warning("ENTRY %s released by the operator", client_order_id)
+        return EntryResult(EntryOutcome.RELEASED, "released_by_operator")
+
+    async def _prove_absent(
+        self, intent: ExecutionIntent, attempt: OrderAttempt
+    ) -> None:
+        """Raise :class:`ReleaseRefused` unless ``attempt``'s order is proven absent."""
+        trade = self.runtime.trade
+        assert trade is not None
+        cid = attempt.client_order_id
+        window = timedelta(milliseconds=RECV_WINDOW_MS) + ABSENCE_GRACE
+        wait = attempt.created_at + window - self.clock()
+        if wait > timedelta(0):
+            raise ReleaseRefused(
+                f"too recent; retry in {int(wait.total_seconds()) + 1}s"
+            )
+        try:
+            order = (
+                await trade.get_order(
+                    symbol=intent.symbol,
+                    client_order_id=cid,
+                    priority=Priority.RECONCILE,
+                )
+            ).data
+        except TradeCallError as error:
+            if error.exchange_code not in NOT_FOUND_CODES:
+                raise ReleaseRefused(f"cannot query {cid}: {error.message}") from error
+        else:
+            raise ReleaseRefused(
+                f"{cid} is on the exchange ({getattr(order, 'status', None)}); "
+                "the agent settles it"
+            )
+        buys = await self._unexplained_buys(intent, attempt)
+        if buys is None:
+            raise ReleaseRefused(f"cannot read {intent.symbol} trades")
+        for order_id in sorted({t.order_id for t in buys}):
+            try:
+                other = (
+                    await trade.get_order(
+                        symbol=intent.symbol,
+                        order_id=order_id,
+                        priority=Priority.RECONCILE,
+                    )
+                ).data
+            except TradeCallError as error:
+                raise ReleaseRefused(
+                    f"cannot identify order {order_id}: {error.message}"
+                ) from error
+            owner = str(getattr(other, "client_order_id", None) or "")
+            if not owner or owner == cid or owner.startswith("mta-"):
+                raise ReleaseRefused(
+                    f"BUY order {order_id} ({owner or 'no client id'}) may be ours"
+                )
 
     def _escalate(self, attempt: OrderAttempt) -> None:
         age = self.clock() - attempt.created_at
@@ -555,4 +679,4 @@ def _context(runtime: ExecutionRuntime) -> Any:
     return runtime.context
 
 
-__all__ = ["EntryOutcome", "EntryResult", "OrderManager"]
+__all__ = ["EntryOutcome", "EntryResult", "OrderManager", "ReleaseRefused"]

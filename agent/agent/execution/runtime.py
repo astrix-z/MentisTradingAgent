@@ -135,6 +135,8 @@ class ExecutionRuntime:
         self._admission_wake: Callable[[], None] | None = None
         #: Sells a symbol's open position at market (``close_position``).
         self.close_position: Callable[[str], Awaitable[Any]] | None = None
+        #: Releases an entry proven never placed (``release_entry``).
+        self.release_entry: Callable[[str], Awaitable[Any]] | None = None
 
     # --- wiring ------------------------------------------------------------
 

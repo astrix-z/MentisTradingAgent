@@ -144,6 +144,7 @@ class ExecutionService:
 
         runtime.on_leadership(self._startup_reconcile)
         runtime.close_position = self.exits.close_symbol
+        runtime.release_entry = self.orders.release_entry
         admission.on_reserved = self._on_reserved
         runtime.on_watch(self._check_deadlines)
         self.orders.on_filled = self._on_filled

@@ -769,7 +769,10 @@ class FakeExchange:
     def get_order(self, **kwargs: Any) -> ApiResponse[GetOrderResponse]:
         with self._lock:
             self._before("get_order", kwargs)
-            order = self._by_client_id(kwargs.get("orig_client_order_id"))
+            if kwargs.get("order_id") is not None:
+                order = self.orders.get(kwargs["order_id"])
+            else:
+                order = self._by_client_id(kwargs.get("orig_client_order_id"))
             if order is None or self._hidden_query("get_order"):
                 raise BadRequestError("Order does not exist.", UNKNOWN_ORDER)
             payload = order.document()

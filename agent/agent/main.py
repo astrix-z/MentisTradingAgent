@@ -173,6 +173,7 @@ _INDEPENDENT_COMMANDS = (
     "execution_pause",
     "execution_resume",
     "close_position",
+    "release_entry",
 )
 
 

@@ -556,7 +556,8 @@ intent → **quarantine** (не трогаем, divergence). Также посл
 
 ### 9.4 Ручные команды
 `execution_pause` / `execution_resume` (только входы), `close_position {symbol}`
-(через §6.7, `reason=manual`). Обычные `@command` в `agent/agent/common/commands.py`,
+(через §6.7, `reason=manual`), `release_entry {client_order_id}` — освободить
+UNKNOWN-вход, отсутствие ордера которого агент доказал сам (runbook §1). Обычные `@command` в `agent/agent/common/commands.py`,
 вне очереди start/stop.
 
 ### 9.5 Ключ (Q7)

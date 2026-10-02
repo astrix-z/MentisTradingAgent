@@ -1373,6 +1373,28 @@ def test_close_position_needs_a_valid_symbol(
     assert trading.REDIS_RUNTIME_KEY not in redis.values
 
 
+def test_release_entry_needs_an_entry_client_id(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    for cid in ("", "web_manual_1", "mta-0123456789abcdef01234567-pl1"):
+        refused = client.post(
+            "/api/v1/trading/commands/",
+            json={"type": "release_entry", "payload": {"client_order_id": cid}},
+            headers=headers(client),
+        )
+        assert refused.status_code == 422, cid
+    assert not redis.publications
+    cid = "mta-0123456789abcdef01234567-e1"
+    accepted = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": "release_entry", "payload": {"client_order_id": f" {cid} "}},
+        headers=headers(client),
+    )
+    assert accepted.status_code == 202
+    assert redis.publications[0][1]["payload"] == {"client_order_id": cid}
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
 # --- Start fence (plan §4.6 G4, PRESET-09a) -----------------------------------
 
 
