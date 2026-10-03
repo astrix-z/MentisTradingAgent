@@ -112,7 +112,14 @@ class StreamHub:
             if not owners:
                 new.append((key[0], interval, self._kline_fanout(key)))
             owners[view] = callback
-        await self._streams.subscribe_klines_batch(new)
+        try:
+            await self._streams.subscribe_klines_batch(new)
+        except BaseException:
+            # Not subscribed: forget the owners this call added for streams
+            # that did not exist, so the next call subscribes them again.
+            for symbol, interval, _ in new:
+                self._drop_owner(self._klines, (symbol, interval), view)
+            raise
 
     async def _unsubscribe_klines(
         self, view: StreamView, pairs: Sequence[tuple[str, str]]
@@ -140,7 +147,22 @@ class StreamHub:
             if not owners:
                 new.append((key, self._trade_fanout(key)))
             owners[view] = callback
-        await self._streams.subscribe_trades_batch(new)
+        try:
+            await self._streams.subscribe_trades_batch(new)
+        except BaseException:
+            for symbol, _ in new:
+                self._drop_owner(self._trades, symbol, view)
+            raise
+
+    @staticmethod
+    def _drop_owner(
+        table: dict[Any, dict[StreamView, Any]], key: Any, view: StreamView
+    ) -> None:
+        owners = table.get(key)
+        if owners is not None:
+            owners.pop(view, None)
+            if not owners:
+                del table[key]
 
     async def _unsubscribe_trades(
         self, view: StreamView, symbols: Sequence[str]

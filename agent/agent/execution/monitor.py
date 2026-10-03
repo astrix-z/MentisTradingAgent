@@ -49,6 +49,8 @@ _KEEP_BARS = 200
 #: Retry of a failed backfill: doubling from the first delay, up to the cap.
 BACKFILL_RETRY_FIRST = timedelta(seconds=5)
 BACKFILL_RETRY_MAX = timedelta(minutes=5)
+#: Enough doublings of the first delay to pass the maximum.
+_MAX_DOUBLINGS = 16
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,10 @@ class MonitorFeed:
         self._stale_after = stale_after
         self._view: StreamView | None = None
         self._followed: dict[uuid.UUID, Followed] = {}
+        #: What the view is subscribed to — recorded only after a subscribe
+        #: succeeded, so a failed one is tried again by the next follow().
+        self._klines_on: set[tuple[str, str]] = set()
+        self._trades_on: set[str] = set()
         self._bars: dict[tuple[str, str], dict[int, Bar]] = {}
         self._ready: set[tuple[str, str]] = set()
         self._trades: dict[str, LastTrade] = {}
@@ -127,33 +133,35 @@ class MonitorFeed:
             await self._view.start()
             self._view.on_reconnect(self._reconnected)
         wanted = {p.position_id: p for p in positions}
-        before = {(p.symbol, p.interval) for p in self._followed.values()}
         after = {(p.symbol, p.interval) for p in wanted.values()}
-        before_symbols = {p.symbol for p in self._followed.values()}
         after_symbols = {p.symbol for p in wanted.values()}
         self._followed = wanted
         if self._view is None:
             return
-        added = sorted(after - before)
-        removed = sorted(before - after)
+        added = sorted(after - self._klines_on)
+        removed = sorted(self._klines_on - after)
         if added:
             await self._view.subscribe_klines_batch(
                 [(s, i, self._kline_callback(s, i)) for s, i in added]
             )
-        new_symbols = sorted(after_symbols - before_symbols)
+            self._klines_on.update(added)
+        new_symbols = sorted(after_symbols - self._trades_on)
         if new_symbols:
             await self._view.subscribe_trades_batch(
                 [(s, self._trade_callback(s)) for s in new_symbols]
             )
+            self._trades_on.update(new_symbols)
         if removed:
             await self._view.unsubscribe_klines_batch(removed)
+            self._klines_on.difference_update(removed)
             for key in removed:
                 self._bars.pop(key, None)
                 self._ready.discard(key)
                 self._retry.pop(key, None)
-        gone = sorted(before_symbols - after_symbols)
+        gone = sorted(self._trades_on - after_symbols)
         if gone:
             await self._view.unsubscribe_trades_batch(gone)
+            self._trades_on.difference_update(gone)
             for symbol in gone:
                 self._trades.pop(symbol, None)
         for key in added:
@@ -161,7 +169,7 @@ class MonitorFeed:
         # A subscription whose backfill failed stays not ready; every round
         # retries it once its backoff has passed.
         now = self._clock()
-        for key in sorted(after - set(added) - self._ready):
+        for key in sorted((after & self._klines_on) - set(added) - self._ready):
             failures = self._retry.get(key)
             if failures is None or now >= failures[1]:
                 self._schedule_backfill(key)
@@ -173,6 +181,8 @@ class MonitorFeed:
             task.cancel()
         self._backfills.clear()
         view, self._view = self._view, None
+        self._klines_on.clear()
+        self._trades_on.clear()
         if view is not None:
             await view.stop()
 
@@ -292,7 +302,10 @@ class MonitorFeed:
             rows = await self._load(symbol, interval, start, 1000)
         except Exception as exc:  # noqa: BLE001 - retried by follow() after a backoff
             count = self._retry[key][0] + 1 if key in self._retry else 1
-            delay = min(BACKFILL_RETRY_FIRST * 2 ** (count - 1), BACKFILL_RETRY_MAX)
+            # The exponent is capped before the timedelta is built: an
+            # outage of hours must not overflow it.
+            doublings = min(count - 1, _MAX_DOUBLINGS)
+            delay = min(BACKFILL_RETRY_FIRST * 2**doublings, BACKFILL_RETRY_MAX)
             self._retry[key] = (count, self._clock() + delay)
             logger.warning(
                 "backfill %s %s failed (%s), retry in %ss: %s",

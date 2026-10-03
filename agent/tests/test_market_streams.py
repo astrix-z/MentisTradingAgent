@@ -20,10 +20,11 @@ STREAM_MAP = global_stream_connections.stream_connections_map
 
 
 class FakeSdk:
-    def __init__(self, *, failed_connects: int = 0) -> None:
+    def __init__(self, *, failed_connects: int = 0, failed_subscribes: int = 0) -> None:
         self.connections: list[Any] = []
         self.reconnect_tasks: list[str] = []
         self.failed_connects = failed_connects
+        self.failed_subscribes = failed_subscribes
         self.close_listeners: list[Callable[[], None]] = []
         self.subscribe_messages: list[list[str]] = []
         self.unsubscribe_messages: list[list[str]] = []
@@ -43,6 +44,9 @@ class FakeSdk:
     async def subscribe(self, streams: list[str], response_model: Any = None) -> None:
         if not self.connections:
             raise ValueError("No WebSocket connections available.")
+        if self.failed_subscribes:
+            self.failed_subscribes -= 1
+            raise ConnectionError("subscribe failed")
         streams = [s for s in streams if s not in STREAM_MAP]
         self.subscribe_messages.append(streams)
         for stream in streams:

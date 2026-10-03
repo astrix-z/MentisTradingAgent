@@ -295,6 +295,57 @@ def test_failed_backfill_is_retried_with_backoff_until_it_recovers() -> None:
     asyncio.run(scenario())
 
 
+def test_a_failed_subscribe_is_tried_again_by_the_next_follow() -> None:
+    # Review 2026-10-03: the hub recorded the owner before the subscribe and
+    # the feed its followed set, so after one failure nothing re-subscribed
+    # and the backfill made the symbol "ready" with no stream at all.
+    async def scenario() -> None:
+        sdks = Sdks()
+        hub = StreamHub(factory=sdks.factory)
+        t2, t1 = times(2, 1)
+        feed = feed_for(hub, Loader({t2: "98", t1: "99"}))
+        followed = [Followed(uuid.uuid4(), "BTCUSDT", "15m", 2, t2)]
+        await feed.follow("live", [])  # nothing yet
+        feed._view = await hub.attach("live", "monitor")
+        await feed._view.start()
+        sdks.by_network["live"].failed_subscribes = 1
+        with pytest.raises(ConnectionError):
+            await feed.follow("live", followed)
+        await asyncio.gather(*feed._backfills.values())
+        assert hub._klines == {}  # the hub forgot the failed owner
+        assert not feed.ready("BTCUSDT", "15m")
+        await feed.follow("live", followed)  # recovered
+        await asyncio.gather(*feed._backfills.values())
+        sdk = sdks.by_network["live"]
+        assert sdk.callbacks.get("btcusdt@kline_15m")
+        assert sdk.callbacks.get("btcusdt@trade")
+        assert feed.ready("BTCUSDT", "15m")
+        await feed.close()
+
+    asyncio.run(scenario())
+
+
+def test_backoff_after_many_failures_stays_at_its_cap() -> None:
+    # Review 2026-10-03: 5 s × 2**44 overflowed timedelta on the 45th failure.
+    async def scenario() -> None:
+        sdks = Sdks()
+        hub = StreamHub(factory=sdks.factory)
+        loader = FlakyLoader({}, failures=10_000)
+        clock = [NOW]
+        feed = MonitorFeed(hub, loader, clock=lambda: clock[0])
+        followed = [Followed(uuid.uuid4(), "BTCUSDT", "15m", 2, None)]
+        for _ in range(60):
+            clock[0] += timedelta(minutes=5, seconds=1)
+            await feed.follow("live", followed)
+            await asyncio.gather(*feed._backfills.values())
+        count, retry_at = feed._retry[("BTCUSDT", "15m")]
+        assert count == 60
+        assert retry_at - clock[0] == timedelta(minutes=5)
+        await feed.close()
+
+    asyncio.run(scenario())
+
+
 def test_trades_give_the_guard_its_price_and_silence_is_degraded() -> None:
     async def scenario() -> None:
         sdks = Sdks()
