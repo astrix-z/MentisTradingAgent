@@ -239,7 +239,13 @@ class Engine:
                 finally:
                     self._startup = None
             finally:
-                self._startup_feedback = None
+                try:
+                    # Refused before the running strategy was torn down (the
+                    # execution preflight, the snapshot): what changed in the
+                    # meantime is still that strategy's to hear.
+                    await self._replay_to_running()
+                finally:
+                    self._startup_feedback = None
             if self.execution is not None:
                 self.execution.open_admission(strategy)
 
@@ -342,6 +348,19 @@ class Engine:
         while buffered:  # may grow while a delivery awaits
             event, closed = buffered.pop(0)
             await self._deliver(strategy, event, closed)
+
+    async def _replay_to_running(self) -> None:
+        """Deliver what a failed start buffered to the run it left in place.
+
+        The buffer stays on while it drains, so a change arriving meanwhile
+        queues behind the earlier ones instead of overtaking them. After a
+        successful start the buffer is already gone; after a start that tore
+        the old run down nothing is running, and nothing is delivered.
+        """
+        strategy = self._strategy
+        if strategy is None or self._state != "running":
+            return
+        await self._replay_startup_feedback(strategy)
 
     @staticmethod
     async def _deliver(strategy: Strategy, event: PositionEvent, closed: bool) -> None:

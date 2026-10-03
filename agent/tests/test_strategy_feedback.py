@@ -289,3 +289,47 @@ def test_a_failed_start_drops_its_buffer(monkeypatch: pytest.MonkeyPatch) -> Non
         await engine.shutdown()
 
     asyncio.run(scenario())
+
+
+def test_a_refused_start_delivers_its_buffer_to_the_run_still_going(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review 2026-10-03: BTC closed during prepare_start of a new Start that
+    # was then refused (credentials, account); the old strategy kept running
+    # but its close was buffered and dropped.
+    async def scenario() -> None:
+        engine, _redis, strategy, _streams = setup_engine(monkeypatch)
+        closed: list[str] = []
+
+        async def on_closed(e: PositionEvent) -> None:
+            closed.append(e.symbol)
+
+        strategy.on_position_closed = AsyncMock(side_effect=on_closed)
+        runtime = AsyncMock()
+        runtime.positions_snapshot = AsyncMock(return_value=PositionsSnapshot())
+        runtime.open_admission = lambda name: None
+        runtime.close_admission = lambda: None
+        runtime.heartbeat = lambda: {}
+        runtime.message = lambda: None
+        engine.execution = runtime
+        await start(engine)
+        assert engine._state == "running"
+        at = datetime.now(UTC)
+
+        async def refused(**kwargs: Any) -> None:
+            await engine.position_feedback(
+                event("BTCUSDT", at=at, cooldown_until=at + timedelta(hours=1)), True
+            )
+            raise ValueError("credentials belong to another account")
+
+        runtime.prepare_start = AsyncMock(side_effect=refused)
+        with pytest.raises(ValueError):
+            await start(engine)
+        assert engine._state == "running" and engine._strategy is strategy
+        assert closed == ["BTCUSDT"]  # delivered once, to the run still going
+        assert engine._startup_feedback is None
+        await engine.position_feedback(event("ETHUSDT", at=at), True)
+        assert closed == ["BTCUSDT", "ETHUSDT"]  # and directly afterwards
+        await engine.shutdown()
+
+    asyncio.run(scenario())
