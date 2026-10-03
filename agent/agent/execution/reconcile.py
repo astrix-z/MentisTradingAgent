@@ -273,9 +273,25 @@ class Reconciler:
         # moot), so the old legs stay an obligation: nothing — no new OCO, no
         # sale — is sized from the remainder until both legs are terminal and
         # every fill of theirs is booked, and a restart resumes from there.
+        #
+        # The read above ran without the position's lock: a worker may have
+        # replaced the list since (a reprice), and the finished list is then
+        # the old one it already cancelled and proved. What is adopted is
+        # decided again under the lock, from the current row.
         list_id = position.protection_list_id
-        stop = position.desired_stop or position.exchange_stop
         async with self.worker.orders.lock_for(position.id):
+            current = await self.worker.protector._position(position.id)
+            if (
+                current.operation is not None
+                or current.status != PositionStatus.PROTECTED
+                or current.protection_list_id != list_id
+            ):
+                logger.info(
+                    "%s changed while its list was read; next round decides",
+                    position.symbol,
+                )
+                return
+            stop = current.desired_stop or current.exchange_stop
             await self.worker.adopt_finished_list(position.id, list_id, stop)
             proven = await self.worker.barrier(position.id, list_id)
         if proven is not None and proven.step is Step.CLOSED:

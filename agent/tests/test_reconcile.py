@@ -11,7 +11,7 @@ import pytest
 from execution_world import CONTEXT, Stack, World, run
 from sqlalchemy import func, select
 
-from agent.exchange.budget import RequestBudget
+from agent.exchange.budget import Priority, RequestBudget
 from agent.exchange.trade import TradeClient
 from agent.execution.admission import record_signal
 from agent.execution.ledger import FillRecord, lock_position
@@ -308,5 +308,48 @@ def test_finished_list_with_hidden_leg_fills_blocks_the_replacement() -> None:
         assert position.quantity == before - Decimal("0.1")
         [live] = [ol for ol in state.fake.lists.values() if ol.status == "EXECUTING"]
         assert live.orders[0].quantity == position.quantity
+
+    run(scenario)
+
+
+def test_a_finished_list_read_before_a_reprice_is_not_adopted_after_it() -> None:
+    # Review 2026-10-03: the reconciler read pl1 (ALL_DONE after the worker
+    # cancelled it), the worker meanwhile installed pl2 at stop 99.5; the old
+    # answer then made pl1 a reprice to stop 98 and the next resume dropped
+    # the association with the live pl2.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        trade = stack.runtime.trade
+        assert trade is not None
+        real = trade.get_order_list
+        reading, repriced = asyncio.Event(), asyncio.Event()
+
+        async def delayed(**kwargs: Any) -> Any:
+            if kwargs.get("priority") is not Priority.RECONCILE:
+                return await real(**kwargs)
+            reading.set()
+            await repriced.wait()
+            return await real(**kwargs)  # pl1, cancelled by the reprice
+
+        trade.get_order_list = delayed  # type: ignore[method-assign]
+
+        async def reprice() -> None:
+            await reading.wait()
+            result = await stack.worker.reprice(position_id, Decimal("99.5"))
+            assert result.step.value == "protected"
+            repriced.set()
+
+        await asyncio.gather(reconciler(stack).run(), reprice())
+        position = await state.position(stack, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        assert position.operation is None
+        assert position.protection_list_id is not None
+        assert position.protection_list_id.endswith("-pl2")
+        assert position.exchange_stop == Decimal("99.5")
+        live = [ol for ol in state.fake.lists.values() if ol.status == "EXECUTING"]
+        assert [ol.list_client_order_id for ol in live] == [position.protection_list_id]
+        await reconciler(stack).run()  # a later round leaves it alone
+        assert (await state.position(stack, position_id)).operation is None
 
     run(scenario)
