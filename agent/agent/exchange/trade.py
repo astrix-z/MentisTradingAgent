@@ -329,15 +329,22 @@ class TradeClient:
         max_wait: float | None = None,
         weight: int | None = None,
         signed: bool = True,
+        before_send: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> TradeResult[T]:
-        """Spend budget, run one signed SDK method in a thread, classify."""
+        """Spend budget, run one signed SDK method in a thread, classify.
+
+        ``before_send`` runs after the budget wait, right before the request
+        leaves; whatever it raises aborts the call with nothing sent.
+        """
         try:
             await self.budget.acquire(
                 priority, weight or weight_of(name), max_wait=max_wait
             )
         except BudgetExhausted as exc:
             raise classify(exc) from exc
+        if before_send is not None:
+            before_send()
         method: Callable[..., ApiResponse[T]] = getattr(self._client.rest_api, name)
         if signed:
             kwargs["recv_window"] = RECV_WINDOW_MS
@@ -396,13 +403,18 @@ class TradeClient:
         client_order_id: str,
         priority: Priority,
         max_wait: float | None = None,
+        before_send: Callable[[], None] | None = None,
     ) -> TradeResult[NewOrderResponse]:
-        """Place an order; the response carries fills (``FULL``)."""
+        """Place an order; the response carries fills (``FULL``).
+
+        ``before_send`` is the caller's last check, after the budget wait.
+        """
         _check_client_id(client_order_id)
         return await self._call(
             "new_order",
             priority,
             max_wait=max_wait,
+            before_send=before_send,
             symbol=symbol,
             side=NewOrderSideEnum(side),
             type=NewOrderTypeEnum(order_type),

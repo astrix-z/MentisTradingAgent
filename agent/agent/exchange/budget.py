@@ -113,14 +113,18 @@ class RequestBudget:
         """Wait until ``weight`` fits under ``priority``'s ceiling, then spend it.
 
         ``max_wait=None`` waits as long as needed; a number bounds the wait and
-        raises :class:`BudgetExhausted` past it. A ban always fails at once.
+        raises :class:`BudgetExhausted` past it — also when a sleep woke up
+        late and capacity is there by then: the bound is a deadline, not a
+        number of polls. A ban always fails at once.
         """
         started = self._clock()
+        waited = False
         while True:
             now = self._clock()
             if now < self.banned_until:
                 raise BudgetExhausted("IP banned by the exchange (418)", banned=True)
-            if now >= self.paused_until and self._fits(priority, weight):
+            late = waited and max_wait is not None and now - started >= max_wait
+            if not late and now >= self.paused_until and self._fits(priority, weight):
                 with self._lock:
                     self._spent.append((now, weight))
                 return
@@ -128,6 +132,7 @@ class RequestBudget:
                 reason = "paused after 429" if now < self.paused_until else "budget"
                 raise BudgetExhausted(f"request weight not available ({reason})")
             await self._sleep(_POLL_SECONDS)
+            waited = True
 
     def _fits(self, priority: Priority, weight: int) -> bool:
         return self.used() + weight <= self.limit * _CEILING[priority]

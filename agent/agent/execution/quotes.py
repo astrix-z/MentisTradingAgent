@@ -109,6 +109,27 @@ class QuoteSnapshot:
         if now - self.last_trade.time > max_trade_age:
             raise ReferenceUnverified("last trade is stale")
 
+    def usable_until(
+        self,
+        *,
+        max_fetch_age: timedelta = DEFAULT_MAX_FETCH_AGE,
+        max_trade_age: timedelta = DEFAULT_MAX_TRADE_AGE,
+    ) -> datetime:
+        """The moment after which :meth:`check_fresh` and the reference
+        checks of :meth:`reference_for` no longer hold for this snapshot.
+
+        Every age limit counts — the fetch and the market data it carries —
+        so a send gated by this moment is gated by all of them.
+        """
+        until = self.fetched_at + max_fetch_age
+        if self.last_trade is not None:
+            until = min(until, self.last_trade.time + max_trade_age)
+        if self.reference is not None:
+            until = min(until, self.reference.timestamp + max_trade_age)
+            if self.reference.price is None and self.avg is not None:
+                until = min(until, self.avg.close_time + max_trade_age)
+        return until
+
     def last_price(self) -> Decimal:
         if self.last_trade is None:
             raise ReferenceUnverified("no last trade")

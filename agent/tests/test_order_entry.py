@@ -9,9 +9,11 @@ from typing import Any
 
 from execution_world import CONTEXT, World, run
 
+from agent.exchange.budget import RequestBudget
 from agent.execution.admission import record_signal
 from agent.execution.models import AttemptState, IntentState, PositionStatus
 from agent.execution.orders import EntryOutcome
+from agent.execution.quotes import QuoteProvider, QuoteSnapshot
 
 
 def test_filled_entry_opens_a_proven_position_and_pays_off_the_reserve() -> None:
@@ -190,13 +192,13 @@ def test_cancelled_wait_keeps_the_entry_unknown() -> None:
 # --- review 2026-09-30 (EXEC-06/EXEC-14): time read after awaited work ------------
 
 
-class _Slow:
+class _Slow(QuoteProvider):
     """A quote provider whose fetch lets ``seconds`` pass on the clock."""
 
-    def __init__(self, inner: Any, state: World, seconds: float) -> None:
+    def __init__(self, inner: QuoteProvider, state: World, seconds: float) -> None:
         self.inner, self.state, self.seconds = inner, state, seconds
 
-    async def snapshot(self, symbol: str) -> Any:
+    async def snapshot(self, symbol: str) -> QuoteSnapshot:
         quote = await self.inner.snapshot(symbol)
         self.state.clock.advance(self.seconds)
         return quote
@@ -297,5 +299,78 @@ def test_the_quote_and_its_spread_are_persisted_for_the_audit() -> None:
             Decimal("100.1"),
         )
         assert Decimal(sent["spread_pct"]) == Decimal("0.2")
+
+    run(scenario)
+
+
+# --- review 2026-10-03 (EXEC-02/06/14): the send deadline is a hard one ------------
+
+
+def test_late_budget_wake_up_does_not_carry_the_buy_past_valid_until() -> None:
+    # The budget sleeps past the signal's validity and wakes up with capacity:
+    # the BUY must not leave (the reviewer's repro sent it 3.17 s late).
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack, valid_for=timedelta(seconds=2))
+        trade = stack.runtime.trade
+        assert trade is not None
+        ticks = [0.0]
+
+        async def late_sleep(seconds: float) -> None:
+            ticks[0] += 3
+            state.clock.advance(3)
+
+        budget = RequestBudget(clock=lambda: ticks[0], sleep=late_sleep)
+        budget.on_rate_limited(1)  # the ENTRY has to wait for the budget
+        trade.budget = budget
+        result = await stack.orders.execute_entry(signal_id)
+        assert result.outcome is EntryOutcome.RELEASED
+        assert state.fake.orders == {}
+        intent = await state.intent(stack, signal_id)
+        assert intent.state == IntentState.NO_FILL and intent.quote_reserved == 0
+
+    run(scenario)
+
+
+def test_deadline_is_checked_after_the_budget_wait_right_before_the_send() -> None:
+    # Even when the budget admits in time, the clock may pass the deadline
+    # during the wait; the last check runs after it.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack, valid_for=timedelta(seconds=2))
+        trade = stack.runtime.trade
+        assert trade is not None
+        acquire = trade.budget.acquire
+
+        async def slow_acquire(*args: Any, **kwargs: Any) -> None:
+            await acquire(*args, **kwargs)
+            state.clock.advance(3)
+
+        trade.budget.acquire = slow_acquire  # type: ignore[method-assign]
+        result = await stack.orders.execute_entry(signal_id)
+        assert (result.outcome, result.reason) == (EntryOutcome.RELEASED, "expired")
+        assert state.fake.orders == {}
+
+    run(scenario)
+
+
+def test_last_trade_going_stale_after_presubmit_is_not_bought() -> None:
+    # The fetch and the signal are fresh, but the market data the quote
+    # carries crosses quote_max_trade_age_s (60) while the attempt is journaled.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack)
+        state.fake.last_time["BTCUSDT"] = state.clock.ms() - 59_000
+        journal = stack.orders.journal
+        mark = journal._mark
+
+        async def slow_mark(attempt_id: str, *, sent: bool) -> None:
+            await mark(attempt_id, sent=sent)
+            state.clock.advance(2)
+
+        journal._mark = slow_mark  # type: ignore[method-assign]
+        result = await stack.orders.execute_entry(signal_id)
+        assert (result.outcome, result.reason) == (EntryOutcome.RELEASED, "expired")
+        assert state.fake.orders == {}
 
     run(scenario)

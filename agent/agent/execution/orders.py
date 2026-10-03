@@ -169,15 +169,19 @@ class OrderManager:
             cid = attempt.client_order_id
         trade = runtime.trade
 
-        async def place() -> TradeResult[Any]:
-            # Last look at the clock: the journal writes above took time, and
-            # the budget may make the request wait; neither may carry the BUY
-            # past the signal's validity or the quote's freshness.
-            left = (deadline - self.clock()).total_seconds()
-            if left <= 0:
+        def in_time() -> None:
+            if self.clock() >= deadline:
                 raise TradeCallError(
                     Outcome.REJECTED, "expired before send", error_type=_EXPIRED
                 )
+
+        async def place() -> TradeResult[Any]:
+            # Last looks at the clock: the journal writes above took time, and
+            # the budget may make the request wait; neither may carry the BUY
+            # past the signal's validity or any freshness limit of the quote.
+            # The second look is after the budget wait, right before the send.
+            in_time()
+            left = (deadline - self.clock()).total_seconds()
             return await trade.new_order(
                 symbol=intent.symbol,
                 side="BUY",
@@ -188,6 +192,7 @@ class OrderManager:
                 client_order_id=cid,
                 priority=Priority.ENTRY,
                 max_wait=left,
+                before_send=in_time,
             )
 
         try:
@@ -212,9 +217,10 @@ class OrderManager:
         """The checks right before the BUY (plan §6.1).
 
         Returns a reason to release (or ``None``), the moment after which the
-        BUY must not be sent — the signal's ``valid_until`` or the quote's
-        freshness limit, whichever is first — and the quote checked. Time is
-        read after the awaited reads, never before them.
+        BUY must not be sent — the signal's ``valid_until`` or the first of the
+        quote's freshness limits (its fetch and the last trade/reference it
+        carries) — and the quote checked. Time is read after the awaited reads,
+        never before them.
         """
         runtime = self.runtime
         settings = runtime.settings
@@ -253,7 +259,10 @@ class OrderManager:
         )
         if problems:
             return f"{problems[0].reason.value}: {problems[0].detail}", now, quote
-        deadline = quote.fetched_at + max_fetch_age
+        deadline = quote.usable_until(
+            max_fetch_age=max_fetch_age,
+            max_trade_age=timedelta(seconds=settings.quote_max_trade_age_s),
+        )
         if signal.valid_until is not None:
             deadline = min(deadline, signal.valid_until)
         return None, deadline, quote

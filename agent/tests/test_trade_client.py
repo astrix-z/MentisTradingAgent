@@ -642,3 +642,51 @@ def test_feedback_lands_even_when_the_waiter_was_cancelled(
 
     run(scenario)
     assert check(budget)
+
+
+# --- review 2026-10-03 (EXEC-02): max_wait is a deadline -------------------------
+
+
+def test_a_late_wake_up_past_max_wait_is_refused_even_with_capacity() -> None:
+    clock = FakeClock()
+
+    async def late_sleep(seconds: float) -> None:
+        clock.now += 3  # the event loop woke us up well past the poll
+
+    budget = RequestBudget(clock=clock, sleep=late_sleep)
+    budget.on_rate_limited(1)  # capacity is back after one second
+    with pytest.raises(BudgetExhausted):
+        run(lambda: budget.acquire(Priority.ENTRY, 1, max_wait=2))
+    assert budget.used() == 0
+    run(lambda: budget.acquire(Priority.ENTRY, 1))  # unbounded still waits
+    assert budget.used() == 1
+
+
+def test_before_send_runs_after_the_budget_and_aborts_with_nothing_sent() -> None:
+    clock = FakeClock()
+    budget = RequestBudget(clock=clock, sleep=clock.sleep)
+    budget.on_rate_limited(1)
+    transport = Transport(_response(200, ORDER))
+    client = make_client(transport, budget)
+    seen: list[float] = []
+
+    def too_late() -> None:
+        seen.append(clock.now)
+        raise TradeCallError(Outcome.REJECTED, "expired before send")
+
+    with pytest.raises(TradeCallError):
+        run(
+            lambda: client.new_order(
+                symbol="BTCUSDT",
+                side="BUY",
+                order_type="LIMIT",
+                quantity=Decimal(1),
+                price=Decimal(1),
+                time_in_force="FOK",
+                client_order_id="late",
+                priority=Priority.ENTRY,
+                before_send=too_late,
+            )
+        )
+    assert seen and seen[0] >= 1001  # after the budget wait
+    assert transport.calls == []
