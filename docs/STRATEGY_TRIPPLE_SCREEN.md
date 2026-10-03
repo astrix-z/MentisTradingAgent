@@ -27,7 +27,7 @@ strategies/tripple_screen/strategy.py`, метод `_screen_universe`) была
 Правила выхода уточнены при планировании реального исполнения
 (`docs/ORDER_EXECUTION_PLAN.md`, Q12):
 
-- **Потолок трейлинга:** stop поднимается не выше `fill × (1 + trail_cap_pct)`,
+- **Потолок трейлинга:** stop поднимается не выше `fill × (1 + trail_cap_pct / 100)`,
   default 4% (§7.2).
 - **Выход по времени:** позиция, открытая дольше `max_hold_hours` (default 8 ч)
   от entry fill, закрывается по рынку, `exit_reason = time` (§7.5).
@@ -329,7 +329,7 @@ stop_price = min(swing_low_ref, fill_price × 0.99)
 - Включается сразу после fill.
 - На каждом закрытии M15: `trail_candidate = min(low(M15)[i], i = 1..N) × 0.999`,
   `N = trail_ripple_n` (конфиг, default 2), буфер 0.1%.
-- Ratchet: `new_stop = min(max(current_stop, trail_candidate), fill_price × (1 + trail_cap_pct))`
+- Ratchet: `new_stop = min(max(current_stop, trail_candidate), fill_price × (1 + trail_cap_pct / 100))`
   — перенос **только вверх** (уменьшение убытка / рост защищённой прибыли),
   но не выше потолка `fill × 1.04` (`trail_cap_pct`, default 4%). Достигнув
   потолка, stop больше не переставляется.
@@ -351,7 +351,7 @@ tp_price = fill_price × 1.10     # tp_pct (конфиг, default 10%)
 
 - На входе: `initial_stop < fill_price < tp_price`.
 - Далее stop монотонно не убывает и всегда
-  `stop ≤ fill_price × (1 + trail_cap_pct) < tp_price`. Трейлинг может поднять
+  `stop ≤ fill_price × (1 + trail_cap_pct / 100) < tp_price`. Трейлинг может поднять
   stop выше fill (защита прибыли). Прежнее требование «`stop < fill` в любой
   момент» снято в v1.2.
 - Если новый уровень stop ≥ текущей цены (цена уже ниже), stop не
