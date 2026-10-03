@@ -117,11 +117,35 @@ async def invariants(
                     and ol.status == "EXECUTING"
                 ]
                 assert live, f"{position.symbol} protected by a dead list"
+                # Adequate: each live leg sells the whole position, to a step.
+                step = fake.rules[position.symbol].step
+                for leg in live[0].orders:
+                    gap = position.quantity - (leg.quantity - leg.executed)
+                    assert Decimal(0) <= gap < step, (position.symbol, leg, gap)
+            elif position.status == PositionStatus.UNKNOWN:
+                # Only a justified UNKNOWN: an outcome still unresolved on
+                # the exchange, and an escalation saying so.
+                unresolved = [
+                    a
+                    for a in attempts
+                    if a.signal_id == position.signal_id
+                    and (
+                        a.state in ("prepared", "sent", "unknown")
+                        or (
+                            a.role == "l"
+                            and a.state in ("acked", "resolved")
+                            and a.order_list_id is not None
+                            and a.applied_at is None
+                        )
+                    )
+                ]
+                assert unresolved, f"{position.symbol} UNKNOWN with nothing unresolved"
+                assert any(
+                    "unknown" in key or position.symbol in text
+                    for key, text in runtime.alerts.items()
+                ), f"{position.symbol} UNKNOWN without an escalation"
             else:
-                assert position.status in (
-                    PositionStatus.CLOSED,
-                    PositionStatus.UNKNOWN,
-                ), (
+                assert position.status == PositionStatus.CLOSED, (
                     position.symbol,
                     position.status,
                 )
@@ -187,6 +211,45 @@ Scenario = Callable[[World], Awaitable[None]]
 
 def matrix(scenario: Scenario, **options: Any) -> None:
     run(scenario, **options)
+
+
+# --- the oracle itself ---------------------------------------------------------------------
+
+
+def test_invariants_reject_an_unjustified_unknown() -> None:
+    # Review 2026-10-03: a protected position whose OCO is gone, marked
+    # UNKNOWN with nothing unresolved and no alert, used to pass.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        position = await state.position(stack, position_id)
+        [order_list] = state.fake.lists.values()
+        state.fake.delete_order_list(
+            symbol="BTCUSDT", list_client_order_id=order_list.list_client_order_id
+        )
+        async with stack.runtime.session() as session, session.begin():
+            row = await session.get(Position, position.id)
+            assert row is not None
+            row.status = PositionStatus.UNKNOWN
+        stack.runtime.alerts.clear()
+        with pytest.raises(AssertionError, match="nothing unresolved"):
+            await invariants(state, stack.runtime)
+
+    matrix(scenario)
+
+
+def test_invariants_reject_a_list_smaller_than_the_position() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        async with stack.runtime.session() as session, session.begin():
+            row = await session.get(Position, position_id)
+            assert row is not None
+            row.quantity += Decimal("0.001")  # the list no longer covers it
+        with pytest.raises(AssertionError):
+            await invariants(state, stack.runtime)
+
+    matrix(scenario)
 
 
 # --- entry ---------------------------------------------------------------------------------
@@ -285,6 +348,34 @@ def test_crash_at_each_boundary_of_the_entry(boundary: str) -> None:
             else IntentState.NO_FILL
         )
         assert intent.state == expected
+        await finish(state, recovered)
+
+    matrix(scenario)
+
+
+@pytest.mark.parametrize("which", ["first", "replacement"])
+def test_crash_between_the_oco_ack_and_its_association(which: str) -> None:
+    # Review 2026-10-03 (EXEC-09): the OCO's answer is committed, the process
+    # dies before the list is associated with the position.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        if which == "first":
+            position_id = await state.filled(stack)
+        else:
+            position_id = await state.protected(stack)
+        stack.protector._mark_protected = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("process killed")
+        )
+        with pytest.raises(RuntimeError):
+            if which == "first":
+                await stack.protector.protect(position_id)
+            else:
+                await stack.worker.reprice(position_id, Decimal("99.5"))
+        recovered = await recover(state)
+        position = await state.position(stack, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        sells = [o for o in state.fake.orders.values() if o.side == "SELL"]
+        assert all(o.type != "MARKET" for o in sells)
         await finish(state, recovered)
 
     matrix(scenario)
