@@ -1433,3 +1433,76 @@ test("an unresolved entry is released only after confirmation, and a refusal is 
   await expect(card.getByText("release_entry — failed")).toBeVisible()
   await expect(card.getByText(/may be ours/)).toBeVisible()
 })
+
+// --- Review 2026-10-03 (PRESET-07/08) ---
+
+test("a preset invalid only for a missing option is valid again once the option is back", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped())
+  api.presets.options.ripple_interval =
+    api.presets.options.ripple_interval.filter((option) => option !== "5m")
+  const fast = api.presets.list.items[1]
+  fast.valid = false
+  fast.errors = [{ field: "ripple_interval", message: "5m is not in the list" }]
+  let presetReads = 0
+  page.on("request", (request) => {
+    if (
+      request.method() === "GET" &&
+      request.url().endsWith("/tripple_screen/presets/")
+    )
+      presetReads += 1
+  })
+  await page.clock.install()
+  await page.goto("/strategy")
+  await choose(page, "Preset", "Fast · built-in (invalid)")
+  await expectBlocked(page)
+  const readsBefore = presetReads
+
+  // Another administrator puts M5 back; the server re-checks the preset.
+  api.presets.options.ripple_interval = [
+    ...api.presets.options.ripple_interval,
+    "5m",
+  ]
+  fast.valid = true
+  fast.errors = []
+  await page.clock.runFor(31_000)
+  await expect(page.getByLabel("Ripple interval")).toHaveText("M5")
+  await expect(page.getByLabel("Preset", { exact: true })).toHaveText(
+    "Fast · built-in",
+  )
+  expect(presetReads).toBeGreaterThan(readsBefore)
+  await expect(
+    page.getByRole("button", { name: "Start", exact: true }),
+  ).toBeEnabled()
+})
+
+test("without a catalog the option lists stay editable and unknown support is said", async ({
+  page,
+}) => {
+  const api = await mock(page, stopped(), { available: false })
+  // Without a catalog the server cannot tell what the agent supports.
+  await page.route("**/tripple_screen/options/", async (route) => {
+    if (route.request().method() !== "GET") return route.fallback()
+    await route.fulfill({
+      json: {
+        ripple_interval: { options: ["5m", "custom"], unsupported: null },
+      },
+    })
+  })
+  await page.goto("/strategy")
+  await expect(
+    page.getByText(/has not published a strategy catalog/),
+  ).toBeVisible()
+  await expect(
+    page.getByRole("button", { name: "Start", exact: true }),
+  ).toBeDisabled()
+  const toggle = page.getByRole("button", { name: "Edit option lists" })
+  await toggle.click()
+  const ripple = page.getByRole("region", { name: "ripple_interval options" })
+  await expect(ripple.locator('[data-option="custom"]')).toBeVisible()
+  await expect(
+    ripple.getByText(/not known which of these values the agent supports/),
+  ).toBeVisible()
+  expect(api.posts).toEqual([])
+})

@@ -193,7 +193,12 @@ function Strategy() {
   const activeLabel = activeStrategy?.label ?? "strategy"
   const catalogReady = !!catalog && catalog.available !== false
   const strategyOffered = strategy !== "" && offeredNames.has(strategy)
-  const strategyName = activeStrategy?.name ?? strategy
+  // Which strategy the lists and presets belong to does not wait for the
+  // schema: without a catalog the form cannot hydrate, but the option lists
+  // stay editable for the strategy the agent was told to run (Start stays
+  // closed — it needs the catalog).
+  const strategyName =
+    activeStrategy?.name || strategy || status?.desired.strategy || ""
 
   const optionsQuery = useQuery({
     ...fieldOptionsQueryOptions(strategyName),
@@ -274,6 +279,21 @@ function Strategy() {
       : checked.result.status
 
   const presets = presetsQuery.data?.items
+
+  // A preset's server verdict (`valid`) depends on the schema and the lists
+  // as well. Presets are not polled, so when either changes — another
+  // administrator restored an option, a redeployed agent — read them again
+  // instead of showing a stale "invalid" beside a passing local check.
+  const presetsContext = useRef<string | null>(null)
+  useEffect(() => {
+    if (!contextReady) return
+    const previous = presetsContext.current
+    presetsContext.current = context
+    if (previous !== null && previous !== context)
+      void queryClient.invalidateQueries({
+        queryKey: ["strategy-presets", strategyName],
+      })
+  }, [contextReady, context, queryClient, strategyName])
   const presetEntries: PresetEntry[] = useMemo(
     () =>
       (presets ?? []).map((preset) => ({
