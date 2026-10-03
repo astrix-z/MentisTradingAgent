@@ -141,3 +141,57 @@ def test_release_entry_command_reports_the_outcome() -> None:
         assert (await state.intent(stack, signal_id)).state == IntentState.NO_FILL
 
     run(scenario)
+
+
+# --- review 2026-10-03: hidden or paged-out trades are not absence ---------------
+
+
+def test_lagging_history_is_not_proof_of_absence() -> None:
+    # Our BUY filled, its answer was lost, the exchange does not find it by
+    # client id and does not show its trades yet: the balance still does.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id, cid = await unknown_entry(state, stack, "timeout_after")
+        [buy] = state.fake.orders_of("BTCUSDT", "BUY")
+        state.fake.hide_trades(buy.order_id)
+        state.fake.fault("get_order", "not_found", times=1000)
+        for _ in range(4):
+            state.clock.advance(60)
+            await stack.orders.resolve_entries()
+        await still_held(state, stack, signal_id)
+        with pytest.raises(ReleaseRefused, match="may have filled"):
+            await stack.orders.release_entry(cid)
+        await still_held(state, stack, signal_id)
+
+    run(scenario)
+
+
+def test_our_trade_paged_out_by_later_manual_buys_is_still_found() -> None:
+    # 1001 manual BUYs after ours: our trade is not among the last 1000, but
+    # the history is read from the attempt's time on, every page.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id, cid = await unknown_entry(state, stack, "timeout_after")
+        for n in range(1001):
+            state.fake.new_order(
+                symbol="BTCUSDT",
+                side="BUY",
+                type="LIMIT",
+                time_in_force="FOK",
+                quantity="0.00001",
+                price=str(state.fake.last["BTCUSDT"] * 2),
+                new_client_order_id=f"web_manual_{n}",
+            )
+        state.fake.fault("get_order", "not_found", times=1)  # by client id only
+        state.clock.advance(120)
+        with pytest.raises(ReleaseRefused, match="may be ours"):
+            await stack.orders.release_entry(cid)
+        await still_held(state, stack, signal_id)
+        # Auto-recovery: two misses by client id, then the paged history
+        # shows a BUY nobody accounts for (ours) — UNKNOWN, not released.
+        state.fake.fault("get_order", "not_found", times=2)
+        for _ in range(2):
+            await stack.orders.resolve_entries()
+        await still_held(state, stack, signal_id)
+
+    run(scenario, usdt="10000")

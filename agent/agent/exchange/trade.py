@@ -587,6 +587,31 @@ class TradeClient:
                 return trades
             cursor = max(cast(int, t.id) for t in fresh) + 1
 
+    async def my_trades_from_time(
+        self, *, symbol: str, start_ms: int, priority: Priority = Priority.RECONCILE
+    ) -> list[MyTradesResponse]:
+        """Every trade at or after ``start_ms``, page by page, to the newest.
+
+        The first page is found by time (it does not depend on any cursor or
+        on how many trades came after), the rest by id; the history is read
+        until a page comes back short.
+        """
+        first: TradeResult[list[MyTradesResponse]] = await self._call(
+            "my_trades",
+            priority,
+            symbol=symbol,
+            start_time=start_ms,
+            limit=MY_TRADES_PAGE,
+        )
+        page = first.data
+        trades = [t for t in page if t.id is not None]
+        if len(page) < MY_TRADES_PAGE or not trades:
+            return trades
+        after = max(cast(int, t.id) for t in trades) + 1
+        return trades + await self.my_trades_since(
+            symbol=symbol, from_id=after, priority=priority
+        )
+
     async def get_account(self) -> TradeResult[GetAccountResponse]:
         return await self._call(
             "get_account", Priority.RECONCILE, omit_zero_balances=True

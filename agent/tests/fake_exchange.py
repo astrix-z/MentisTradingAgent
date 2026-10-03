@@ -815,6 +815,7 @@ class FakeExchange:
             self._before("my_trades", kwargs)
             symbol = kwargs["symbol"]
             from_id = kwargs.get("from_id")
+            start_time = kwargs.get("start_time")
             order_id = kwargs.get("order_id")
             limit = kwargs.get("limit") or 500
             rows = [
@@ -823,10 +824,13 @@ class FakeExchange:
                 if t["symbol"] == symbol
                 and t["orderId"] not in self.hidden_orders
                 and (from_id is None or t["id"] >= from_id)
+                and (start_time is None or t["time"] >= start_time)
                 and (order_id is None or t["orderId"] == order_id)
             ]
-            # Like Binance: from fromId forward, else the most recent trades.
-            payload = rows[:limit] if from_id is not None else rows[-limit:]
+            # Like Binance: from fromId or startTime forward, else the most
+            # recent trades.
+            forward = from_id is not None or start_time is not None
+            payload = rows[:limit] if forward else rows[-limit:]
         return response(MyTradesResponse, payload)
 
     def get_account(self, **kwargs: Any) -> ApiResponse[GetAccountResponse]:

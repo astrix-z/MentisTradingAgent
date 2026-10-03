@@ -34,7 +34,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.exchange.budget import Priority
@@ -55,6 +55,7 @@ from agent.execution.models import (
     IntentState,
     OrderAttempt,
     Position,
+    PositionStatus,
     SignalInbox,
 )
 from agent.execution.quotes import QuoteProvider, QuoteSnapshot, ReferenceUnverified
@@ -66,6 +67,10 @@ logger = logging.getLogger(__name__)
 
 #: Clock difference tolerated between our attempt time and a trade's time.
 _TRADE_TIME_SLACK_MS = 5_000
+#: Share of an entry's quantity a fill adds to the balance at least (a
+#: commission paid in the base asset takes ≤0.1%); more than this held
+#: unexplained means the entry may have filled.
+_FILL_SHARE = Decimal("0.99")
 #: ``error_type`` of the refusal raised when the send deadline has passed.
 _EXPIRED = "Expired"
 
@@ -525,26 +530,35 @@ class OrderManager:
     async def _unexplained_buy(
         self, intent: ExecutionIntent, attempt: OrderAttempt
     ) -> bool:
-        """Whether a BUY of an order we cannot name filled since ``attempt``.
+        """Whether the entry may have filled although its order is not found.
 
-        Any doubt (the history cannot be read) counts as yes.
+        Yes when a BUY of an order we cannot name filled since ``attempt``, or
+        the balance holds as much as the entry would have bought beyond what
+        positions and the visible trades explain. Any doubt (the history or
+        the balance cannot be read) counts as yes.
         """
-        buys = await self._unexplained_buys(intent, attempt)
-        return buys is None or bool(buys)
+        strangers = await self._strangers(intent, attempt)
+        if strangers is None or any(t.is_buyer for t in strangers):
+            return True
+        return await self._balance_doubt(intent, strangers) is not None
 
-    async def _unexplained_buys(
+    async def _strangers(
         self, intent: ExecutionIntent, attempt: OrderAttempt
     ) -> list[Any] | None:
-        """The BUY trades of orders we cannot name since ``attempt``.
+        """The trades of orders we cannot name since ``attempt``, both sides.
 
-        ``None`` when the history cannot be read.
+        The whole history from the attempt's time on, every page, so a trade
+        is not missed because many came after it. ``None`` when the history
+        cannot be read. A trade the exchange does not show yet is not here
+        either — :meth:`_balance_doubt` is what covers that lag.
         """
         trade = self.runtime.trade
         assert trade is not None
+        since = int(attempt.created_at.timestamp() * 1000) - _TRADE_TIME_SLACK_MS
         try:
-            trades = (
-                await trade.my_trades(symbol=intent.symbol, priority=Priority.RECONCILE)
-            ).data
+            trades = await trade.my_trades_from_time(
+                symbol=intent.symbol, start_ms=since, priority=Priority.RECONCILE
+            )
         except TradeCallError:
             return None
         async with self.runtime.session() as session:
@@ -560,12 +574,57 @@ class OrderManager:
                     )
                 ).all()
             )
-        since = int(attempt.created_at.timestamp() * 1000) - _TRADE_TIME_SLACK_MS
-        return [
-            t
-            for t in trades
-            if t.is_buyer and t.order_id not in known and (t.time or 0) >= since
-        ]
+        return [t for t in trades if t.order_id not in known and (t.time or 0) >= since]
+
+    async def _balance_doubt(
+        self, intent: ExecutionIntent, strangers: list[Any]
+    ) -> str | None:
+        """Why the balance cannot rule out that the entry filled, or ``None``.
+
+        A filled entry adds its quantity (less a commission paid in the base
+        asset) to the balance, whether or not its trade is visible yet. The
+        base asset held beyond the open positions of the symbol and the net
+        of the ``strangers`` trades must be less than that.
+        """
+        trade = self.runtime.trade
+        context = self.runtime.context
+        assert trade is not None and context is not None
+        assert intent.quantity is not None
+        base = self.applier.base_of(intent.symbol)
+        try:
+            account = (await trade.get_account()).data
+        except TradeCallError as error:
+            return f"cannot read balances: {error.message}"
+        total = sum(
+            (
+                Decimal(row.free or "0") + Decimal(row.locked or "0")
+                for row in account.balances or []
+                if row.asset == base
+            ),
+            Decimal(0),
+        )
+        async with self.runtime.session() as session:
+            held = (
+                await session.scalar(
+                    select(func.coalesce(func.sum(Position.quantity), 0)).where(
+                        Position.account == context.account,
+                        Position.network == context.network,
+                        Position.symbol == intent.symbol,
+                        Position.status != PositionStatus.CLOSED,
+                    )
+                )
+            ) or Decimal(0)
+        net = sum(
+            (Decimal(t.qty) if t.is_buyer else -Decimal(t.qty) for t in strangers),
+            Decimal(0),
+        )
+        unexplained = total - Decimal(held) - net
+        if unexplained >= intent.quantity * _FILL_SHARE:
+            return (
+                f"{unexplained} {base} held beyond positions and visible trades; "
+                f"the BUY of {intent.quantity} may have filled"
+            )
+        return None
 
     # --- the operator's release ---------------------------------------------------
 
@@ -575,8 +634,11 @@ class OrderManager:
         For an open entry attempt of the current context only. The agent
         proves absence itself, whatever the operator saw: the request is older
         than ``recvWindow`` plus a margin, the exchange does not know the
-        client id, and every BUY of an order we cannot name since the attempt
-        belongs to an order with someone else's client id. Any doubt raises
+        client id, every BUY of an order we cannot name since the attempt
+        (the whole history, every page) belongs to an order with someone
+        else's client id, and the balance does not hold the entry's quantity
+        beyond what positions and those trades explain — a trade the exchange
+        does not show yet still shows in the balance. Any doubt raises
         :class:`ReleaseRefused` and changes nothing.
         """
         runtime = self.runtime
@@ -643,9 +705,10 @@ class OrderManager:
                 f"{cid} is on the exchange ({getattr(order, 'status', None)}); "
                 "the agent settles it"
             )
-        buys = await self._unexplained_buys(intent, attempt)
-        if buys is None:
+        strangers = await self._strangers(intent, attempt)
+        if strangers is None:
             raise ReleaseRefused(f"cannot read {intent.symbol} trades")
+        buys = [t for t in strangers if t.is_buyer]
         for order_id in sorted({t.order_id for t in buys}):
             try:
                 other = (
@@ -664,6 +727,9 @@ class OrderManager:
                 raise ReleaseRefused(
                     f"BUY order {order_id} ({owner or 'no client id'}) may be ours"
                 )
+        doubt = await self._balance_doubt(intent, strangers)
+        if doubt is not None:
+            raise ReleaseRefused(doubt)
 
     def _escalate(self, attempt: OrderAttempt) -> None:
         age = self.clock() - attempt.created_at

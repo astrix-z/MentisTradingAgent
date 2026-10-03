@@ -220,6 +220,10 @@ class PositionApplier:
         self._converter = converter
         self._base_of = base_of
 
+    def base_of(self, symbol: str) -> str:
+        """The base asset of ``symbol``."""
+        return self._base_of(symbol)
+
     async def open_from_entry(
         self,
         session: AsyncSession,
