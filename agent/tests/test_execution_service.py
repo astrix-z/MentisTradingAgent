@@ -386,3 +386,80 @@ def test_fees_unpriced_at_close_are_revalued_by_a_later_round() -> None:
         await restarted.runtime.shutdown()
 
     run(scenario)
+
+
+# --- review 2026-10-03 (EXEC-09): an OCO answer committed, never applied ----------
+
+
+def _live_lists(state: World) -> list[Any]:
+    return [ol for ol in state.fake.lists.values() if ol.status == "EXECUTING"]
+
+
+def _market_sells(state: World) -> list[Any]:
+    return [o for o in state.fake.orders_of("BTCUSDT", "SELL") if o.type == "MARKET"]
+
+
+def test_crash_between_the_replacement_ack_and_its_association() -> None:
+    # pl1 → reprice → pl2 accepted, ACK committed → the process dies before
+    # _mark_protected. It used to query only pl1, mark the position overdue
+    # and try MARKET sells against the balance pl2 holds.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("process killed")
+
+        first.protector._mark_protected = crash  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            await first.worker.reprice(position_id, Decimal("99.5"))
+        await state.kill(first)
+        [pl2] = _live_lists(state)
+        assert pl2.list_client_order_id.endswith("-pl2")
+
+        state.clock.advance(31)
+        restarted = service(state)
+        await restarted.runtime.boot()
+        for _ in range(3):
+            await restarted.tick()
+        position = await state.position(first, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        assert position.protection_list_id == pl2.list_client_order_id
+        assert position.exchange_stop == Decimal("99.5")
+        assert position.operation is None
+        assert _market_sells(state) == []
+        assert len(_live_lists(state)) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_crash_between_the_first_ack_and_its_association() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.filled(first)
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("process killed")
+
+        first.protector._mark_protected = crash  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            await first.protector.protect(position_id)
+        await state.kill(first)
+        [pl1] = _live_lists(state)
+
+        state.clock.advance(31)
+        restarted = service(state)
+        await restarted.runtime.boot()
+        for _ in range(3):
+            await restarted.tick()
+        position = await state.position(first, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        assert position.protection_list_id == pl1.list_client_order_id
+        assert _market_sells(state) == []
+        assert len(_live_lists(state)) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)

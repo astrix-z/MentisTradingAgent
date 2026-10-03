@@ -122,6 +122,9 @@ class Protector:
                 await self.check_deadline(position_id)
                 return StepResult(Step.WAITING, f"{position.operation} in progress")
             await self.check_deadline(position_id)
+            unapplied = await self._unapplied_lists(position)
+            if unapplied:
+                return await self._apply_answered(position, unapplied[0])
             pending = await self._open_attempts(position, (Role.LIST,))
             if pending:
                 resolved = await self._resolve_list(position, pending[-1])
@@ -308,20 +311,66 @@ class Protector:
             self.orders._escalate(attempt)
             await self.check_deadline(position.id)
             return StepResult(Step.WAITING, "OCO outcome unknown")
-        order_list = lookup.data
+        return await self._apply_list(position, attempt, lookup.data, resolve=True)
+
+    async def _apply_answered(
+        self, position: Position, attempt: OrderAttempt
+    ) -> StepResult:
+        """Act on an OCO answer that was recorded but never applied.
+
+        The exchange accepted the list; a crash before it was associated left
+        it untracked, and it may be live and hold the asset. It is read again
+        and applied exactly like a list found for an UNKNOWN attempt. A miss
+        now is lag, never absence: the position waits (and its deadline runs).
+        """
+        trade = self._trade()
+        cid = attempt.client_order_id
+        try:
+            order_list = (
+                await trade.get_order_list(
+                    list_client_order_id=cid, priority=Priority.PROTECT
+                )
+            ).data
+        except TradeCallError as error:
+            self.orders._escalate(attempt)
+            await self.check_deadline(position.id)
+            return StepResult(
+                Step.WAITING, f"answered list {cid} not readable: {error.message}"
+            )
+        logger.warning("OCO %s answered but not applied; applying it", cid)
+        return await self._apply_list(position, attempt, order_list, resolve=False)
+
+    async def _apply_list(
+        self,
+        position: Position,
+        attempt: OrderAttempt,
+        order_list: Any,
+        *,
+        resolve: bool,
+    ) -> StepResult:
+        """Make a list the exchange has the position's protection, or, if it
+        already finished, prove its legs first. ``resolve`` also records the
+        outcome of an attempt that was UNKNOWN."""
+        cid = attempt.client_order_id
         if str(order_list.list_order_status) != "EXECUTING":
-            # The list finished (a leg filled, or it was cancelled) while its
-            # outcome was unknown. The attempt stays open, and so blocks every
-            # new list, until both legs are terminal and fully booked.
+            # The list finished (a leg filled, or it was cancelled) before we
+            # knew of it. The attempt blocks every new list until both legs
+            # are terminal and fully booked.
             proof = await self.prove_legs(position.id, order_list)
             if not proof.proven:
                 await self.check_deadline(position.id)
                 return StepResult(Step.WAITING, proof.reason)
+            if resolve:
+                await self.orders.journal.resolve(
+                    cid, AttemptState.RESOLVED, data=order_list
+                )
+            async with self.runtime.session() as session, session.begin():
+                await self.orders.journal.mark_applied(session, cid)
+            return await self._after_list(position.id, proof.filled_type)
+        if resolve:
             await self.orders.journal.resolve(
                 cid, AttemptState.RESOLVED, data=order_list
             )
-            return await self._after_list(position.id, proof.filled_type)
-        await self.orders.journal.resolve(cid, AttemptState.RESOLVED, data=order_list)
         request = attempt.request
         await self._mark_protected(
             position.id,
@@ -458,6 +507,7 @@ class Protector:
             position.protection_list_id = list_id
             position.unprotected_since = None
             position.operation = None
+            await self.orders.journal.mark_applied(session, list_id)
             await record_event(
                 session,
                 account=position.account,
@@ -489,6 +539,12 @@ class Protector:
             for attempt in await self._open_attempts(position, (Role.EXIT,)):
                 if not await self._resolve_exit(position, attempt):
                     return StepResult(Step.WAITING, "exit outcome unknown")
+            if await self._unapplied_lists(position) or await self._open_attempts(
+                position, (Role.LIST,)
+            ):
+                # A list that may be live holds the asset: a sale would be
+                # refused, or sell what the list still might. Settle it first.
+                return StepResult(Step.WAITING, "a protection list is unsettled")
             if not await self._proven(position_id):
                 return StepResult(Step.WAITING, "fills not proven")
             position = await self._position(position_id)
@@ -748,6 +804,12 @@ class Protector:
         async with self.runtime.session() as session:
             return await self.orders.journal.open_of(
                 session, signal_id=position.signal_id, roles=roles
+            )
+
+    async def _unapplied_lists(self, position: Position) -> list[OrderAttempt]:
+        async with self.runtime.session() as session:
+            return await self.orders.journal.unapplied_lists(
+                session, signal_id=position.signal_id
             )
 
     async def _market(

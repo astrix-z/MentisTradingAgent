@@ -217,6 +217,9 @@ class OrderAttempt(Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: When the answer's effect on the position was recorded (a list
+    #: associated, or proven finished); ``None`` for an answer not acted on.
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Fill(Base):

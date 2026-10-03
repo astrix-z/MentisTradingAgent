@@ -196,12 +196,16 @@ class PositionWorker:
     async def _settle_replacement(self, position_id: uuid.UUID) -> StepResult | None:
         """Resolve a replacement OCO of unproven outcome before anything is sent.
 
-        A previous round may have sent the new list and lost the answer. It
+        A previous round may have sent the new list and lost the answer, or
+        had the answer and crashed before applying it. It
         may be live and hold the asset: neither another OCO nor a market sale
         may go out until it is proven absent (``None``), live (PROTECTED) or
         finished (its fills booked).
         """
         position = await self.protector._position(position_id)
+        for answered in await self.protector._unapplied_lists(position):
+            # Accepted, answer committed, never associated: it may be live.
+            return await self.protector._apply_answered(position, answered)
         for attempt in await self.protector._open_attempts(position, (Role.LIST,)):
             resolved = await self.protector._resolve_list(position, attempt)
             if resolved is not None:

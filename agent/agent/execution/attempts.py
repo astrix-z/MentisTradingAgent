@@ -313,6 +313,40 @@ class AttemptJournal:
             ).all()
         )
 
+    async def unapplied_lists(
+        self, session: AsyncSession, *, signal_id: uuid.UUID
+    ) -> list[OrderAttempt]:
+        """OCO attempts the exchange answered with a list that was never applied.
+
+        The answer is committed before the list is associated with the
+        position (or proven finished); a crash in between leaves a list that
+        may be live and hold the asset. Until applied, no other OCO or market
+        sale may be sized for the position.
+        """
+        return list(
+            (
+                await session.scalars(
+                    select(OrderAttempt)
+                    .where(
+                        OrderAttempt.signal_id == signal_id,
+                        OrderAttempt.role == Role.LIST.value,
+                        OrderAttempt.state.in_(
+                            [AttemptState.ACKED, AttemptState.RESOLVED]
+                        ),
+                        OrderAttempt.order_list_id.is_not(None),
+                        OrderAttempt.applied_at.is_(None),
+                    )
+                    .order_by(OrderAttempt.created_at)
+                )
+            ).all()
+        )
+
+    async def mark_applied(self, session: AsyncSession, attempt_id: str) -> None:
+        """Record, in the caller's transaction, that the answer took effect."""
+        attempt = await session.get(OrderAttempt, attempt_id, with_for_update=True)
+        if attempt is not None and attempt.applied_at is None:
+            attempt.applied_at = self._clock()
+
     async def next_sequence(
         self, session: AsyncSession, *, signal_id: uuid.UUID, role: Role
     ) -> int:
