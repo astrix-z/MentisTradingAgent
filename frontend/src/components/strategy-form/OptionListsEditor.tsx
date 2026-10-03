@@ -97,7 +97,10 @@ export function OptionListsEditor({
               problem: null,
             }
             // S from the published schema; without the field, the server's
-            // verdict (null — unknown without a catalog).
+            // verdict — null when it has no catalog either, which is
+            // "unknown", not "all supported".
+            const supportUnknown =
+              !field?.options && stored?.unsupported === null
             const isUnsupported = (value: string) =>
               field?.options
                 ? !field.options.includes(value)
@@ -263,6 +266,15 @@ export function OptionListsEditor({
                 {draft.problem && (
                   <p role="alert" className="text-destructive text-sm">
                     {draft.problem}
+                  </p>
+                )}
+                {supportUnknown && draft.values.length > 0 && (
+                  <p
+                    role="status"
+                    className="text-amber-700 text-sm dark:text-amber-400"
+                  >
+                    The agent's catalog is unavailable, so it is not known which
+                    of these values the agent supports.
                   </p>
                 )}
                 {unsupportedNow.length > 0 && (
