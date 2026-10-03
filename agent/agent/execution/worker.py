@@ -73,11 +73,18 @@ class PositionWorker:
         )
 
     async def resume(self, position_id: uuid.UUID) -> StepResult:
-        """Continue an operation a previous process recorded but did not finish."""
+        """Continue an operation a previous process recorded but did not finish.
+
+        Like every operation step it cancels and sends, so it waits for the
+        execution lock and a finished reconcile: the startup reconcile itself
+        only reads and records, and the first round after it resumes.
+        """
         position = await self.protector._position(position_id)
         if position.operation is None or position.op_state is None:
             return StepResult(Step.WAITING, "nothing to resume")
         async with self.orders.lock_for(position_id):
+            if not self.runtime.may_mutate():
+                return StepResult(Step.WAITING, "no execution lock")
             return await self._continue(position_id)
 
     # --- the protocol ---------------------------------------------------------------------

@@ -463,3 +463,50 @@ def test_crash_between_the_first_ack_and_its_association() -> None:
         await restarted.runtime.shutdown()
 
     run(scenario)
+
+
+def test_startup_reconcile_mutates_nothing_until_it_is_finished() -> None:
+    # Review 2026-10-03 (EXEC-05): a recorded reprice was resumed from inside
+    # the startup reconcile — delete_order_list and order_list_oco went out
+    # with reconciled=False, may_mutate()=False.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("process killed")
+
+        first.worker._continue = crash  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            await first.worker.reprice(position_id, Decimal("99.5"))
+        await state.kill(first)
+        assert (await state.position(first, position_id)).operation == "reprice"
+
+        restarted = service(state)
+        seen: list[tuple[str, bool]] = []
+        for name in (
+            "delete_order_list",
+            "order_list_oco",
+            "new_order",
+            "delete_order",
+        ):
+            real = getattr(state.fake, name)
+
+            def spy(*args: Any, _name: str = name, _real: Any = real, **kw: Any) -> Any:
+                seen.append((_name, restarted.runtime.may_mutate()))
+                return _real(*args, **kw)
+
+            setattr(state.fake, name, spy)
+        await restarted.runtime.boot()
+        assert seen == []  # the reconcile only read and recorded
+        assert restarted.runtime.reconciled
+        await restarted.tick()  # the first round resumes the reprice
+        assert [name for name, _ in seen] == ["delete_order_list", "order_list_oco"]
+        assert all(allowed for _, allowed in seen)
+        position = await state.position(first, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        assert position.exchange_stop == Decimal("99.5")
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
