@@ -1369,3 +1369,67 @@ test("a required choice with no default is not invented for an old preset", asyn
   await expectBlocked(page)
   expect(api.posts).toEqual([])
 })
+
+test("an unresolved entry is released only after confirmation, and a refusal is shown", async ({
+  page,
+}) => {
+  const cid = "mta-0123456789abcdef01234567-e1"
+  const status = snapshot()
+  // The Unresolved entry card appears only while the agent reports one.
+  const api = await mock(page, status)
+  await page.goto("/strategy")
+  await expect(page.getByText("Unresolved entry")).toHaveCount(0)
+
+  status.actual = {
+    ...status.actual!,
+    execution: {
+      mode: "enabled",
+      leader: true,
+      open_positions: 0,
+      alerts: {
+        unknown: `order ${cid} (BTCUSDT) outcome unknown for 300s; not retried`,
+      },
+    },
+  }
+  await page.reload()
+  await page.clock.install()
+  const card = page.getByRole("region", { name: "Release entry" })
+  await expect(card.getByRole("alert")).toContainText(cid)
+  const input = card.getByLabel("Entry client order id")
+  await expect(input).toHaveValue(cid)
+
+  // Not an entry id: the button stays off.
+  await input.fill("web_manual_1")
+  await expect(card.getByText(/Not an entry client id/)).toBeVisible()
+  await expect(
+    card.getByRole("button", { name: "Release entry" }),
+  ).toBeDisabled()
+  await input.fill(cid)
+
+  // Cancel sends nothing.
+  await card.getByRole("button", { name: "Release entry" }).click()
+  await page.getByRole("button", { name: "Cancel" }).click()
+  expect(api.posts).toHaveLength(0)
+
+  await card.getByRole("button", { name: "Release entry" }).click()
+  await page.getByRole("button", { name: "Release", exact: true }).click()
+  await expect(card.getByText(accepted("release_entry"))).toBeVisible()
+  expect(api.posts).toEqual([
+    {
+      path: "/api/v1/trading/commands/",
+      body: { type: "release_entry", payload: { client_order_id: cid } },
+    },
+  ])
+
+  // The agent refuses: the message is shown, success is not implied.
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "release_entry",
+    ok: false,
+    message: "not released: BUY order 9 (no client id) may be ours",
+    at,
+  })
+  await page.clock.runFor(2000)
+  await expect(card.getByText("release_entry — failed")).toBeVisible()
+  await expect(card.getByText(/may be ours/)).toBeVisible()
+})

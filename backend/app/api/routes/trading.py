@@ -238,11 +238,24 @@ class RuntimeSnapshot(BaseModel):
 AgentState = Literal["running", "idle", "error"]
 
 
+class ExecutionHeartbeat(BaseModel):
+    """The agent's execution state (``ExecutionRuntime.heartbeat``).
+
+    The account id is left out: the UI needs the alerts, not the account.
+    """
+
+    mode: str
+    leader: bool = False
+    open_positions: int = 0
+    alerts: dict[str, str] = Field(default_factory=dict)
+
+
 class AgentHeartbeat(BaseModel):
     """Liveness + account state reported by the agent."""
 
     state: AgentState
     message: str | None = None
+    execution: ExecutionHeartbeat | None = None
     network: Network | None = None
     strategy: str | None = None
     balances: dict[str, float] | None = None

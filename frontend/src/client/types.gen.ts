@@ -18,6 +18,7 @@ export type AgentHeartbeat = {
      * Message
      */
     message?: string | null;
+    execution?: ExecutionHeartbeat | null;
     /**
      * Network
      */
@@ -206,6 +207,34 @@ export type CommandState = {
      * Error
      */
     error?: string | null;
+};
+
+/**
+ * ExecutionHeartbeat
+ *
+ * The agent's execution state (``ExecutionRuntime.heartbeat``).
+ *
+ * The account id is left out: the UI needs the alerts, not the account.
+ */
+export type ExecutionHeartbeat = {
+    /**
+     * Mode
+     */
+    mode: string;
+    /**
+     * Leader
+     */
+    leader?: boolean;
+    /**
+     * Open Positions
+     */
+    open_positions?: number;
+    /**
+     * Alerts
+     */
+    alerts?: {
+        [key: string]: string;
+    };
 };
 
 /**

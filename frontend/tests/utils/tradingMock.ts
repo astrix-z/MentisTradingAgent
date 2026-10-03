@@ -301,10 +301,12 @@ export async function mock(
     } else if (request.method() === "POST") {
       const payload = request.postDataJSON()
       posts.push({ path: url.pathname, body: payload })
+      // The generic endpoint names its type in the body; the others in the path.
+      const generic = url.pathname.endsWith("/trading/commands/")
       const envelope: CommandEnvelope = {
         id: posts.length === 1 ? firstId : secondId,
-        type: url.pathname.split("/").at(-2) ?? "",
-        payload: payload ?? {},
+        type: generic ? payload.type : (url.pathname.split("/").at(-2) ?? ""),
+        payload: (generic ? payload.payload : payload) ?? {},
         issued_at: at,
       }
       body = envelope

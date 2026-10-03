@@ -389,6 +389,37 @@ def test_status_keeps_desired_and_actual_separate(
     }
 
 
+def test_status_passes_execution_alerts_without_the_account(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    alert = "order mta-0123456789abcdef01234567-e1 (BTCUSDT) outcome unknown"
+    # As ``Engine.publish_heartbeat`` writes it.
+    redis.values[trading.REDIS_HEARTBEAT_KEY] = json.dumps(
+        {
+            "state": "running",
+            "message": f"execution: unknown: {alert}",
+            "execution": {
+                "mode": "enabled",
+                "account": "1001",
+                "network": "live",
+                "leader": True,
+                "open_positions": 0,
+                "alerts": {"unknown": alert},
+            },
+            "network": "live",
+            "updated_at": NOW.isoformat(),
+        }
+    )
+    response = client.get("/api/v1/trading/status/", headers=headers(client))
+    assert response.status_code == 200
+    assert response.json()["actual"]["execution"] == {
+        "mode": "enabled",
+        "leader": True,
+        "open_positions": 0,
+        "alerts": {"unknown": alert},
+    }
+
+
 def test_missing_heartbeat_is_not_confirmed_running(
     client: TestClient,
     redis: MemoryRedis,

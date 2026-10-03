@@ -10,6 +10,7 @@ import {
   UsersService,
 } from "@/client"
 import { CommandTrackingView } from "@/components/CommandTrackingView"
+import { ReleaseEntry } from "@/components/ReleaseEntry"
 import { OptionListsEditor } from "@/components/strategy-form/OptionListsEditor"
 import {
   CURRENT_PARAMS,
@@ -767,6 +768,21 @@ function Strategy() {
           </CardContent>
         </Card>
       </div>
+
+      {status?.actual?.execution?.alerts?.unknown && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Unresolved entry</CardTitle>
+            <CardDescription>
+              An entry whose outcome the agent could not prove; its reserve and
+              slot stay held
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ReleaseEntry status={status} />
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader>
