@@ -8,6 +8,8 @@ the election makes (SET NX, the renew/release scripts, pubsub).
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 import time
 from typing import Any
 
@@ -240,3 +242,55 @@ def test_the_lease_counts_from_when_the_renewal_was_sent() -> None:
     assert lease.valid()
     clock[0] = sent_at + ttl
     assert not lease.valid()
+
+
+def test_leadership_is_released_only_after_the_db_write_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Review 2026-10-03: cancelling the listener did not stop its DB thread,
+    # so the lock was released while A's write still ran and B could handle
+    # the next message alongside it.
+    tokens = iter(["A", "B"])
+    monkeypatch.setattr(
+        sl.uuid, "uuid4", lambda: type("U", (), {"hex": next(tokens)})()
+    )
+    started, release = threading.Event(), threading.Event()
+    writes: list[tuple[str, str]] = []
+
+    def blocking_entry(payload: dict[str, Any], _network: str) -> None:
+        writes.append(("start", payload["signal_id"]))
+        started.set()
+        release.wait(5)
+        writes.append(("end", payload["signal_id"]))
+
+    async def network(_redis: Any) -> str:
+        return "testnet"
+
+    monkeypatch.setattr(sl, "_record_entry", blocking_entry)
+    monkeypatch.setattr(sl, "_current_network", network)
+
+    async def scenario() -> None:
+        redis = ExpiringRedis()
+        a = asyncio.create_task(sl.run_signal_listener(redis))  # type: ignore[arg-type]
+        await asyncio.sleep(0.02)
+        assert redis._live(sl.REDIS_LISTENER_LOCK_KEY) == "A"
+        redis.publish(
+            json.dumps({"kind": "signal", "type": "ENTRY", "signal_id": "s1"})
+        )
+        await asyncio.to_thread(started.wait, 5)
+        a.cancel()  # shutdown or lost leadership: the listener is cancelled
+        await asyncio.sleep(0.05)
+        assert not a.done()
+        assert redis._live(sl.REDIS_LISTENER_LOCK_KEY) == "A"  # still held
+        b = asyncio.create_task(sl.run_signal_listener(redis))  # type: ignore[arg-type]
+        await asyncio.sleep(0.05)
+        assert redis._live(sl.REDIS_LISTENER_LOCK_KEY) == "A"  # B cannot lead yet
+        release.set()
+        await asyncio.gather(a, return_exceptions=True)
+        assert writes == [("start", "s1"), ("end", "s1")]
+        await asyncio.sleep(0.05)
+        assert redis._live(sl.REDIS_LISTENER_LOCK_KEY) == "B"  # handed over after
+        b.cancel()
+        await asyncio.gather(b, return_exceptions=True)
+
+    asyncio.run(scenario())

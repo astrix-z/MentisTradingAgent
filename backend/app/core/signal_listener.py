@@ -31,6 +31,7 @@ from typing import Any
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlmodel import Session, col, select
 
@@ -155,9 +156,18 @@ def _record_exit(payload: dict[str, Any], network: str) -> None:
     already closed at this EXIT's ``emitted_at`` means a redelivery (pub/sub
     after a reconnect, or a leadership handover), which must not close the
     next open position of the same symbol.
+
+    The check and the close are one transaction under a transaction-level
+    advisory lock on (network, symbol): two copies of the same EXIT handled
+    at once (two workers overlapping in a handover) run one after the other,
+    and the second sees the first one's close.
     """
     closed_at = datetime.fromisoformat(payload["emitted_at"])
     with Session(engine) as session:
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+            {"key": f"signal-exit:{network}:{payload['symbol']}"},
+        )
         applied = session.exec(
             select(SignalPosition)
             .where(SignalPosition.symbol == payload["symbol"])
@@ -234,17 +244,36 @@ async def _handle_message(redis: Redis, raw: str) -> None:
     if payload.get("kind") != "signal":
         return
     kind = payload.get("type")
+    record = {"ENTRY": _record_entry, "EXIT": _record_exit}.get(kind or "")
+    if record is None:
+        return
     try:
-        # The database work is blocking: in a thread, it cannot hold up the
-        # event loop and with it the lease renewal.
-        if kind == "ENTRY":
-            network = await _current_network(redis)
-            await asyncio.to_thread(_record_entry, payload, network)
-        elif kind == "EXIT":
-            network = await _current_network(redis)
-            await asyncio.to_thread(_record_exit, payload, network)
+        network = await _current_network(redis)
+        await _in_thread(record, payload, network)
     except Exception:  # noqa: BLE001 - one bad message must not kill the listener
         logger.exception("failed to process signal payload: %s", payload)
+
+
+async def _in_thread(
+    record: Callable[[dict[str, Any], str], None], payload: dict[str, Any], network: str
+) -> None:
+    """Run blocking database work in a thread, to its end.
+
+    In a thread it cannot hold up the event loop and with it the lease
+    renewal. Cancelling the caller cannot stop the thread, so a cancelled
+    handler waits for it before giving up: the listener task ends — and
+    leadership is released — only once no write of this worker is in flight.
+    """
+    work = asyncio.ensure_future(asyncio.to_thread(record, payload, network))
+    try:
+        await asyncio.shield(work)
+    except asyncio.CancelledError:
+        while not work.done():
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(work)
+        with suppress(Exception):
+            work.result()
+        raise
 
 
 class LeaseLost(Exception):
