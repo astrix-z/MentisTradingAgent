@@ -39,7 +39,13 @@ from agent.exchange.budget import Priority
 from agent.exchange.trade import Outcome, TradeCallError, TradeClient
 from agent.execution.attempts import Found, Role, client_id
 from agent.execution.filters import SymbolFilters, round_down, round_up
-from agent.execution.ledger import FillRecord, Finalizer, lock_position, record_event
+from agent.execution.ledger import (
+    FillRecord,
+    Finalizer,
+    lock_position,
+    record_event,
+    transaction_time,
+)
 from agent.execution.models import AttemptState, OrderAttempt, Position, PositionStatus
 from agent.execution.orders import OrderManager
 from agent.execution.outcome import ExitMechanism, ExitReason
@@ -636,7 +642,7 @@ class Protector:
         return True
 
     async def _book_response(self, position: Position, order: Any, cid: str) -> None:
-        when = self.orders.clock()
+        when = transaction_time(order, self.orders.clock())
         fills = [
             FillRecord.from_order_fill(
                 fill,
@@ -675,7 +681,9 @@ class Protector:
                 filled_type = await self._order_type(position, order_id) or filled_type
         async with self.runtime.session() as session, session.begin():
             locked = await lock_position(session, position_id)
-            await self.orders.applier.apply(session, locked, fills)
+            result = await self.orders.applier.apply(session, locked, fills)
+            if result.retimed:
+                await self.finalizer.retime(session, locked)
         return filled_type
 
     async def _order_type(self, position: Position, order_id: int) -> str | None:

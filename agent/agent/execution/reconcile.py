@@ -151,6 +151,9 @@ class Reconciler:
                     session, position, by_position[position_id]
                 )
                 applied += len(result.new_fills)
+                if result.retimed:
+                    # The trade list dated fills booked from a late response.
+                    await self.worker.protector.finalizer.retime(session, position)
             await session.execute(
                 insert(TradeCursor)
                 .values(

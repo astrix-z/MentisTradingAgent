@@ -30,12 +30,12 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -167,6 +167,21 @@ class CommissionConverter:
 class ApplyResult:
     new_fills: list[FillRecord]
     position: Position
+    #: Fills already in the ledger whose time an authoritative source
+    #: (``myTrades``) corrected; quantities were not applied again.
+    retimed: list[FillRecord] = field(default_factory=list)
+
+
+def transaction_time(order: Any, fallback: datetime) -> datetime:
+    """When the exchange executed ``order`` (its ``transactTime``), else ``fallback``.
+
+    A response read late must not date its fills by when it was read: the
+    UTC day of a loss, a cooldown and a fee's price all follow the trade.
+    """
+    stamp = getattr(order, "transact_time", None)
+    if isinstance(stamp, int) and stamp > 0:
+        return datetime.fromtimestamp(stamp / 1000, UTC)
+    return fallback
 
 
 async def lock_position(session: AsyncSession, position_id: uuid.UUID) -> Position:
@@ -289,6 +304,7 @@ class PositionApplier:
         :func:`lock_position`, or just created in it).
         """
         applied: list[FillRecord] = []
+        retimed: list[FillRecord] = []
         base = self._base_of(position.symbol)
         for fill in fills:
             if fill.symbol != position.symbol:
@@ -321,7 +337,14 @@ class PositionApplier:
                 .returning(Fill.trade_id)
             )
             if inserted.scalar_one_or_none() is None:
-                continue  # already in the ledger
+                # Already in the ledger. A response carried no trade time of
+                # its own; the exchange's trade list is authoritative and
+                # corrects it, without applying the quantity again.
+                if fill.source != "response" and await self._retime(
+                    session, position, fill
+                ):
+                    retimed.append(fill)
+                continue
             applied.append(fill)
             if fill.side == "BUY":
                 position.bought_qty += fill.quantity
@@ -353,7 +376,47 @@ class PositionApplier:
                 },
                 position=position,
             )
-        return ApplyResult(applied, position)
+        return ApplyResult(applied, position, retimed)
+
+    async def _retime(
+        self, session: AsyncSession, position: Position, fill: FillRecord
+    ) -> bool:
+        """Correct a booked fill's time from ``fill``; True if it changed.
+
+        The commission is valued again at the corrected time when a price is
+        there for it (the old value stays otherwise), and the position's
+        ``opened_at`` follows its earliest BUY.
+        """
+        row = await session.get(
+            Fill,
+            (position.account, position.network, fill.symbol, fill.trade_id),
+            with_for_update=True,
+        )
+        if row is None or row.source != "response" or row.trade_time == fill.time:
+            return False
+        row.trade_time = fill.time
+        row.source = fill.source
+        if row.commission_quote is not None:
+            value = await self._converter.convert(fill)
+            if value is not None:
+                position.commission_quote += value - row.commission_quote
+                row.commission_quote = value
+        if fill.side == "BUY":
+            await session.flush()
+            position.opened_at = await session.scalar(
+                select(func.min(Fill.trade_time)).where(
+                    Fill.position_id == position.id, Fill.side == "BUY"
+                )
+            )
+        await record_event(
+            session,
+            account=position.account,
+            network=position.network,
+            kind="fill_retimed",
+            payload={"trade_id": fill.trade_id, "time": fill.time},
+            position=position,
+        )
+        return True
 
     async def proven(
         self, session: AsyncSession, position: Position, executed: Mapping[int, Decimal]
@@ -515,6 +578,68 @@ class Finalizer:
             position=position,
         )
         return not pending
+
+    async def retime(self, session: AsyncSession, position: Position) -> None:
+        """Bring a closed position in line with corrected fill times.
+
+        ``closed_at`` follows the last SELL; the losing-trade count moves to
+        the UTC day it now falls on, the cooldown this position set is
+        measured from it, and the result is recomputed (a fee's value may
+        have changed with its time). ``position`` is locked by the caller.
+        """
+        if position.status != PositionStatus.CLOSED or position.outcome is None:
+            return
+        outcome = dict(position.outcome)
+        await session.flush()
+        last_sell = await session.scalar(
+            select(func.max(Fill.trade_time)).where(
+                Fill.position_id == position.id, Fill.side == "SELL"
+            )
+        )
+        before = position.closed_at
+        closed_at = last_sell or before or datetime.now(UTC)
+        pnl = position.sold_quote - position.bought_quote - position.commission_quote
+        losing = pnl < 0 or bool(outcome.get("commission_pending"))
+        if bool(outcome.get("counted_losing")) and before is not None:
+            await _count_losing(session, position, before, -1)
+        if losing:
+            await _count_losing(session, position, closed_at, 1)
+        position.closed_at = closed_at
+        position.realized_pnl = pnl
+        policy = ExitPolicy.from_transport(position.exit_policy)
+        cooldown_until = closed_at + timedelta(minutes=policy.cooldown_minutes)
+        await session.execute(
+            update(SymbolCooldown)
+            .where(
+                SymbolCooldown.account == position.account,
+                SymbolCooldown.network == position.network,
+                SymbolCooldown.symbol == position.symbol,
+                SymbolCooldown.position_id == position.id,
+            )
+            .values(cooldown_until=cooldown_until, updated_at=func.now())
+        )
+        position.outcome = {
+            **outcome,
+            "opened_at": transport_value(position.opened_at or closed_at),
+            "closed_at": transport_value(closed_at),
+            "realized_pnl": transport_value(pnl),
+            "commission_quote": transport_value(position.commission_quote),
+            "counted_losing": losing,
+        }
+        await record_event(
+            session,
+            account=position.account,
+            network=position.network,
+            kind="position_retimed",
+            payload={
+                "closed_at": closed_at,
+                "previous": before,
+                "realized_pnl": pnl,
+                "losing": losing,
+                "cooldown_until": cooldown_until,
+            },
+            position=position,
+        )
 
     async def _fill_missing_commissions(
         self, session: AsyncSession, position: Position

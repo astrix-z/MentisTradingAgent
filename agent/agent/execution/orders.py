@@ -48,7 +48,12 @@ from agent.execution.attempts import (
     Role,
 )
 from agent.execution.filters import FilterCache
-from agent.execution.ledger import FillRecord, PositionApplier, lock_position
+from agent.execution.ledger import (
+    FillRecord,
+    PositionApplier,
+    lock_position,
+    transaction_time,
+)
 from agent.execution.models import (
     AttemptState,
     ExecutionIntent,
@@ -312,11 +317,7 @@ class OrderManager:
         assert signal is not None
         policy = ExitPolicy.from_transport(signal.payload["exit_policy"])
         order_id = int(order.order_id)
-        when = (
-            datetime.fromtimestamp(order.transact_time / 1000, UTC)
-            if getattr(order, "transact_time", None)
-            else detected_at
-        )
+        when = transaction_time(order, detected_at)
         fills = [
             FillRecord.from_order_fill(
                 fill,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -14,8 +15,10 @@ from fake_exchange import SymbolRules
 from agent.common.commands import HANDLERS, AgentCommand, CommandContext
 from agent.exchange.hub import StreamHub
 from agent.execution.exits import Exits, NoSuchPosition
+from agent.execution.ledger import losing_trades_today
 from agent.execution.models import PositionStatus
 from agent.execution.monitor import MonitorFeed
+from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.protection import Step
 from agent.execution.quotes import LastTrade
 
@@ -162,5 +165,45 @@ def test_close_position_command_reports_the_outcome() -> None:
         assert reports[-1]["data"]["step"] == "closed"
         with pytest.raises(NoSuchPosition):
             await exits.close_symbol("BTCUSDT")  # nothing left to close
+
+    run(scenario)
+
+
+def test_a_late_sell_response_dates_the_close_by_the_exchange() -> None:
+    # Review 2026-10-03 (EXEC-15): the losing SELL executed 23:59:58 UTC, its
+    # response was read 00:00:03; the fill, close and loss day followed the
+    # reader, and the trade list never corrected them.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        executed = datetime(2026, 10, 3, 23, 59, 58, tzinfo=UTC)
+        state.clock.advance((executed - state.clock.now()).total_seconds())
+        state.fake.set_price("BTCUSDT", Decimal("99.5"))  # a loss, above the stop
+        trade = stack.runtime.trade
+        assert trade is not None
+        real = trade.new_order
+
+        async def late(**kwargs: Any) -> Any:
+            result = await real(**kwargs)
+            state.clock.advance(5)  # the answer arrives after midnight
+            return result
+
+        trade.new_order = late  # type: ignore[method-assign]
+        result = await stack.worker.close(
+            position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
+        )
+        assert result.step is Step.CLOSED
+        position = await state.position(stack, position_id)
+        assert position.closed_at is not None
+        assert position.closed_at.date() == executed.date()
+        assert abs((position.closed_at - executed).total_seconds()) < 1
+        async with stack.runtime.session() as session:
+            assert await losing_trades_today(session, "1001", "live", executed) == 1
+            assert (
+                await losing_trades_today(
+                    session, "1001", "live", executed + timedelta(seconds=5)
+                )
+                == 0
+            )
 
     run(scenario)

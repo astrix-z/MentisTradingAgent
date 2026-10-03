@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -33,6 +34,7 @@ from agent.execution.ledger import (
     PositionApplier,
     lock_position,
     losing_trades_today,
+    transaction_time,
 )
 from agent.execution.models import (
     ExecutionEvent,
@@ -527,3 +529,55 @@ def test_revalued_profit_gives_back_the_provisional_losing_count() -> None:
             assert await losing_trades_today(session, "1001", "live", T0) == 0
 
     run(scenario)
+
+
+# --- review 2026-10-03 (EXEC-15): exchange time, corrected by the trade list ------
+
+
+def test_trade_list_corrects_a_late_response_time_and_moves_the_loss_day() -> None:
+    # The losing SELL executed 23:59:58 UTC; its response, without a trade
+    # time of its own, was booked at 00:00:03 the next day.
+    async def scenario(sessions: async_sessionmaker[AsyncSession]) -> None:
+        executed = datetime(2026, 10, 3, 23, 59, 58, tzinfo=UTC)
+        read = datetime(2026, 10, 4, 0, 0, 3, tzinfo=UTC)
+        position_id = await open_position(
+            sessions, fill(1, at=executed - timedelta(hours=2))
+        )
+        await apply(
+            sessions, position_id, fill(5, order_id=2, side="SELL", price="90", at=read)
+        )
+        await close(sessions, position_id)
+        async with sessions() as session:
+            assert await losing_trades_today(session, "1001", "live", read) == 1
+        authoritative = fill(
+            5, order_id=2, side="SELL", price="90", at=executed, source="my_trades"
+        )
+        async with sessions() as session:
+            position = await lock_position(session, position_id)
+            result = await APPLIER.apply(session, position, [authoritative])
+            assert result.new_fills == [] and result.retimed == [authoritative]
+            await FINALIZER.retime(session, position)
+            await session.commit()
+        position = await get(sessions, position_id)
+        assert position.closed_at == executed
+        assert position.sold_qty == Decimal("0.1")  # not applied twice
+        assert position.outcome is not None
+        assert position.outcome["closed_at"] == executed.isoformat()
+        async with sessions() as session:
+            assert await losing_trades_today(session, "1001", "live", executed) == 1
+            assert await losing_trades_today(session, "1001", "live", read) == 0
+            cooldown = (await session.scalars(select(SymbolCooldown))).one()
+            assert cooldown.cooldown_until == executed + timedelta(minutes=60)
+        async with sessions() as session:  # a second sync changes nothing
+            position = await lock_position(session, position_id)
+            again = await APPLIER.apply(session, position, [authoritative])
+            assert again.retimed == []
+
+    run(scenario)
+
+
+def test_transaction_time_is_the_exchanges_not_the_readers() -> None:
+    order = SimpleNamespace(transact_time=int(T0.timestamp() * 1000))
+    late = T0 + timedelta(seconds=5)
+    assert transaction_time(order, late) == T0
+    assert transaction_time(SimpleNamespace(transact_time=None), late) == late
