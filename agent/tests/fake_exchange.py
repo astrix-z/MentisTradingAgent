@@ -522,6 +522,7 @@ class FakeExchange:
             )
         elif below.open and below.stop_price is not None and price <= below.stop_price:
             below.triggered = True
+            self._settle_list(order_list)  # the trigger cancels the sibling now
         if below.open and below.triggered:
             if below.type == "STOP_LOSS":
                 self._fill(
@@ -561,17 +562,20 @@ class FakeExchange:
         order_list.status_type = "ALL_DONE"
 
     def _settle_list(self, order_list: OrderList) -> None:
-        """Binance OCO: once a leg executes at all, even partly, its sibling
-        is cancelled (EXPIRED). The list ends when no leg is open any more.
+        """Binance OCO: once a leg is triggered or executes at all, even
+        partly, its sibling is cancelled (EXPIRED). The list ends when no leg
+        is open any more.
 
-        The two legs share one lock of the list quantity, so the sibling can
-        never sell what the executed leg already sold.
+        A stop-limit leg that triggered but did not fill (a gap past its
+        limit) rests as a limit order; the take-profit is gone by then, so a
+        rebound can fill only the one leg. The two legs share one lock of the
+        list quantity, so the sibling can never sell what the other sold.
         """
-        executed = [o for o in order_list.orders if o.executed > 0]
-        if not executed:
+        active = [o for o in order_list.orders if o.executed > 0 or o.triggered]
+        if not active:
             return
         for order in order_list.orders:
-            if order.open and order not in executed:
+            if order.open and order not in active:
                 order.status = "EXPIRED"
                 order.update_time = self.now()
         if not any(o.open for o in order_list.orders):

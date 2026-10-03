@@ -266,6 +266,33 @@ def test_market_stop_fills_at_the_gap_price_and_stop_limit_does_not() -> None:
     asyncio.run(scenario())
 
 
+def test_gap_then_rebound_to_the_take_profit_sells_one_leg_only() -> None:
+    # Review 2026-10-03: a triggered, unfilled stop-limit left the TP alive,
+    # and a rebound filled both legs: 0.20 sold of 0.10, locked -0.10.
+    async def scenario() -> None:
+        fake = exchange()
+        trade = client(fake)
+        await buy(trade)
+        await protect(trade, limit="98.5")
+        fake.set_price("BTCUSDT", Decimal(98))  # triggers 99, below 98.5
+        take_profit = fake._by_client_id("mta-s-pt1")
+        stop = fake._by_client_id("mta-s-ps1")
+        assert take_profit is not None and stop is not None
+        assert stop.triggered and stop.status == "NEW"
+        assert take_profit.status == "EXPIRED"  # OCO: the trigger cancels it
+        fake.set_price("BTCUSDT", Decimal(110))  # rebound through the TP
+        assert take_profit.executed == 0
+        assert stop.status == "FILLED" and stop.executed == Decimal("0.1")
+        [order_list] = fake.lists.values()
+        assert order_list.status == "ALL_DONE"
+        free, locked = fake.balance("BTC")
+        assert (free, locked) == (Decimal(0), Decimal(0))
+        sold = sum((o.executed for o in fake.orders_of("BTCUSDT", "SELL")), Decimal(0))
+        assert sold == Decimal("0.1")
+
+    asyncio.run(scenario())
+
+
 def test_partial_fill_during_cancel_leaves_a_remainder() -> None:
     async def scenario() -> None:
         fake = exchange()
