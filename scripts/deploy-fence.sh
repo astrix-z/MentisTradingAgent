@@ -67,8 +67,27 @@ stage_compose() { (cd "$STAGE/tree" && "${COMPOSE[@]}" "$@"); }
 # -e: an error reply (OOM, WRONGTYPE, …) is a non-zero exit; without it
 # redis-cli prints the error and exits 0.
 redis_cli() { (cd "$APP_DIR" && timeout "$CALL_TIMEOUT_S" "${COMPOSE[@]}" exec -T redis redis-cli -e "$@"); }
-# A catalog the agent published: JSON carrying its schema_hash, not just text.
-catalog_ok() { grep -Eq '^\{.*"schema_hash": *"[^"]+"' <<<"$1"; }
+# A catalog the agent published, proven the way the agent builds it: a JSON
+# object with a version, a non-empty list of named strategies and the
+# execution settings, whose schema_hash is the sha256 of exactly those
+# (agent/agent/protocol.py, describe_catalog). Truncated or look-alike text
+# is not a catalog. Prints the schema_hash when it is one.
+CATALOG_CHECK='
+import hashlib, json, sys
+doc = json.loads(sys.stdin.read())
+assert isinstance(doc, dict)
+assert isinstance(doc.get("version"), int) and doc["version"] >= 1
+strategies, execution = doc["strategies"], doc["execution"]
+assert isinstance(strategies, list) and strategies
+assert all(isinstance(s, dict) and isinstance(s.get("name"), str) and s["name"] for s in strategies)
+assert isinstance(execution, dict)
+canonical = json.dumps({"strategies": strategies, "execution": execution},
+                       sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+assert doc.get("schema_hash") == hashlib.sha256(canonical.encode()).hexdigest()
+print(doc["schema_hash"])
+'
+catalog_hash() { python3 -c "$CATALOG_CHECK" <<<"$1" 2>/dev/null; }
+catalog_ok() { catalog_hash "$1" >/dev/null; }
 # Самый свежий непустой дамп базы $1 (пустой файл — не дамп, R123).
 latest_dump() {
   find "$BACKUP_DIR" -maxdepth 1 -name "pre-deploy-$1-*.dump" -size +0c -printf '%T@ %p\n' 2>/dev/null \
@@ -163,6 +182,7 @@ done < <(find "$RELEASES" -maxdepth 1 -name 'stage-*' ! -name "stage-$ATTEMPT" -
 
 [[ -d "$STAGE/tree" ]] || fail "нет артефакта попытки $STAGE/tree"
 command -v rsync >/dev/null || fail "на сервере нет rsync (нужен для чистой установки APP_DIR)"
+command -v python3 >/dev/null || fail "на сервере нет python3 (нужен для проверки каталога агента)"
 
 # --- T0: первый запуск под 09a (§4.6, runbook шаг 7) -------------------------
 # До нового снапшота: иначе «последний дамп» был бы уже нашим.
@@ -330,7 +350,7 @@ while :; do
   sleep "$PAUSE_S"
 done
 catalog_ok "$published" || fail "агент цели не опубликовал $CATALOG_KEY за ${CATALOG_WAIT_S} с"
-echo "    schema_hash: $(grep -o '"schema_hash": *"[^"]*"' <<<"$published" | head -n 1)"
+echo "    schema_hash: $(catalog_hash "$published")"
 
 # Healthcheck — до снятия флага: неработающий backend оставляет Start закрытым (R130).
 echo "==> Healthcheck backend (до ${HEALTH_WAIT_S} с)"

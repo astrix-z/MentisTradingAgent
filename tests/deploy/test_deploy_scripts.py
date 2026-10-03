@@ -15,6 +15,8 @@ real Docker and Redis. Those are the local-stack acceptance of 09a.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import stat
 import subprocess
@@ -25,6 +27,30 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def catalog_document(*names: str, schema_hash: str | None = None) -> str:
+    """A catalog shaped and hashed the way the agent publishes it."""
+    strategies = [{"name": name} for name in names]
+    execution: dict[str, object] = {"entries": []}
+    canonical = json.dumps(
+        {"strategies": strategies, "execution": execution},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    digest = schema_hash or hashlib.sha256(canonical.encode()).hexdigest()
+    return json.dumps(
+        {
+            "version": 1,
+            "schema_hash": digest,
+            "published_at": "2026-10-03T00:00:00+00:00",
+            "strategies": strategies,
+            "execution": execution,
+        }
+    )
+
+
 DEPLOY = ROOT / "scripts/deploy.sh"
 
 
@@ -176,7 +202,7 @@ STUBS: dict[str, str] = {
               if [[ -f "$STATE/catalog_payload" ]]; then
                 cp "$STATE/catalog_payload" "$STATE/redis/agent:strategies"
               elif [[ ! -f "$STATE/agent_silent" ]]; then
-                echo '{"schema_hash": "h-new"}' >"$STATE/redis/agent:strategies"
+                cp "$STATE/valid_catalog" "$STATE/redis/agent:strategies"
               fi ;;
             ps)
               [[ -f "$STATE/containers/c-$2.image" ]] && echo "c-$2" ;;
@@ -297,6 +323,7 @@ def server(tmp_path: Path, request: pytest.FixtureRequest) -> Server:
         server.put(f"images/mentis-{svc}:{T0}", f"id-{svc}-{T0}")
         server.put(f"containers/c-{svc}.image", f"id-{svc}-{T0}")
     server.put("redis/agent:strategies", '{"schema_hash": "h-old"}')
+    server.put("valid_catalog", catalog_document("tripple_screen"))
     return server
 
 
@@ -386,19 +413,28 @@ def test_a_refused_fence_set_stops_before_the_agent_is_touched(server: Server) -
 
 @pytest.mark.parametrize(
     "catalog",
-    ["error", "text"],
-    ids=["wrongtype-error", "not-a-catalog"],
+    ["error", "text", "truncated", "wrong-hash", "no-strategies"],
+    ids=["wrongtype-error", "not-a-catalog", "truncated", "wrong-hash", "empty"],
 )
 def test_the_catalog_gate_needs_a_real_catalog(server: Server, catalog: str) -> None:
     # GET WRONGTYPE printed an error that counted as a publication: the fence
-    # was lifted and the deploy exited 0 with no catalog.
+    # was lifted and the deploy exited 0 with no catalog. Review 2026-10-03:
+    # a truncated '{"schema_hash": "not-a-catalog"' passed the regex too.
     if catalog == "error":
         server.put(
             "error_redis_GET",
             "WRONGTYPE Operation against a key holding the wrong kind of value",
         )
-    else:
+    elif catalog == "text":
         server.put("catalog_payload", "not json at all")  # nonempty, no schema_hash
+    elif catalog == "truncated":
+        server.put("catalog_payload", '{"schema_hash": "not-a-catalog"')
+    elif catalog == "wrong-hash":
+        server.put(
+            "catalog_payload", catalog_document("tripple_screen", schema_hash="0" * 64)
+        )
+    else:
+        server.put("catalog_payload", catalog_document())
     server.env["DEPLOY_CATALOG_WAIT_S"] = "2"
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 1, result.stdout
