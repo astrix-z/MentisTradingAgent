@@ -195,3 +195,37 @@ def test_our_trade_paged_out_by_later_manual_buys_is_still_found() -> None:
         await still_held(state, stack, signal_id)
 
     run(scenario, usdt="10000")
+
+
+# --- re-review 2026-10-03: a foreign BUY's base fee is not ours --------------------
+
+
+def test_a_foreign_buys_base_fee_does_not_hide_our_hidden_buy() -> None:
+    # Commission in the base asset. Our BUY filled, its answer was lost and
+    # its trades are hidden; then the owner tops up USDT and buys 20 times our
+    # quantity by hand. Counted gross, that BUY's fee (2% of ours) would eat
+    # the 1% margin of our BUY in the balance and look like absence.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id, cid = await unknown_entry(state, stack, "timeout_after")
+        [buy] = state.fake.orders_of("BTCUSDT", "BUY")
+        state.fake.hide_trades(buy.order_id)
+        qty = buy.executed
+        price = state.fake.last["BTCUSDT"]
+        state.fake._move("USDT", qty * 20 * price * 2)
+        state.fake.new_order(
+            symbol="BTCUSDT",
+            side="BUY",
+            type="LIMIT",
+            time_in_force="FOK",
+            quantity=str(qty * 20),
+            price=str(price * 2),
+            new_client_order_id="web_manual_big",
+        )
+        state.fake.fault("get_order", "not_found", times=1)  # ours, by client id
+        state.clock.advance(120)
+        with pytest.raises(ReleaseRefused, match="may have filled"):
+            await stack.orders.release_entry(cid)
+        await still_held(state, stack, signal_id)
+
+    run(scenario, commission_asset="base")

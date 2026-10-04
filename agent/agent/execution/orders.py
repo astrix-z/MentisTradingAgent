@@ -585,7 +585,9 @@ class OrderManager:
         A filled entry adds its quantity (less a commission paid in the base
         asset) to the balance, whether or not its trade is visible yet. The
         base asset held beyond the open positions of the symbol and the net
-        of the ``strangers`` trades must be less than that.
+        of the ``strangers`` trades must be less than that. A trade's net is
+        what it did to the balance: its quantity less a commission paid in
+        the base asset — a foreign BUY's fee counted as held would hide ours.
         """
         trade = self.runtime.trade
         context = self.runtime.context
@@ -615,10 +617,13 @@ class OrderManager:
                     )
                 )
             ) or Decimal(0)
-        net = sum(
-            (Decimal(t.qty) if t.is_buyer else -Decimal(t.qty) for t in strangers),
-            Decimal(0),
-        )
+        net = Decimal(0)
+        for t in strangers:
+            if t.commission is None or not t.commission_asset:
+                return f"trade {t.id} of {intent.symbol} has no commission"
+            net += Decimal(t.qty) if t.is_buyer else -Decimal(t.qty)
+            if t.commission_asset == base:
+                net -= Decimal(t.commission)
         unexplained = total - Decimal(held) - net
         if unexplained >= intent.quantity * _FILL_SHARE:
             return (
