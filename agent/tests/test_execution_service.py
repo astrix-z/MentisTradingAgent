@@ -7,13 +7,16 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from alembic import command
 from execution_world import World, run
 
+from agent.core.migrate import _config, migrate
 from agent.exchange.budget import RequestBudget
 from agent.exchange.hub import StreamHub
 from agent.exchange.rest import ExchangeRest
 from agent.exchange.trade import TradeClient
 from agent.execution.admission import Admission
+from agent.execution.attempts import Role
 from agent.execution.filters import FilterCache
 from agent.execution.models import AttemptState, IntentState, PositionStatus
 from agent.execution.orders import EntryOutcome
@@ -508,5 +511,118 @@ def test_startup_reconcile_mutates_nothing_until_it_is_finished() -> None:
         assert position.exchange_stop == Decimal("99.5")
         await restarted.stop()
         await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+# --- re-review 2026-10-03 (EXEC-09): a lost association recorded before 0003 ------
+
+
+async def _upgrade_from_0002(state: World) -> None:
+    """The rows were written by the code before 0003: downgrade, then upgrade."""
+    async with state.db.begin() as connection:
+        await connection.run_sync(
+            lambda c: command.downgrade(_config(c), "0002_execution")
+        )
+    await migrate(state.db)
+
+
+async def _crash_on_association(state: World, first: Any) -> None:
+    async def crash(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("process killed")
+
+    first.protector._mark_protected = crash
+
+
+async def _restart_protects_with_the_live_list(
+    state: World, first: Any, position_id: Any, *, stop: Decimal | None = None
+) -> None:
+    [live] = _live_lists(state)
+    state.clock.advance(31)
+    restarted = service(state)
+    await restarted.runtime.boot()
+    for _ in range(3):
+        await restarted.tick()
+    position = await state.position(first, position_id)
+    assert position.status == PositionStatus.PROTECTED
+    assert position.protection_list_id == live.list_client_order_id
+    if stop is not None:
+        assert position.exchange_stop == stop
+    assert position.operation is None
+    assert _market_sells(state) == []
+    assert len(_live_lists(state)) == 1
+    await restarted.stop()
+    await restarted.runtime.shutdown()
+
+
+def test_legacy_lost_first_association_is_recovered_after_upgrade() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.filled(first)
+        await _crash_on_association(state, first)
+        with pytest.raises(RuntimeError):
+            await first.protector.protect(position_id)
+        await state.kill(first)
+        await _upgrade_from_0002(state)
+        await _restart_protects_with_the_live_list(state, first, position_id)
+
+    run(scenario)
+
+
+def test_legacy_lost_replacement_association_is_recovered_after_upgrade() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        await _crash_on_association(state, first)
+        with pytest.raises(RuntimeError):
+            await first.worker.reprice(position_id, Decimal("99.5"))
+        await state.kill(first)
+        await _upgrade_from_0002(state)
+        await _restart_protects_with_the_live_list(
+            state, first, position_id, stop=Decimal("99.5")
+        )
+
+    run(scenario)
+
+
+def test_legacy_resolved_list_lost_before_association_is_recovered() -> None:
+    # The OCO's answer was lost (UNKNOWN); the round found the list, recorded
+    # RESOLVED and died before associating it.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.filled(first)
+        signal_id = (await state.position(first, position_id)).signal_id
+        state.fake.fault("order_list_oco", "timeout_after")
+        await _crash_on_association(state, first)
+        with pytest.raises(RuntimeError):
+            await first.protector.protect(position_id)
+        [attempt] = [
+            a
+            for a in await state.attempts(first, signal_id)
+            if a.role == Role.LIST.value
+        ]
+        assert attempt.state == AttemptState.RESOLVED
+        await state.kill(first)
+        await _upgrade_from_0002(state)
+        await _restart_protects_with_the_live_list(state, first, position_id)
+
+    run(scenario)
+
+
+def test_upgrade_keeps_lists_whose_effect_is_on_record() -> None:
+    # A completed reprice: pl1 replaced by pl2. Neither may be replayed.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        await first.worker.reprice(position_id, Decimal("99.5"))
+        signal_id = (await state.position(first, position_id)).signal_id
+        await _upgrade_from_0002(state)
+        lists = [
+            a
+            for a in await state.attempts(first, signal_id)
+            if a.role == Role.LIST.value
+        ]
+        assert len(lists) == 2
+        assert all(a.applied_at is not None for a in lists)
 
     run(scenario)
