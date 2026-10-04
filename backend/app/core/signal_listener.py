@@ -31,12 +31,12 @@ from typing import Any
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import text
+from sqlalchemy import text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlmodel import Session, col, select
 
 from app.core.db import engine
-from app.models import SignalPosition
+from app.models import SignalExitPending, SignalPosition
 
 logger = logging.getLogger(__name__)
 
@@ -134,15 +134,61 @@ def _record_entry(payload: dict[str, Any], network: str) -> None:
         .returning(col(SignalPosition.id))
     )
     with Session(engine) as session:
+        _lock_symbol(session, network, position.symbol)
         inserted = session.execute(statement).first() is not None
+        closed_by = _take_pending_exit(session, position) if inserted else None
         session.commit()
     if not inserted:
         return  # already recorded by another worker or a redelivered message
     logger.info(
-        "recorded ENTRY position symbol=%s signal_id=%s",
+        "recorded ENTRY position symbol=%s signal_id=%s%s",
         payload["symbol"],
         signal_id,
+        f" closed by the EXIT of {closed_by.isoformat()}" if closed_by else "",
     )
+
+
+def _lock_symbol(session: Session, network: str, symbol: str) -> None:
+    """Serialize the ENTRY/EXIT writes of one symbol until the commit.
+
+    Two workers overlap in a leadership handover, so an old leader's write
+    may run alongside — or after — the new leader's. Under this lock each
+    write sees every earlier commit of the symbol whole.
+    """
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": f"signal-exit:{network}:{symbol}"},
+    )
+
+
+def _closed_status(exit_reason: str | None) -> str:
+    return "hit_take" if exit_reason == "tp" else "hit_stop"
+
+
+def _take_pending_exit(session: Session, position: SignalPosition) -> datetime | None:
+    """Close a just-recorded ENTRY by an EXIT that was handled before it.
+
+    The earliest waiting EXIT of the symbol emitted at or after the ENTRY
+    is its own: when it was handled, no open position was there to close.
+    """
+    pending = session.exec(
+        select(SignalExitPending)
+        .where(SignalExitPending.network == position.network)
+        .where(SignalExitPending.symbol == position.symbol)
+        .where(SignalExitPending.emitted_at >= position.emitted_at)
+        .order_by(col(SignalExitPending.emitted_at))
+    ).first()
+    if pending is None:
+        return None
+    session.execute(
+        update(SignalPosition)
+        .where(col(SignalPosition.signal_id) == position.signal_id)
+        .values(
+            status=_closed_status(pending.exit_reason), closed_at=pending.emitted_at
+        )
+    )
+    session.delete(pending)
+    return pending.emitted_at
 
 
 def _record_exit(payload: dict[str, Any], network: str) -> None:
@@ -153,24 +199,27 @@ def _record_exit(payload: dict[str, Any], network: str) -> None:
     code in production but keeps the listener correct if/when it starts.
 
     Idempotent: an EXIT is applied at most once. A position of the symbol
-    already closed at this EXIT's ``emitted_at`` means a redelivery (pub/sub
-    after a reconnect, or a leadership handover), which must not close the
-    next open position of the same symbol.
+    already closed at this EXIT's ``emitted_at`` (or the EXIT already
+    waiting) means a redelivery (pub/sub after a reconnect, or a leadership
+    handover), which must not close the next open position of the same
+    symbol.
 
-    The check and the close are one transaction under a transaction-level
-    advisory lock on (network, symbol): two copies of the same EXIT handled
-    at once (two workers overlapping in a handover) run one after the other,
-    and the second sees the first one's close.
+    It closes the latest position emitted at or before it; a later one is
+    not its own. With none, the EXIT waits in ``signal_exit_pending``: an old
+    leader's ENTRY write may still land after it, and is then recorded
+    closed (:func:`_take_pending_exit`).
+
+    Everything runs in one transaction under the symbol's advisory lock
+    (:func:`_lock_symbol`): two copies of the same EXIT handled at once run
+    one after the other, and the second sees the first one's effect.
     """
     closed_at = datetime.fromisoformat(payload["emitted_at"])
+    symbol = payload["symbol"]
     with Session(engine) as session:
-        session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-            {"key": f"signal-exit:{network}:{payload['symbol']}"},
-        )
+        _lock_symbol(session, network, symbol)
         applied = session.exec(
             select(SignalPosition)
-            .where(SignalPosition.symbol == payload["symbol"])
+            .where(SignalPosition.symbol == symbol)
             .where(SignalPosition.network == network)
             .where(SignalPosition.status != "open")
             .where(SignalPosition.closed_at == closed_at)
@@ -179,17 +228,31 @@ def _record_exit(payload: dict[str, Any], network: str) -> None:
             return
         position = session.exec(
             select(SignalPosition)
-            .where(SignalPosition.symbol == payload["symbol"])
+            .where(SignalPosition.symbol == symbol)
             .where(SignalPosition.network == network)
             .where(SignalPosition.status == "open")
+            .where(SignalPosition.emitted_at <= closed_at)
             .order_by(col(SignalPosition.emitted_at).desc())
             .with_for_update()
         ).first()
         if position is None:
+            session.execute(
+                pg_insert(SignalExitPending)
+                .values(
+                    **SignalExitPending(
+                        network=network,
+                        symbol=symbol,
+                        emitted_at=closed_at,
+                        exit_reason=payload.get("exit_reason"),
+                    ).model_dump()
+                )
+                .on_conflict_do_nothing(
+                    index_elements=["network", "symbol", "emitted_at"]
+                )
+            )
+            session.commit()
             return
-        position.status = (
-            "hit_take" if payload.get("exit_reason") == "tp" else "hit_stop"
-        )
+        position.status = _closed_status(payload.get("exit_reason"))
         position.closed_at = closed_at
         session.add(position)
         session.commit()
@@ -312,6 +375,21 @@ async def listen_for_signals(redis: Redis, lease: Lease | None = None) -> None:
                 await pubsub.aclose()  # type: ignore[no-untyped-call]
 
 
+async def _renew(redis: Redis, token: str, lease: Lease) -> bool:
+    """Extend the lock if it is still ours; False if lost or unanswered."""
+    sent_at = lease.now()
+    renew: Awaitable[int] = redis.eval(  # type: ignore[assignment]
+        _RENEW_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token, str(_LEADER_TTL_MS)
+    )
+    try:
+        renewed = await asyncio.wait_for(renew, timeout=_LEADER_RENEW_TIMEOUT_SECONDS)
+    except RedisError, TimeoutError:
+        return False
+    if renewed:
+        lease.extend(sent_at)
+    return bool(renewed)
+
+
 async def _hold_leadership(
     redis: Redis, token: str, listener: asyncio.Task[None], lease: Lease
 ) -> None:
@@ -320,22 +398,33 @@ async def _hold_leadership(
         await asyncio.wait({listener}, timeout=_LEADER_RENEW_SECONDS)
         if listener.done():
             return
-        sent_at = lease.now()
-        renew: Awaitable[int] = redis.eval(  # type: ignore[assignment]
-            _RENEW_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token, str(_LEADER_TTL_MS)
-        )
-        renewed: int
-        try:
-            renewed = await asyncio.wait_for(
-                renew, timeout=_LEADER_RENEW_TIMEOUT_SECONDS
-            )
-        except RedisError, TimeoutError:
-            renewed = 0
-        if renewed:
-            lease.extend(sent_at)
-        if not renewed:
+        if not await _renew(redis, token, lease):
             logger.warning("signal listener lost leadership; stepping down")
             return
+
+
+async def _drain(
+    redis: Redis, token: str, listener: asyncio.Task[None], lease: Lease
+) -> bool:
+    """Wait for the cancelled ``listener`` to end; True if it crashed.
+
+    A write in flight runs to its end (:func:`_in_thread`), however long it
+    takes; the lock is renewed meanwhile, so no other worker takes over and
+    handles the next message alongside it. A lock already lost cannot be
+    renewed — the symbol's ordering in the database covers that case.
+    """
+    while not listener.done():
+        await asyncio.wait({listener}, timeout=_LEADER_RENEW_SECONDS)
+        if not listener.done():
+            await _renew(redis, token, lease)
+    try:
+        listener.result()
+    except asyncio.CancelledError, LeaseLost:
+        pass
+    except Exception:  # noqa: BLE001 - keep electing after a crash
+        logger.exception("signal listener crashed; re-electing")
+        return True
+    return False
 
 
 async def run_signal_listener(redis: Redis) -> None:
@@ -364,14 +453,7 @@ async def run_signal_listener(redis: Redis) -> None:
             await _hold_leadership(redis, token, listener, lease)
         finally:
             listener.cancel()
-            crashed = False
-            try:
-                await listener
-            except asyncio.CancelledError, LeaseLost:
-                pass
-            except Exception:  # noqa: BLE001 - keep electing after a crash
-                logger.exception("signal listener crashed; re-electing")
-                crashed = True
+            crashed = await _drain(redis, token, listener, lease)
             release: Awaitable[int] = redis.eval(  # type: ignore[assignment]
                 _RELEASE_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token
             )

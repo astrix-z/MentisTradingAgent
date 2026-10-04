@@ -153,6 +153,31 @@ class SignalPosition(SQLModel, table=True):
     )
 
 
+class SignalExitPending(SQLModel, table=True):
+    """An EXIT that found no open position of its symbol to close.
+
+    Pub/sub handling may reorder: after a leadership handover the old
+    leader's ENTRY write can land after the new leader handled a later EXIT.
+    The EXIT waits here, and the ENTRY it belongs to (emitted at or before
+    it) is recorded already closed by it.
+    """
+
+    __tablename__ = "signal_exit_pending"
+    __table_args__ = (
+        Index("uq_signal_exit_pending", "network", "symbol", "emitted_at", unique=True),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    network: str
+    symbol: str
+    emitted_at: datetime = Field(sa_type=DateTime(timezone=True))  # type: ignore
+    exit_reason: str | None = None
+    created_at: datetime = Field(
+        default_factory=get_datetime_utc,
+        sa_type=DateTime(timezone=True),  # type: ignore
+    )
+
+
 # --- Strategy presets and option lists (docs/STRATEGY_PRESETS_PLAN.md §4.3.1) ---
 #
 # Table names are explicit: the implicit ones (cf. ``signalposition``) would not

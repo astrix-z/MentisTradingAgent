@@ -294,3 +294,59 @@ def test_leadership_is_released_only_after_the_db_write_in_flight(
         await asyncio.gather(b, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_a_drain_longer_than_the_ttl_keeps_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Re-review 2026-10-03: a cancelled leader stopped renewing while its
+    # write drained; past the TTL another worker took over and handled the
+    # next message before the old write ended.
+    monkeypatch.setattr(sl, "_LEADER_TTL_MS", 200)
+    monkeypatch.setattr(sl, "_LEASE_MARGIN_SECONDS", 0.05)
+    tokens = iter(["A", "B"])
+    monkeypatch.setattr(
+        sl.uuid, "uuid4", lambda: type("U", (), {"hex": next(tokens)})()
+    )
+    started, release = threading.Event(), threading.Event()
+    writes: list[tuple[str, str]] = []
+
+    def blocking_entry(payload: dict[str, Any], _network: str) -> None:
+        writes.append(("start", payload["signal_id"]))
+        if payload["signal_id"] == "s1":
+            started.set()
+            release.wait(5)
+        writes.append(("end", payload["signal_id"]))
+
+    async def network(_redis: Any) -> str:
+        return "testnet"
+
+    monkeypatch.setattr(sl, "_record_entry", blocking_entry)
+    monkeypatch.setattr(sl, "_current_network", network)
+
+    async def scenario() -> None:
+        redis = ExpiringRedis()
+        a = asyncio.create_task(sl.run_signal_listener(redis))  # type: ignore[arg-type]
+        await asyncio.sleep(0.02)
+        redis.publish(
+            json.dumps({"kind": "signal", "type": "ENTRY", "signal_id": "s1"})
+        )
+        await asyncio.to_thread(started.wait, 5)
+        a.cancel()
+        b = asyncio.create_task(sl.run_signal_listener(redis))  # type: ignore[arg-type]
+        await asyncio.sleep(0.5)  # 2.5 × TTL
+        assert redis._live(sl.REDIS_LISTENER_LOCK_KEY) == "A"  # renewed
+        redis.publish(
+            json.dumps({"kind": "signal", "type": "ENTRY", "signal_id": "s2"})
+        )
+        await asyncio.sleep(0.05)
+        assert writes == [("start", "s1")]  # nobody handles s2 alongside
+        release.set()
+        await asyncio.gather(a, return_exceptions=True)
+        await asyncio.sleep(0.1)
+        assert redis._live(sl.REDIS_LISTENER_LOCK_KEY) == "B"
+        assert writes[:2] == [("start", "s1"), ("end", "s1")]
+        b.cancel()
+        await asyncio.gather(b, return_exceptions=True)
+
+    asyncio.run(scenario())
