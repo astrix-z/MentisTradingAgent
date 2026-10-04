@@ -36,13 +36,14 @@ import pytest
 from execution_world import CONTEXT, Stack, World, run
 from redis.exceptions import RedisError
 from sqlalchemy import select, text
-from test_execution_service import service
+from test_execution_service import service, upgrade_from_0002
 from test_market_streams import isolate_sdk_state  # noqa: F401
 from test_monitor_feed import Sdks
 
 from agent.engine import Engine
 from agent.exchange.hub import StreamHub
 from agent.execution.admission import record_signal
+from agent.execution.attempts import Role
 from agent.execution.models import (
     INTENT_HOLDING_STATES,
     ExecutionEvent,
@@ -121,7 +122,10 @@ async def invariants(
                 step = fake.rules[position.symbol].step
                 for leg in live[0].orders:
                     gap = position.quantity - (leg.quantity - leg.executed)
-                    assert Decimal(0) <= gap < step, (position.symbol, leg, gap)
+                    assert Decimal(0) <= gap < step, (
+                        f"{position.symbol} list does not cover the position: "
+                        f"leg {leg.client_order_id} gap {gap}"
+                    )
             elif position.status == PositionStatus.UNKNOWN:
                 # Only a justified UNKNOWN: an outcome still unresolved on
                 # the exchange, and an escalation saying so.
@@ -132,7 +136,7 @@ async def invariants(
                     and (
                         a.state in ("prepared", "sent", "unknown")
                         or (
-                            a.role == "l"
+                            a.role == Role.LIST.value
                             and a.state in ("acked", "resolved")
                             and a.order_list_id is not None
                             and a.applied_at is None
@@ -239,15 +243,40 @@ def test_invariants_reject_an_unjustified_unknown() -> None:
 
 
 def test_invariants_reject_a_list_smaller_than_the_position() -> None:
+    # The ledger stays consistent; only the live list shrinks on the exchange.
     async def scenario(state: World) -> None:
         stack = await state.stack()
-        position_id = await state.protected(stack)
+        await state.protected(stack)
+        await invariants(state, stack.runtime)
+        [order_list] = state.fake.lists.values()
+        step = state.fake.rules["BTCUSDT"].step
+        for leg in order_list.orders:
+            leg.quantity -= step
+        with pytest.raises(AssertionError, match="does not cover the position"):
+            await invariants(state, stack.runtime)
+
+    matrix(scenario)
+
+
+def test_invariants_accept_unknown_held_by_an_unapplied_list() -> None:
+    # Re-review 2026-10-03: the oracle compared the role with "l", not "pl",
+    # so an UNKNOWN justified by an accepted, never associated list failed.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.filled(stack)
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("process killed")
+
+        stack.protector._mark_protected = crash  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            await stack.protector.protect(position_id)
         async with stack.runtime.session() as session, session.begin():
             row = await session.get(Position, position_id)
             assert row is not None
-            row.quantity += Decimal("0.001")  # the list no longer covers it
-        with pytest.raises(AssertionError):
-            await invariants(state, stack.runtime)
+            row.status = PositionStatus.UNKNOWN
+        stack.runtime.alerts["unknown"] = "list BTCUSDT answered, not applied"
+        await invariants(state, stack.runtime)
 
     matrix(scenario)
 
@@ -353,10 +382,14 @@ def test_crash_at_each_boundary_of_the_entry(boundary: str) -> None:
     matrix(scenario)
 
 
+@pytest.mark.parametrize("upgrade", [False, True], ids=["fresh", "upgraded"])
 @pytest.mark.parametrize("which", ["first", "replacement"])
-def test_crash_between_the_oco_ack_and_its_association(which: str) -> None:
+def test_crash_between_the_oco_ack_and_its_association(
+    which: str, upgrade: bool
+) -> None:
     # Review 2026-10-03 (EXEC-09): the OCO's answer is committed, the process
-    # dies before the list is associated with the position.
+    # dies before the list is associated with the position. "upgraded": the
+    # state was written before 0003 and the agent restarts on the new schema.
     async def scenario(state: World) -> None:
         stack = await state.stack()
         if which == "first":
@@ -371,6 +404,10 @@ def test_crash_between_the_oco_ack_and_its_association(which: str) -> None:
                 await stack.protector.protect(position_id)
             else:
                 await stack.worker.reprice(position_id, Decimal("99.5"))
+        if upgrade:
+            for dead in list(state.stacks):
+                await state.kill(dead)
+            await upgrade_from_0002(state)
         recovered = await recover(state)
         position = await state.position(stack, position_id)
         assert position.status == PositionStatus.PROTECTED

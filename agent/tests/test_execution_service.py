@@ -518,7 +518,7 @@ def test_startup_reconcile_mutates_nothing_until_it_is_finished() -> None:
 # --- re-review 2026-10-03 (EXEC-09): a lost association recorded before 0003 ------
 
 
-async def _upgrade_from_0002(state: World) -> None:
+async def upgrade_from_0002(state: World) -> None:
     """The rows were written by the code before 0003: downgrade, then upgrade."""
     async with state.db.begin() as connection:
         await connection.run_sync(
@@ -563,7 +563,7 @@ def test_legacy_lost_first_association_is_recovered_after_upgrade() -> None:
         with pytest.raises(RuntimeError):
             await first.protector.protect(position_id)
         await state.kill(first)
-        await _upgrade_from_0002(state)
+        await upgrade_from_0002(state)
         await _restart_protects_with_the_live_list(state, first, position_id)
 
     run(scenario)
@@ -577,7 +577,7 @@ def test_legacy_lost_replacement_association_is_recovered_after_upgrade() -> Non
         with pytest.raises(RuntimeError):
             await first.worker.reprice(position_id, Decimal("99.5"))
         await state.kill(first)
-        await _upgrade_from_0002(state)
+        await upgrade_from_0002(state)
         await _restart_protects_with_the_live_list(
             state, first, position_id, stop=Decimal("99.5")
         )
@@ -603,7 +603,7 @@ def test_legacy_resolved_list_lost_before_association_is_recovered() -> None:
         ]
         assert attempt.state == AttemptState.RESOLVED
         await state.kill(first)
-        await _upgrade_from_0002(state)
+        await upgrade_from_0002(state)
         await _restart_protects_with_the_live_list(state, first, position_id)
 
     run(scenario)
@@ -616,7 +616,7 @@ def test_upgrade_keeps_lists_whose_effect_is_on_record() -> None:
         position_id = await state.protected(first)
         await first.worker.reprice(position_id, Decimal("99.5"))
         signal_id = (await state.position(first, position_id)).signal_id
-        await _upgrade_from_0002(state)
+        await upgrade_from_0002(state)
         lists = [
             a
             for a in await state.attempts(first, signal_id)
