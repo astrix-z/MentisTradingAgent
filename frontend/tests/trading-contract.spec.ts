@@ -1542,3 +1542,45 @@ test("without a catalog the option lists stay editable and unknown support is sa
   ).toBeVisible()
   expect(api.posts).toEqual([])
 })
+
+test("without a catalog an interval list still normalizes and refuses duplicates", async ({
+  page,
+}) => {
+  // Re-review 2026-10-03: with no schema field the entry was only trimmed;
+  // H1 joined 1h and Save sent a duplicate the backend refuses (422).
+  const api = await mock(page, stopped(), { available: false })
+  await page.route("**/tripple_screen/options/", async (route) => {
+    if (route.request().method() !== "GET") return route.fallback()
+    await route.fulfill({
+      json: {
+        wave_interval: { options: ["1h"], unsupported: null },
+        quote_asset: { options: ["USDT"], unsupported: null },
+      },
+    })
+  })
+  await page.goto("/strategy")
+  await page.getByRole("button", { name: "Edit option lists" }).click()
+  const wave = page.getByRole("region", { name: "wave_interval options" })
+  const add = async (text: string) => {
+    await wave.getByLabel("Add to wave_interval").fill(text)
+    await wave.getByRole("button", { name: "Add", exact: true }).click()
+  }
+  await add("H1")
+  await expect(wave.getByText("1h is already in the list.")).toBeVisible()
+  await expect(wave.locator('[data-option="1h"]')).toContainText("H1")
+  await add("1M") // a month: kept as typed, not 1m
+  await add("M15")
+  await wave.getByRole("button", { name: "Save wave_interval" }).click()
+  await expect(wave.getByText("Saved.")).toBeVisible()
+  expect(api.presets.writes.at(-1)).toEqual({
+    method: "PUT",
+    path: "options/wave_interval",
+    body: { options: ["1h", "1M", "15m"] },
+  })
+
+  // quote_asset is only trimmed: "h1" stays a value of its own.
+  const quote = page.getByRole("region", { name: "quote_asset options" })
+  await quote.getByLabel("Add to quote_asset").fill(" H1 ")
+  await quote.getByRole("button", { name: "Add", exact: true }).click()
+  await expect(quote.locator('[data-option="H1"]')).toBeVisible()
+})

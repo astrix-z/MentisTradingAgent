@@ -751,20 +751,38 @@ export function requiredHistory(
 
 // --- Option list editor (§4.4) ---------------------------------------------------
 
+/** The option lists of intervals (the backend's `OPTION_FIELDS` but
+ * `quote_asset`): known by name, so without a catalog too. */
+const INTERVAL_OPTION_LISTS = [
+  "tide_interval",
+  "wave_interval",
+  "ripple_interval",
+]
+
+/** Whether the list `key` holds intervals, with or without its schema field. */
+export function isIntervalList(
+  key: string,
+  field: StrategyField | undefined,
+): boolean {
+  return field?.widget === "interval" || INTERVAL_OPTION_LISTS.includes(key)
+}
+
 /**
  * One entry of an option list as the editor stores it, the backend's rule:
- * trimmed; for an interval field an exact code of S is kept as is (case
+ * trimmed; for an interval list an exact code of S is kept as is (case
  * matters: `1m` is a minute, `1M` a month), a strict label becomes its code
  * (`H1` → `1h`, `W1` → `1w`), anything else is kept as typed and shown as
- * unsupported (D3). Other fields are only trimmed.
+ * unsupported (D3). Other lists are only trimmed. Without a catalog there
+ * is no S: the label rule still applies.
  */
 export function normalizeOption(
+  key: string,
   field: StrategyField | undefined,
   raw: string,
 ): string {
   const value = raw.trim()
-  if (field?.widget !== "interval") return value
-  if ((field.options ?? []).includes(value)) return value
+  if (!isIntervalList(key, field)) return value
+  if ((field?.options ?? []).includes(value)) return value
   const match = /^([MHDW])([0-9]+)$/.exec(value)
   if (!match) return value
   return `${match[2].replace(/^0+/, "") || "0"}${match[1].toLowerCase()}`

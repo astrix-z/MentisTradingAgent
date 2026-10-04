@@ -17,6 +17,7 @@ import { extractErrorMessage } from "@/utils"
 
 import {
   intervalLabel,
+  isIntervalList,
   normalizeOption,
   optionEntryProblem,
   type StrategyField,
@@ -106,7 +107,7 @@ export function OptionListsEditor({
                 ? !field.options.includes(value)
                 : (stored?.unsupported ?? []).includes(value)
             const label = (value: string) =>
-              field?.widget === "interval" ? intervalLabel(value) : value
+              isIntervalList(key, field) ? intervalLabel(value) : value
             const edited =
               JSON.stringify(draft.values) !==
               JSON.stringify(stored?.options ?? [])
@@ -134,7 +135,7 @@ export function OptionListsEditor({
               update({ values })
             }
             const addEntry = () => {
-              const value = normalizeOption(field, draft.entry)
+              const value = normalizeOption(key, field, draft.entry)
               const problem = optionEntryProblem(value, draft.values)
               if (problem) update({ problem })
               else
