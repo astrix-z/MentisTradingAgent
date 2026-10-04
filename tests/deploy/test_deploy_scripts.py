@@ -20,6 +20,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,8 @@ def catalog_document(*names: str, schema_hash: str | None = None) -> str:
 
 
 DEPLOY = ROOT / "scripts/deploy.sh"
+#: A catalog the agent publishes, whole: the backend's compiler accepts it.
+CATALOG_FIXTURE = ROOT / "frontend/tests/fixtures/strategy-catalog.json"
 
 
 def git(*args: str) -> str:
@@ -169,6 +172,12 @@ STUBS: dict[str, str] = {
                 printf 'mentis-backend:latest\nmentis-agent:latest\n'
               fi ;;
             exec)
+              if [[ "$2" == backend ]]; then
+                # The target's backend: the real compiler of this checkout.
+                shift 3  # -T backend python
+                echo "backend python $1" | head -c 40 >>"$STATE/calls.log"; echo >>"$STATE/calls.log"
+                cd "$BACKEND_DIR" && exec "$BACKEND_PYTHON" "$@"
+              fi
               shift 2; shift  # -T redis redis-cli
               strict=0; [[ "$1" == -e ]] && { strict=1; shift; }
               op="$1"; key="$2"; mkdir -p "$STATE/redis"
@@ -311,7 +320,9 @@ def server(tmp_path: Path, request: pytest.FixtureRequest) -> Server:
         "DEPLOY_CATALOG_WAIT_S": "1",
         "DEPLOY_HEALTH_WAIT_S": "1",
         "DEPLOY_WAIT_TIMEOUT_S": "60",
-        "DEPLOY_CALL_TIMEOUT_S": "5",
+        "DEPLOY_CALL_TIMEOUT_S": "10",
+        "BACKEND_DIR": str(ROOT / "backend"),
+        "BACKEND_PYTHON": sys.executable,
     }
     server = Server(home=home, state=state, env=env)
     # A running stack that already went through 09a once: current = T0.
@@ -323,7 +334,7 @@ def server(tmp_path: Path, request: pytest.FixtureRequest) -> Server:
         server.put(f"images/mentis-{svc}:{T0}", f"id-{svc}-{T0}")
         server.put(f"containers/c-{svc}.image", f"id-{svc}-{T0}")
     server.put("redis/agent:strategies", '{"schema_hash": "h-old"}')
-    server.put("valid_catalog", catalog_document("tripple_screen"))
+    server.put("valid_catalog", CATALOG_FIXTURE.read_text())
     return server
 
 
@@ -440,6 +451,40 @@ def test_the_catalog_gate_needs_a_real_catalog(server: Server, catalog: str) -> 
     assert result.returncode == 1, result.stdout
     assert "не опубликовал agent:strategies" in result.stdout, result.stdout
     assert server.redis("trading:start_fence") is not None  # Start stays closed
+    assert (server.releases / "current").read_text().strip() == T0
+
+
+def rehashed(doc: dict[str, object]) -> str:
+    canonical = json.dumps(
+        {"strategies": doc["strategies"], "execution": doc["execution"]},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return json.dumps(
+        {**doc, "schema_hash": hashlib.sha256(canonical.encode()).hexdigest()}
+    )
+
+
+@pytest.mark.parametrize("defect", ["version", "settings-schema"])
+def test_a_catalog_the_target_backend_cannot_use_keeps_the_fence(
+    server: Server, defect: str
+) -> None:
+    # Re-review 2026-10-03: well-formed and correctly hashed, but the
+    # backend refuses it (unsupported version; a settings schema that is not
+    # an object). The deploy exited 0 and lifted the fence.
+    doc = json.loads(CATALOG_FIXTURE.read_text())
+    if defect == "version":
+        doc["version"] = 999
+    else:
+        doc["strategies"][0]["settings_schema"] = {"type": "string"}
+    server.put("catalog_payload", rehashed(doc))
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1, result.stdout
+    assert "backend цели не принимает" in result.stdout, result.stdout
+    expected = "unsupported catalog version 999" if defect == "version" else "object"
+    assert expected in result.stdout, result.stdout
+    assert server.redis("trading:start_fence") is not None
     assert (server.releases / "current").read_text().strip() == T0
 
 

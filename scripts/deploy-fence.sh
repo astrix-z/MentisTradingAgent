@@ -88,6 +88,20 @@ print(doc["schema_hash"])
 '
 catalog_hash() { python3 -c "$CATALOG_CHECK" <<<"$1" 2>/dev/null; }
 catalog_ok() { catalog_hash "$1" >/dev/null; }
+# Whether the target's backend can use the catalog: its own compiler
+# (supported version, settings schemas, constraints), not a copy of its
+# rules in shell. Prints the backend's reason when it cannot.
+CATALOG_ACCEPT='
+import sys
+from app.core.strategy_catalog import CatalogError, compile_published
+try:
+    compile_published(sys.stdin.read())
+except CatalogError as exc:
+    sys.exit(f"catalog refused: {exc}")
+'
+backend_accepts() {
+  (cd "$APP_DIR" && timeout "$CALL_TIMEOUT_S" "${COMPOSE[@]}" exec -T backend python -c "$CATALOG_ACCEPT") <<<"$1"
+}
 # Самый свежий непустой дамп базы $1 (пустой файл — не дамп, R123).
 latest_dump() {
   find "$BACKUP_DIR" -maxdepth 1 -name "pre-deploy-$1-*.dump" -size +0c -printf '%T@ %p\n' 2>/dev/null \
@@ -365,6 +379,9 @@ while :; do
   sleep "$PAUSE_S"
 done
 (( healthy )) || { compose logs --tail 50 backend || true; fail "backend не прошёл healthcheck $url"; }
+# Healthcheck отвечает всегда; принимает ли backend цели этот каталог, решает его компилятор.
+echo "==> Каталог проверяет backend цели"
+backend_accepts "$published" || fail "backend цели не принимает опубликованный каталог"
 
 echo "==> (6) снятие флага"
 redis_cli DEL "$FENCE_KEY" >/dev/null
