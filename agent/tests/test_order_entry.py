@@ -10,9 +10,11 @@ from decimal import Decimal
 from typing import Any
 
 from execution_world import CONTEXT, World, run
+from sqlalchemy import text
 
 from agent.exchange.budget import RequestBudget
 from agent.execution.admission import record_signal
+from agent.execution.lock import LeaderLock
 from agent.execution.models import AttemptState, IntentState, PositionStatus
 from agent.execution.orders import EntryOutcome
 from agent.execution.quotes import QuoteProvider, QuoteSnapshot
@@ -433,5 +435,115 @@ def test_a_queue_for_a_worker_does_not_buy_on_a_stale_quote() -> None:
         result = await stack.orders.execute_entry(signal_id)
         assert (result.outcome, result.reason) == (EntryOutcome.RELEASED, "expired")
         assert state.fake.calls_to("new_order") == 0
+
+    run(scenario)
+
+
+# --- review 2026-10-04 (EXEC-06/08b): admission read again after awaited reads ----
+
+
+class _During(QuoteProvider):
+    """A quote provider that runs ``hook`` while the snapshot is being read."""
+
+    def __init__(self, inner: QuoteProvider, hook: Any) -> None:
+        self.inner, self.hook = inner, hook
+
+    async def snapshot(self, symbol: str) -> QuoteSnapshot:
+        quote = await self.inner.snapshot(symbol)
+        await self.hook()
+        return quote
+
+
+def test_lock_lost_during_the_quote_read_defers_without_buying() -> None:
+    # The reviewer's repro: the owner's PostgreSQL session is killed and
+    # another process takes the lock while the quote is read; the old
+    # process's flag still says held, and it bought.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack)
+        lock = stack.runtime.lock
+        assert lock is not None
+        rival = LeaderLock(state.url, lock.account, lock.network)
+
+        async def cut() -> None:
+            pid = await lock.backend_pid()
+            async with stack.runtime.session() as session:
+                await session.execute(
+                    text("select pg_terminate_backend(:p)"), {"p": pid}
+                )
+                await session.commit()
+            for _ in range(100):  # the server frees the lock with the session
+                if await rival.acquire():
+                    return
+                await asyncio.sleep(0.02)
+            raise AssertionError("the rival never got the lock")
+
+        real = stack.orders.quotes
+        stack.orders.quotes = lambda network: _During(real(network), cut)
+        try:
+            result = await stack.orders.execute_entry(signal_id)
+        finally:
+            await rival.dispose()
+        assert (result.outcome, result.reason) == (
+            EntryOutcome.DEFERRED,
+            "no execution lock",
+        )
+        assert not stack.runtime.may_mutate() and "lock" in stack.runtime.alerts
+        assert state.fake.calls_to("new_order") == 0
+        intent = await state.intent(stack, signal_id)
+        assert intent.state == IntentState.RESERVED  # the new leader decides
+        assert await state.attempts(stack, signal_id) == []
+
+    run(scenario)
+
+
+def test_stop_during_the_quote_read_releases_without_buying() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack)
+
+        async def stop() -> None:
+            stack.runtime.close_admission()
+
+        real = stack.orders.quotes
+        stack.orders.quotes = lambda network: _During(real(network), stop)
+        result = await stack.orders.execute_entry(signal_id)
+        assert (result.outcome, result.reason) == (
+            EntryOutcome.RELEASED,
+            "strategy_stopped",
+        )
+        assert state.fake.calls_to("new_order") == 0
+        intent = await state.intent(stack, signal_id)
+        assert intent.state != IntentState.RESERVED and intent.quote_reserved == 0
+        assert await state.attempts(stack, signal_id) == []
+
+    run(scenario)
+
+
+def test_stop_during_the_budget_wait_is_refused_in_the_sending_thread() -> None:
+    # After the journal: the attempt exists, so it ends REJECTED (never sent)
+    # and the reserve is released with the Stop as the reason.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack)
+        trade = stack.runtime.trade
+        assert trade is not None
+        acquire = trade.budget.acquire
+
+        async def stopping_acquire(*args: Any, **kwargs: Any) -> None:
+            await acquire(*args, **kwargs)
+            stack.runtime.close_admission()
+
+        trade.budget.acquire = stopping_acquire  # type: ignore[method-assign]
+        result = await stack.orders.execute_entry(signal_id)
+        assert (result.outcome, result.reason) == (
+            EntryOutcome.RELEASED,
+            "strategy_stopped",
+        )
+        assert state.fake.calls_to("new_order") == 0
+        [attempt] = await state.attempts(stack, signal_id)
+        assert attempt.state == AttemptState.REJECTED
+        intent = await state.intent(stack, signal_id)
+        assert intent.state == IntentState.NO_FILL and intent.quote_reserved == 0
 
     run(scenario)

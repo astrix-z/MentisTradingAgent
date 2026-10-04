@@ -18,6 +18,7 @@ accepted residual risk (no fencing on the exchange side).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 
@@ -46,6 +47,8 @@ class LeaderLock:
         self._engine: AsyncEngine = create_async_engine(url, poolclass=NullPool)
         self._connection: AsyncConnection | None = None
         self.held = False
+        # The watchdog and a sender may both check; one connection, one query.
+        self._checking = asyncio.Lock()
 
     async def acquire(self) -> bool:
         """Try once; ``True`` if this process now owns the context."""
@@ -73,6 +76,10 @@ class LeaderLock:
 
     async def check(self) -> bool:
         """Confirm the lock's session is still alive; drops ``held`` if not."""
+        async with self._checking:
+            return await self._check()
+
+    async def _check(self) -> bool:
         if not self.held or self._connection is None:
             return False
         try:

@@ -78,6 +78,8 @@ _TRADE_TIME_SLACK_MS = 5_000
 _FILL_SHARE = Decimal("0.99")
 #: ``error_type`` of the refusal raised when the send deadline has passed.
 _EXPIRED = "Expired"
+#: Refused by our own last check: Stop, Pause or a lost lock before the send.
+_NOT_ADMITTED = "NotAdmitted"
 
 
 def _expired(signal: SignalInbox, now: datetime) -> bool:
@@ -150,6 +152,15 @@ class OrderManager:
         if reason is not None:
             await self._release(signal_id, reason)
             return EntryResult(EntryOutcome.RELEASED, reason)
+        # The quote and filter reads were awaited: Stop, Pause or the loss of
+        # the lock may have happened meanwhile. The flag ``held`` only drops
+        # when someone asks the database, so ask it now — not the flag.
+        if not await runtime.confirm_lead():
+            return EntryResult(EntryOutcome.DEFERRED, "no execution lock")
+        blocked = runtime.admission_block()
+        if blocked is not None:
+            await self._release(signal_id, blocked)
+            return EntryResult(EntryOutcome.RELEASED, blocked)
         async with runtime.session() as session, session.begin():
             locked = await session.get(ExecutionIntent, signal_id, with_for_update=True)
             assert locked is not None
@@ -185,13 +196,24 @@ class OrderManager:
                     Outcome.REJECTED, "expired before send", error_type=_EXPIRED
                 )
 
+        def admitted() -> None:
+            # In the sending thread: only in-memory state, no awaits. A Stop or
+            # a lock loss the watchdog noticed during the journal writes, the
+            # budget wait or the queue for a worker still stops the BUY.
+            in_time()
+            blocked = runtime.admission_block()
+            if blocked is not None:
+                raise TradeCallError(
+                    Outcome.REJECTED, blocked, error_type=_NOT_ADMITTED
+                )
+
         async def place() -> TradeResult[Any]:
             # Last looks at the clock: the journal writes above took time, and
             # the budget may make the request wait; neither may carry the BUY
             # past the signal's validity or any freshness limit of the quote.
             # The second look runs in the sending thread, right before the
             # SDK call: after the budget wait and any queue for a worker.
-            in_time()
+            admitted()
             left = (deadline - self.clock()).total_seconds()
             return await trade.new_order(
                 symbol=intent.symbol,
@@ -203,7 +225,7 @@ class OrderManager:
                 client_order_id=cid,
                 priority=Priority.ENTRY,
                 max_wait=left,
-                before_send=in_time,
+                before_send=admitted,
             )
 
         try:
@@ -212,7 +234,10 @@ class OrderManager:
             if error.outcome is Outcome.UNKNOWN:
                 await self._mark_unknown(signal_id)
                 return EntryResult(EntryOutcome.UNKNOWN, error.message)
-            if error.outcome is Outcome.REJECTED and error.error_type != _EXPIRED:
+            if error.outcome is Outcome.REJECTED and error.error_type not in (
+                _EXPIRED,
+                _NOT_ADMITTED,
+            ):
                 self.filters.invalidate(intent.network, intent.symbol)
             reason = _refusal(error.as_record())
             await self._release(signal_id, reason)
@@ -752,6 +777,8 @@ def _refusal(error: dict[str, Any] | None) -> str:
     error = error or {}
     if error.get("error_type") == _EXPIRED:
         return "expired"
+    if error.get("error_type") == _NOT_ADMITTED:
+        return str(error.get("message"))
     return f"entry_{error.get('outcome')}:{error.get('exchange_code')}"
 
 

@@ -323,6 +323,20 @@ class ExecutionRuntime:
             and self.trade is not None
         )
 
+    async def confirm_lead(self) -> bool:
+        """Ask the database, not the flag, whether this process still leads.
+
+        A killed lock session is only noticed when the connection is used;
+        callers about to start a new mutation after awaited work ask here.
+        """
+        if self.lock is None or not self.may_mutate():
+            return False
+        if await self.lock.check():
+            return True
+        self.reconciled = False
+        self.alerts["lock"] = "execution lock lost; mutations stopped"
+        return False
+
     def admission_block(self) -> str | None:
         """Why no new ENTRY may be executed now, or ``None`` if one may."""
         if not self.settings.enabled:
@@ -335,13 +349,15 @@ class ExecutionRuntime:
             return "no_execution_lock"
         if self.trade is not None and self.trade.budget.banned():
             return "ip_banned"
+        # One atomic copy: the sending thread calls this too (orders.py).
+        alerts = tuple(self.alerts)
         blocking = {"schema", "database", "key", "clock", "account", "lock"} & set(
-            self.alerts
+            alerts
         )
         if blocking:
             return sorted(blocking)[0]
         # Unexplained exchange state (reconcile.py): nothing new until resolved.
-        if any(key.startswith(_UNRESOLVED) for key in self.alerts):
+        if any(key.startswith(_UNRESOLVED) for key in alerts):
             return "divergence"
         return None
 
