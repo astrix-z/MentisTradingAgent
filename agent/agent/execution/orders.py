@@ -189,7 +189,8 @@ class OrderManager:
             # Last looks at the clock: the journal writes above took time, and
             # the budget may make the request wait; neither may carry the BUY
             # past the signal's validity or any freshness limit of the quote.
-            # The second look is after the budget wait, right before the send.
+            # The second look runs in the sending thread, right before the
+            # SDK call: after the budget wait and any queue for a worker.
             in_time()
             left = (deadline - self.clock()).total_seconds()
             return await trade.new_order(

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -372,5 +374,64 @@ def test_last_trade_going_stale_after_presubmit_is_not_bought() -> None:
         result = await stack.orders.execute_entry(signal_id)
         assert (result.outcome, result.reason) == (EntryOutcome.RELEASED, "expired")
         assert state.fake.orders == {}
+
+    run(scenario)
+
+
+# --- re-review 2026-10-03 (EXEC-02/06/14): a queue for a worker thread ----------
+
+
+def _busy_executor_after_journal(state: World, stack: Any, advance: float) -> None:
+    """Once the attempt is journaled as sent, the only worker is busy; the
+    clock moves on by ``advance`` seconds before it is free again."""
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    journal = stack.orders.journal
+    mark = journal._mark
+    free = threading.Event()
+
+    async def free_later() -> None:
+        await asyncio.sleep(0.05)  # the SDK call is queued behind the blocker
+        state.clock.advance(advance)
+        free.set()
+
+    async def busy_mark(attempt_id: str, *, sent: bool) -> None:
+        await mark(attempt_id, sent=sent)
+        if sent:
+            loop.run_in_executor(None, free.wait, 5)
+            loop.create_task(free_later())
+
+    journal._mark = busy_mark
+
+
+def test_a_queue_for_a_worker_does_not_carry_the_buy_past_valid_until() -> None:
+    # The checks pass on the loop, the SDK call waits for a free worker; the
+    # reviewer's repro then bought 3.03 s into a 2 s signal.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack, valid_for=timedelta(seconds=2))
+        _busy_executor_after_journal(state, stack, advance=3)
+        result = await stack.orders.execute_entry(signal_id)
+        assert (result.outcome, result.reason) == (EntryOutcome.RELEASED, "expired")
+        assert state.fake.calls_to("new_order") == 0
+        intent = await state.intent(stack, signal_id)
+        assert intent.state == IntentState.NO_FILL and intent.quote_reserved == 0
+        [attempt] = await state.attempts(stack, signal_id)
+        assert attempt.state == AttemptState.REJECTED  # nothing was sent
+
+    run(scenario)
+
+
+def test_a_queue_for_a_worker_does_not_buy_on_a_stale_quote() -> None:
+    # A long-lived signal; the last trade is 59 s old at pre-submit and
+    # crosses quote_max_trade_age_s (60) while the call waits for a worker.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack)
+        state.fake.last_time["BTCUSDT"] = state.clock.ms() - 59_000
+        _busy_executor_after_journal(state, stack, advance=3)
+        result = await stack.orders.execute_entry(signal_id)
+        assert (result.outcome, result.reason) == (EntryOutcome.RELEASED, "expired")
+        assert state.fake.calls_to("new_order") == 0
 
     run(scenario)

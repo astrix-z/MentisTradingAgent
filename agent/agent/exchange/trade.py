@@ -334,8 +334,10 @@ class TradeClient:
     ) -> TradeResult[T]:
         """Spend budget, run one signed SDK method in a thread, classify.
 
-        ``before_send`` runs after the budget wait, right before the request
-        leaves; whatever it raises aborts the call with nothing sent.
+        ``before_send`` runs in that thread right before the SDK method —
+        after the budget wait and after any wait for a free worker of the
+        executor; whatever it raises aborts the call with nothing sent. It
+        must be safe to call from another thread.
         """
         try:
             await self.budget.acquire(
@@ -343,15 +345,15 @@ class TradeClient:
             )
         except BudgetExhausted as exc:
             raise classify(exc) from exc
-        if before_send is not None:
-            before_send()
         method: Callable[..., ApiResponse[T]] = getattr(self._client.rest_api, name)
         if signed:
             kwargs["recv_window"] = RECV_WINDOW_MS
         # The request runs in a thread that cancelling the caller cannot stop,
         # so the budget feedback (429/418/weight headers) is applied by the
         # task itself when the thread finishes, awaited or not.
-        call = asyncio.ensure_future(asyncio.to_thread(self._invoke, method, kwargs))
+        call = asyncio.ensure_future(
+            asyncio.to_thread(self._invoke, method, kwargs, before_send)
+        )
         self._inflight.add(call)
         call.add_done_callback(self._feedback)
         response = await asyncio.shield(call)
@@ -380,8 +382,13 @@ class TradeClient:
                 self.budget.on_banned(error.retry_after)
 
     def _invoke[T](
-        self, method: Callable[..., ApiResponse[T]], kwargs: dict[str, Any]
+        self,
+        method: Callable[..., ApiResponse[T]],
+        kwargs: dict[str, Any],
+        before_send: Callable[[], None] | None = None,
     ) -> ApiResponse[T]:
+        if before_send is not None:
+            before_send()  # raises as is: nothing was sent
         try:
             response = method(**kwargs)
             response.data()  # an unparsable body surfaces here, inside the thread
@@ -407,7 +414,7 @@ class TradeClient:
     ) -> TradeResult[NewOrderResponse]:
         """Place an order; the response carries fills (``FULL``).
 
-        ``before_send`` is the caller's last check, after the budget wait.
+        ``before_send`` is the caller's last check, in the sending thread.
         """
         _check_client_id(client_order_id)
         return await self._call(
