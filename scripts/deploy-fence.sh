@@ -68,21 +68,29 @@ stage_compose() { (cd "$STAGE/tree" && "${COMPOSE[@]}" "$@"); }
 # redis-cli prints the error and exits 0.
 redis_cli() { (cd "$APP_DIR" && timeout "$CALL_TIMEOUT_S" "${COMPOSE[@]}" exec -T redis redis-cli -e "$@"); }
 # A catalog the agent published, proven the way the agent builds it: a JSON
-# object with a version, a non-empty list of named strategies and the
-# execution settings, whose schema_hash is the sha256 of exactly those
+# object with a version, a non-empty list of named strategies and a
+# schema_hash that is the sha256 of exactly what the agent hashes
 # (agent/agent/protocol.py, describe_catalog). Truncated or look-alike text
 # is not a catalog. Prints the schema_hash when it is one.
+#
+# Every target deploy.sh admits (608cfa1 on) must pass, rollbacks included:
+# since e4dffb4 the catalog carries the execution settings and the hash
+# covers {strategies, execution}; before it there is no "execution" and the
+# hash covers the strategies list alone.
 CATALOG_CHECK='
 import hashlib, json, sys
 doc = json.loads(sys.stdin.read())
 assert isinstance(doc, dict)
 assert isinstance(doc.get("version"), int) and doc["version"] >= 1
-strategies, execution = doc["strategies"], doc["execution"]
+strategies = doc["strategies"]
 assert isinstance(strategies, list) and strategies
 assert all(isinstance(s, dict) and isinstance(s.get("name"), str) and s["name"] for s in strategies)
-assert isinstance(execution, dict)
-canonical = json.dumps({"strategies": strategies, "execution": execution},
-                       sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+if "execution" in doc:
+    assert isinstance(doc["execution"], dict)
+    hashed = {"strategies": strategies, "execution": doc["execution"]}
+else:
+    hashed = strategies
+canonical = json.dumps(hashed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 assert doc.get("schema_hash") == hashlib.sha256(canonical.encode()).hexdigest()
 print(doc["schema_hash"])
 '
@@ -90,14 +98,25 @@ catalog_hash() { python3 -c "$CATALOG_CHECK" <<<"$1" 2>/dev/null; }
 catalog_ok() { catalog_hash "$1" >/dev/null; }
 # Whether the target's backend can use the catalog: its own compiler
 # (supported version, settings schemas, constraints), not a copy of its
-# rules in shell. Prints the backend's reason when it cannot.
+# rules in shell. Prints the backend's reason when it cannot. Backends
+# before a66a659 have no compile_published; their routes parsed the text and
+# called compile_catalog (read_catalog) — the same steps are taken here.
 CATALOG_ACCEPT='
-import sys
-from app.core.strategy_catalog import CatalogError, compile_published
+import json, sys
+from app.core import strategy_catalog as catalog
+raw = sys.stdin.read()
 try:
-    compile_published(sys.stdin.read())
-except CatalogError as exc:
+    if hasattr(catalog, "compile_published"):
+        catalog.compile_published(raw)
+    else:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise catalog.CatalogError("published catalog must be a JSON object")
+        catalog.compile_catalog(payload)
+except catalog.CatalogError as exc:
     sys.exit(f"catalog refused: {exc}")
+except Exception as exc:
+    sys.exit(f"catalog refused: cannot compile published catalog: {exc}")
 '
 backend_accepts() {
   (cd "$APP_DIR" && timeout "$CALL_TIMEOUT_S" "${COMPOSE[@]}" exec -T backend python -c "$CATALOG_ACCEPT") <<<"$1"

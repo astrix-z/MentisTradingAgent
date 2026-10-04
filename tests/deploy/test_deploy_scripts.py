@@ -173,10 +173,12 @@ STUBS: dict[str, str] = {
               fi ;;
             exec)
               if [[ "$2" == backend ]]; then
-                # The target's backend: the real compiler of this checkout.
+                # The target's backend: the real compiler of the target
+                # revision, from the tree the fence installed (compose runs
+                # in APP_DIR), not of this checkout.
                 shift 3  # -T backend python
                 echo "backend python $1" | head -c 40 >>"$STATE/calls.log"; echo >>"$STATE/calls.log"
-                cd "$BACKEND_DIR" && exec "$BACKEND_PYTHON" "$@"
+                cd backend && exec "$BACKEND_PYTHON" "$@"
               fi
               shift 2; shift  # -T redis redis-cli
               strict=0; [[ "$1" == -e ]] && { strict=1; shift; }
@@ -321,7 +323,6 @@ def server(tmp_path: Path, request: pytest.FixtureRequest) -> Server:
         "DEPLOY_HEALTH_WAIT_S": "1",
         "DEPLOY_WAIT_TIMEOUT_S": "60",
         "DEPLOY_CALL_TIMEOUT_S": "10",
-        "BACKEND_DIR": str(ROOT / "backend"),
         "BACKEND_PYTHON": sys.executable,
     }
     server = Server(home=home, state=state, env=env)
@@ -559,6 +560,35 @@ def test_a_rollback_to_saved_images_does_not_build(server: Server) -> None:
     assert result.returncode == 0, result.stdout
     assert not any(" build" in call for call in server.calls())
     assert server.image("mentis-agent:latest") == f"id-agent-{T0}"
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["608cfa1", "e4dffb4"],
+    ids=["catalog-without-execution", "backend-without-compile-published"],
+)
+def test_a_rollback_to_an_admitted_historical_revision_passes_g4(
+    server: Server, target: str
+) -> None:
+    # Review 2026-10-04 (PRESET-09a): deploy.sh admits targets from 608cfa1,
+    # but the fence demanded "execution" in the catalog (608cfa1 has none and
+    # hashes the strategies alone) and imported compile_published (backends
+    # before a66a659 lack it). Both rollbacks ended in G4 with exit 1.
+    # The catalog is that revision's own fixture; the compiler is the
+    # revision's backend from the installed tree.
+    revision = git("rev-parse", "--short=7", target)
+    for svc in ("backend", "agent"):
+        server.put(f"images/mentis-{svc}:{revision}", f"id-{svc}-{revision}")
+    server.put(
+        "valid_catalog",
+        git("show", f"{revision}:frontend/tests/fixtures/strategy-catalog.json"),
+    )
+    result = server.deploy("--revision", revision)
+    assert result.returncode == 0, result.stdout
+    assert not any(" build" in call for call in server.calls())
+    assert any(call.startswith("backend python") for call in server.calls())
+    assert server.redis("trading:start_fence") is None
+    assert (server.releases / "current").read_text().strip() == revision
 
 
 def test_a_target_without_images_or_a_tracked_lock_is_refused(server: Server) -> None:
