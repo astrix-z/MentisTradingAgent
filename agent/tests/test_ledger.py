@@ -576,6 +576,75 @@ def test_trade_list_corrects_a_late_response_time_and_moves_the_loss_day() -> No
     run(scenario)
 
 
+def test_a_retimed_fee_without_a_price_is_pending_until_revalued() -> None:
+    # Re-review 2026-10-03: the trade list corrects the SELL's time while no
+    # BNB price is there for the new time; the fee kept its old-time value
+    # (0.001 USDT) for good — profit +0.0005, not losing. At BNB=2 the right
+    # result is a fee of 0.002 and a loss of 0.0005.
+    async def scenario(sessions: async_sessionmaker[AsyncSession]) -> None:
+        read = T0 + timedelta(hours=1)
+        executed = read - timedelta(seconds=5)
+        position_id = await open_position(
+            sessions, fill(1, commission="0", asset="USDT")
+        )
+        BNB["price"] = Decimal(1)
+        try:
+            await apply(
+                sessions,
+                position_id,
+                fill(
+                    5,
+                    order_id=2,
+                    side="SELL",
+                    price="100.015",
+                    commission="0.001",
+                    at=read,
+                ),
+            )
+            await close(sessions, position_id)
+            position = await get(sessions, position_id)
+            assert position.outcome is not None
+            assert position.outcome["counted_losing"] is False
+            authoritative = fill(
+                5,
+                order_id=2,
+                side="SELL",
+                price="100.015",
+                commission="0.001",
+                at=executed,
+                source="my_trades",
+            )
+            BNB["price"] = None  # type: ignore[assignment]
+            async with sessions() as session:
+                position = await lock_position(session, position_id)
+                result = await APPLIER.apply(session, position, [authoritative])
+                assert result.retimed == [authoritative]
+                await FINALIZER.retime(session, position)
+                await session.commit()
+            position = await get(sessions, position_id)
+            assert position.commission_quote == 0  # the old value is withdrawn
+            assert position.outcome is not None
+            assert position.outcome["commission_pending"] == [5]
+            assert position.outcome["counted_losing"] is True
+            assert not await revalue(sessions, position_id)  # still no price
+            BNB["price"] = Decimal(2)
+            await apply(sessions, position_id, authoritative)  # replay: no-op
+            assert await revalue(sessions, position_id)
+            assert await revalue(sessions, position_id)  # idempotent
+        finally:
+            BNB["price"] = Decimal(600)
+        position = await get(sessions, position_id)
+        assert position.commission_quote == Decimal("0.002")
+        assert position.realized_pnl == Decimal("-0.0005")
+        assert position.outcome is not None
+        assert position.outcome["commission_pending"] == []
+        assert position.outcome["counted_losing"] is True
+        async with sessions() as session:
+            assert await losing_trades_today(session, "1001", "live", executed) == 1
+
+    run(scenario)
+
+
 def test_transaction_time_is_the_exchanges_not_the_readers() -> None:
     order = SimpleNamespace(transact_time=int(T0.timestamp() * 1000))
     late = T0 + timedelta(seconds=5)

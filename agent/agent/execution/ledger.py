@@ -383,8 +383,10 @@ class PositionApplier:
     ) -> bool:
         """Correct a booked fill's time from ``fill``; True if it changed.
 
-        The commission is valued again at the corrected time when a price is
-        there for it (the old value stays otherwise), and the position's
+        The commission is valued again at the corrected time. With no price
+        for that time the old value — of the wrong time — is withdrawn: the
+        fee is unpriced again (``NULL``), and the finalizer's pending
+        revaluation prices it once a price is there. The position's
         ``opened_at`` follows its earliest BUY.
         """
         row = await session.get(
@@ -398,9 +400,8 @@ class PositionApplier:
         row.source = fill.source
         if row.commission_quote is not None:
             value = await self._converter.convert(fill)
-            if value is not None:
-                position.commission_quote += value - row.commission_quote
-                row.commission_quote = value
+            position.commission_quote += (value or Decimal(0)) - row.commission_quote
+            row.commission_quote = value
         if fill.side == "BUY":
             await session.flush()
             position.opened_at = await session.scalar(
@@ -599,7 +600,19 @@ class Finalizer:
         before = position.closed_at
         closed_at = last_sell or before or datetime.now(UTC)
         pnl = position.sold_quote - position.bought_quote - position.commission_quote
-        losing = pnl < 0 or bool(outcome.get("commission_pending"))
+        # A fee whose value was withdrawn with its old time is pending again.
+        pending = sorted(
+            int(trade_id)
+            for trade_id in (
+                await session.scalars(
+                    select(Fill.trade_id).where(
+                        Fill.position_id == position.id,
+                        Fill.commission_quote.is_(None),
+                    )
+                )
+            ).all()
+        )
+        losing = pnl < 0 or bool(pending)
         if bool(outcome.get("counted_losing")) and before is not None:
             await _count_losing(session, position, before, -1)
         if losing:
@@ -624,6 +637,7 @@ class Finalizer:
             "closed_at": transport_value(closed_at),
             "realized_pnl": transport_value(pnl),
             "commission_quote": transport_value(position.commission_quote),
+            "commission_pending": pending,
             "counted_losing": losing,
         }
         await record_event(
