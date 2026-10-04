@@ -1477,6 +1477,42 @@ test("a preset invalid only for a missing option is valid again once the option 
   ).toBeEnabled()
 })
 
+test("presets read without a catalog are read again when the catalog first appears", async ({
+  page,
+}) => {
+  // Re-review 2026-10-03: the first unavailable → ready transition did not
+  // read the presets again; the stale built-in Fast (tp 5) stayed.
+  const published = catalog({ available: false })
+  const api = await mock(page, stopped(), published)
+  let presetReads = 0
+  page.on("request", (request) => {
+    if (
+      request.method() === "GET" &&
+      request.url().endsWith("/tripple_screen/presets/")
+    )
+      presetReads += 1
+  })
+  await page.clock.install()
+  await page.goto("/strategy")
+  await expect(
+    page.getByText(/has not published a strategy catalog/),
+  ).toBeVisible()
+  await expect.poll(() => presetReads).toBe(1)
+
+  // The agent publishes its catalog, whose Fast takes profit at 7.
+  const body = structuredClone(strategyCatalog)
+  body.strategies[0].presets[1].params.tp_pct = "7"
+  Object.assign(published, catalog(body))
+  api.presets.list.items[1].params.tp_pct = "7"
+  await page.clock.runFor(61_000)
+  await expect(page.getByLabel("Take profit %")).toBeVisible()
+  await expect.poll(() => presetReads).toBe(2)
+  await choose(page, "Preset", "Fast · built-in")
+  await expect(page.getByLabel("Take profit %")).toHaveValue("7")
+  await page.clock.runFor(61_000)
+  expect(presetReads).toBe(2) // read once more, not again and again
+})
+
 test("without a catalog the option lists stay editable and unknown support is said", async ({
   page,
 }) => {

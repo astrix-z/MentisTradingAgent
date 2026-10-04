@@ -284,16 +284,34 @@ function Strategy() {
   // as well. Presets are not polled, so when either changes — another
   // administrator restored an option, a redeployed agent — read them again
   // instead of showing a stale "invalid" beside a passing local check.
+  // Presets read while the agent had no catalog carry built-ins the server
+  // could not sync; they are read again once a catalog is there, the first
+  // time included.
   const presetsContext = useRef<string | null>(null)
+  const presetsReadWithoutCatalog = useRef(false)
+  const catalogMissing = catalog?.available === false
   useEffect(() => {
+    if (catalogMissing && presetsQuery.isSuccess)
+      presetsReadWithoutCatalog.current = true
     if (!contextReady) return
     const previous = presetsContext.current
     presetsContext.current = context
-    if (previous !== null && previous !== context)
+    const stale =
+      presetsReadWithoutCatalog.current ||
+      (previous !== null && previous !== context)
+    presetsReadWithoutCatalog.current = false
+    if (stale)
       void queryClient.invalidateQueries({
         queryKey: ["strategy-presets", strategyName],
       })
-  }, [contextReady, context, queryClient, strategyName])
+  }, [
+    catalogMissing,
+    presetsQuery.isSuccess,
+    contextReady,
+    context,
+    queryClient,
+    strategyName,
+  ])
   const presetEntries: PresetEntry[] = useMemo(
     () =>
       (presets ?? []).map((preset) => ({
