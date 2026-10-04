@@ -325,6 +325,92 @@ def test_a_failed_subscribe_is_tried_again_by_the_next_follow() -> None:
     asyncio.run(scenario())
 
 
+def test_a_subscribe_joined_in_flight_fails_for_everyone_who_joined() -> None:
+    # Re-review 2026-10-03: the strategy's kline subscribe is in flight; the
+    # monitor joins the same stream, sees an owner and sends nothing. The
+    # strategy's subscribe then fails: the monitor used to stay the owner of
+    # a stream that never existed and was "ready" without bars.
+    async def scenario() -> None:
+        sdks = Sdks()
+        hub = StreamHub(factory=sdks.factory)
+        strategy = await hub.attach("live", "strategy")
+        await strategy.start()
+        sdk = sdks.by_network["live"]
+        release = asyncio.Event()
+        real = sdk.subscribe
+
+        async def held(streams: list[str], response_model: Any = None) -> None:
+            if any("kline" in s for s in streams) and not release.is_set():
+                await release.wait()
+                raise ConnectionError("subscribe failed")
+            await real(streams, response_model)
+
+        sdk.subscribe = held  # type: ignore[method-assign]
+        first = asyncio.create_task(
+            strategy.subscribe_klines_batch([("BTCUSDT", "15m", lambda m: None)])
+        )
+        await asyncio.sleep(0)
+        feed = feed_for(hub, Loader({}))
+        followed = [Followed(uuid.uuid4(), "BTCUSDT", "15m", 2, None)]
+        joined = asyncio.create_task(feed.follow("live", followed))
+        await asyncio.sleep(0.01)
+        assert not joined.done()  # waits for the strategy's subscribe
+        release.set()
+        with pytest.raises(ConnectionError):
+            await first
+        with pytest.raises(ConnectionError):
+            await joined
+        assert ("BTCUSDT", "15m") not in hub._klines
+        assert not feed.ready("BTCUSDT", "15m")
+
+        await feed.follow("live", followed)  # the next round subscribes it
+        await asyncio.gather(*feed._backfills.values())
+        assert sdk.callbacks.get("btcusdt@kline_15m")
+        assert sdk.callbacks.get("btcusdt@trade")
+        assert feed.ready("BTCUSDT", "15m")
+        assert list(hub._klines[("BTCUSDT", "15m")]) == [feed._view]
+        await feed.close()
+        await strategy.stop()
+
+    asyncio.run(scenario())
+
+
+def test_a_subscribe_joined_in_flight_succeeds_for_everyone() -> None:
+    async def scenario() -> None:
+        sdks = Sdks()
+        hub = StreamHub(factory=sdks.factory)
+        one = await hub.attach("live", "strategy")
+        two = await hub.attach("live", "monitor")
+        await one.start()
+        sdk = sdks.by_network["live"]
+        release = asyncio.Event()
+        real = sdk.subscribe
+
+        async def held(streams: list[str], response_model: Any = None) -> None:
+            await release.wait()
+            await real(streams, response_model)
+
+        sdk.subscribe = held  # type: ignore[method-assign]
+        bars: list[Any] = []
+        first = asyncio.create_task(
+            one.subscribe_trades_batch([("ETHUSDT", bars.append)])
+        )
+        await asyncio.sleep(0)
+        second = asyncio.create_task(
+            two.subscribe_trades_batch([("ETHUSDT", bars.append)])
+        )
+        await asyncio.sleep(0.01)
+        assert not second.done()
+        release.set()
+        await asyncio.gather(first, second)
+        assert sdk.subscribe_messages == [["ethusdt@trade"]]
+        deliver(sdk, "ethusdt@trade", "t1")
+        assert bars == ["t1", "t1"]
+        assert hub._pending_trades == {}
+
+    asyncio.run(scenario())
+
+
 def test_backoff_after_many_failures_stays_at_its_cap() -> None:
     # Review 2026-10-03: 5 s × 2**44 overflowed timedelta on the 45th failure.
     async def scenario() -> None:

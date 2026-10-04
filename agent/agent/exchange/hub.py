@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Sequence
-from typing import Any
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any, TypeVar
 
 from agent.exchange.rest import Network
 from agent.exchange.streams import (
@@ -36,6 +36,8 @@ from agent.exchange.streams import (
 )
 
 logger = logging.getLogger(__name__)
+
+_Key = TypeVar("_Key")
 
 
 class NetworkBusy(RuntimeError):
@@ -52,6 +54,10 @@ class StreamHub:
         self._views: set[StreamView] = set()
         self._klines: dict[KlineKey, dict[StreamView, KlineCallback]] = {}
         self._trades: dict[str, dict[StreamView, TradeCallback]] = {}
+        #: Streams whose subscribe is in flight: whoever joins one waits for
+        #: its outcome instead of taking an owner entry for an established stream.
+        self._pending_klines: dict[KlineKey, asyncio.Future[None]] = {}
+        self._pending_trades: dict[str, asyncio.Future[None]] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -104,22 +110,17 @@ class StreamHub:
     async def _subscribe_klines(
         self, view: StreamView, items: Sequence[tuple[str, str, KlineCallback]]
     ) -> None:
-        assert self._streams is not None
-        new: list[tuple[str, str, KlineCallback]] = []
-        for symbol, interval, callback in items:
-            key = (symbol.upper(), interval)
-            owners = self._klines.setdefault(key, {})
-            if not owners:
-                new.append((key[0], interval, self._kline_fanout(key)))
-            owners[view] = callback
-        try:
-            await self._streams.subscribe_klines_batch(new)
-        except BaseException:
-            # Not subscribed: forget the owners this call added for streams
-            # that did not exist, so the next call subscribes them again.
-            for symbol, interval, _ in new:
-                self._drop_owner(self._klines, (symbol, interval), view)
-            raise
+        streams = self._streams
+        assert streams is not None
+        await self._subscribe(
+            self._klines,
+            self._pending_klines,
+            view,
+            [((s.upper(), i), cb) for s, i, cb in items],
+            lambda keys: streams.subscribe_klines_batch(
+                [(s, i, self._kline_fanout((s, i))) for s, i in keys]
+            ),
+        )
 
     async def _unsubscribe_klines(
         self, view: StreamView, pairs: Sequence[tuple[str, str]]
@@ -139,20 +140,61 @@ class StreamHub:
     async def _subscribe_trades(
         self, view: StreamView, items: Sequence[tuple[str, TradeCallback]]
     ) -> None:
-        assert self._streams is not None
-        new: list[tuple[str, TradeCallback]] = []
-        for symbol, callback in items:
-            key = symbol.upper()
-            owners = self._trades.setdefault(key, {})
+        streams = self._streams
+        assert streams is not None
+        await self._subscribe(
+            self._trades,
+            self._pending_trades,
+            view,
+            [(s.upper(), cb) for s, cb in items],
+            lambda keys: streams.subscribe_trades_batch(
+                [(s, self._trade_fanout(s)) for s in keys]
+            ),
+        )
+
+    async def _subscribe(
+        self,
+        table: dict[_Key, dict[StreamView, Any]],
+        pending: dict[_Key, asyncio.Future[None]],
+        view: StreamView,
+        items: list[tuple[_Key, Any]],
+        send: Callable[[list[_Key]], Awaitable[None]],
+    ) -> None:
+        """Make ``view`` an owner of each stream once the stream exists.
+
+        A stream nobody owns is subscribed by this call. One whose subscribe
+        is in flight (another view's call) is waited for: its success is
+        ours, its failure fails us too. On failure every owner of a stream
+        that never came to exist is forgotten — whoever joined while it was
+        in flight included — so the next call subscribes it again.
+        """
+        loop = asyncio.get_running_loop()
+        new: list[_Key] = []
+        waits: list[asyncio.Future[None]] = []
+        for key, callback in items:
+            owners = table.setdefault(key, {})
             if not owners:
-                new.append((key, self._trade_fanout(key)))
+                new.append(key)
+                pending[key] = loop.create_future()
+            elif key in pending:
+                waits.append(pending[key])
             owners[view] = callback
         try:
-            await self._streams.subscribe_trades_batch(new)
-        except BaseException:
-            for symbol, _ in new:
-                self._drop_owner(self._trades, symbol, view)
+            await send(new)
+        except BaseException as error:
+            for key in new:
+                table.pop(key, None)
+                future = pending.pop(key)
+                future.set_exception(
+                    ConnectionError(f"subscribe of {key} failed: {error!r}")
+                )
+                future.exception()  # retrieved here; waiters still get it
             raise
+        for key in new:
+            pending.pop(key).set_result(None)
+        for future in waits:
+            # On failure our owner entry went with the stream: nothing to undo.
+            await asyncio.shield(future)
 
     @staticmethod
     def _drop_owner(
