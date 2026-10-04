@@ -44,6 +44,7 @@ from agent.engine import Engine
 from agent.exchange.hub import StreamHub
 from agent.execution.admission import record_signal
 from agent.execution.attempts import Role
+from agent.execution.lock import LeaderLock
 from agent.execution.models import (
     INTENT_HOLDING_STATES,
     ExecutionEvent,
@@ -57,10 +58,12 @@ from agent.execution.models import (
 )
 from agent.execution.orders import EntryOutcome
 from agent.execution.outcome import ExitMechanism, ExitReason
+from agent.execution.quotes import QuoteProvider, QuoteSnapshot
 from agent.execution.reconcile import Reconciler
 from agent.execution.runtime import ContextRefused, ExecutionRuntime
 from agent.execution.service import ExecutionService
 from agent.execution.settings import ExecutionSettings
+from agent.execution.worker import Operation
 
 # --- invariants ---------------------------------------------------------------------
 
@@ -414,6 +417,92 @@ def test_crash_between_the_oco_ack_and_its_association(
         sells = [o for o in state.fake.orders.values() if o.side == "SELL"]
         assert all(o.type != "MARKET" for o in sells)
         await finish(state, recovered)
+
+    matrix(scenario)
+
+
+@pytest.mark.parametrize("upgrade", [False, True], ids=["fresh", "upgraded"])
+def test_lost_replacement_ack_then_a_recorded_close(upgrade: bool) -> None:
+    # Review 2026-10-04 (EXEC-09a/11b/13): pl2 accepted, its association lost,
+    # then a manual Close made durable. "upgraded": written before 0003; 0004
+    # used to skip every EXIT, leaving pl2 holding the asset against the SELL.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        stack.protector._mark_protected = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("process killed")
+        )
+        with pytest.raises(RuntimeError):
+            await stack.worker.reprice(position_id, Decimal("99.5"))
+        await stack.worker._record(
+            position_id,
+            Operation.EXIT,
+            {
+                "reason": ExitReason.MANUAL.value,
+                "mechanism": ExitMechanism.MANUAL_CLOSE.value,
+            },
+        )
+        if upgrade:
+            for dead in list(state.stacks):
+                await state.kill(dead)
+            await upgrade_from_0002(state)
+        recovered = await recover(state)
+        position = await state.position(stack, position_id)
+        assert position.status == PositionStatus.CLOSED
+        sells = [o for o in state.fake.orders.values() if o.side == "SELL"]
+        assert [o.type for o in sells if o.type == "MARKET"] == ["MARKET"]
+        assert not [ol for ol in state.fake.lists.values() if ol.status == "EXECUTING"]
+        await finish(state, recovered)
+
+    matrix(scenario)
+
+
+@pytest.mark.parametrize("cause", ["stop", "lost_lock"])
+def test_admission_lost_during_the_presubmit_quote_sends_nothing(cause: str) -> None:
+    # Review 2026-10-04 (EXEC-06/08b/13): Stop, or the lock session killed and
+    # taken by another process, while the pre-submit quote is read. Nothing
+    # may reach the exchange; the next process finds the intent consistent.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        signal_id = await state.reserve(stack)
+        lock = stack.runtime.lock
+        assert lock is not None
+        rival = LeaderLock(state.url, lock.account, lock.network)
+        real = stack.orders.quotes
+
+        async def interfere() -> None:
+            if cause == "stop":
+                stack.runtime.close_admission()
+                return
+            pid = await lock.backend_pid()
+            async with stack.runtime.session() as session:
+                await session.execute(
+                    text("select pg_terminate_backend(:p)"), {"p": pid}
+                )
+                await session.commit()
+            for _ in range(100):
+                if await rival.acquire():
+                    return
+                await asyncio.sleep(0.02)
+            raise AssertionError("the rival never got the lock")
+
+        class During(QuoteProvider):
+            def __init__(self, inner: QuoteProvider) -> None:
+                self.inner = inner
+
+            async def snapshot(self, symbol: str) -> QuoteSnapshot:
+                quote = await self.inner.snapshot(symbol)
+                await interfere()
+                return quote
+
+        stack.orders.quotes = lambda network: During(real(network))
+        try:
+            result = await stack.orders.execute_entry(signal_id)
+        finally:
+            await rival.dispose()
+        assert result.outcome in (EntryOutcome.RELEASED, EntryOutcome.DEFERRED)
+        assert state.fake.calls_to("new_order") == 0  # no exchange mutation
+        await finish(state, await recover(state))
 
     matrix(scenario)
 

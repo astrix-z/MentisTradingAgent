@@ -11,8 +11,10 @@ position is closed, or protected by this list, or by a list sent after it.
 Every other answered list of an open position goes back to recovery, which
 reads it from the exchange: a live one becomes the protection, a finished
 one has its legs proven and booked (a no-op for a list already booked).
-Positions in an EXIT operation are left alone — the worker's exit does not
-settle lists, and an exit was under way before the upgrade.
+The rule is the same whatever operation the position is in. An EXIT is no
+exception: the worker settles an unapplied list before it sells, and a live
+one restarts the exit on it (cancel → barrier → SELL); left applied, that
+list held the asset while every SELL was refused (review 2026-10-04).
 
 Revision ID: 0004_legacy_lists
 Revises: 0003_attempt_applied
@@ -39,7 +41,6 @@ WHERE a.role = 'pl'
     SELECT 1 FROM position AS p
     WHERE p.signal_id = a.signal_id
       AND p.status <> 'closed'
-      AND (p.operation IS NULL OR p.operation = 'reprice')
       AND p.protection_list_id IS DISTINCT FROM a.client_order_id
       AND NOT EXISTS (
         SELECT 1 FROM order_attempt AS current

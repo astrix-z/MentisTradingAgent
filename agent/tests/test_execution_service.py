@@ -24,6 +24,7 @@ from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.quotes import QuoteProvider
 from agent.execution.runtime import ExecutionRuntime
 from agent.execution.service import ExecutionService
+from agent.execution.worker import Operation
 
 
 def service(state: World, hub: StreamHub | None = None) -> ExecutionService:
@@ -624,5 +625,97 @@ def test_upgrade_keeps_lists_whose_effect_is_on_record() -> None:
         ]
         assert len(lists) == 2
         assert all(a.applied_at is not None for a in lists)
+
+    run(scenario)
+
+
+# --- review 2026-10-04 (EXEC-09a/11b): a lost replacement ACK, then a recorded EXIT --
+
+
+async def _lost_replacement_then_close(state: World) -> tuple[Any, Any]:
+    """pl1 cancelled, pl2 accepted and its answer committed, the association
+    lost; then a manual Close recorded durably before the process died."""
+    first = await state.stack()
+    position_id = await state.protected(first)
+    await _crash_on_association(state, first)
+    with pytest.raises(RuntimeError):
+        await first.worker.reprice(position_id, Decimal("99.5"))
+    await first.worker._record(
+        position_id,
+        Operation.EXIT,
+        {
+            "reason": ExitReason.MANUAL.value,
+            "mechanism": ExitMechanism.MANUAL_CLOSE.value,
+        },
+    )
+    await state.kill(first)
+    position = await state.position(first, position_id)
+    assert position.operation == Operation.EXIT.value
+    assert len(_live_lists(state)) == 1  # pl2, held by nobody's record
+    return first, position_id
+
+
+async def _restart_closes_through_the_live_list(
+    state: World, first: Any, position_id: Any
+) -> None:
+    restarted = service(state)
+    await restarted.runtime.boot()
+    for _ in range(3):
+        await restarted.tick()
+    position = await state.position(first, position_id)
+    assert position.status == PositionStatus.CLOSED
+    assert _live_lists(state) == []
+    assert len(_market_sells(state)) == 1
+    signal_id = position.signal_id
+    exits = [
+        a for a in await state.attempts(first, signal_id) if a.role == Role.EXIT.value
+    ]
+    assert [a.state for a in exits] == [AttemptState.ACKED]  # no refused SELL
+    await restarted.stop()
+    await restarted.runtime.shutdown()
+
+
+def test_lost_replacement_then_close_exits_without_an_upgrade() -> None:
+    # The control: on the current schema the unapplied answer finds pl2.
+    async def scenario(state: World) -> None:
+        first, position_id = await _lost_replacement_then_close(state)
+        await _restart_closes_through_the_live_list(state, first, position_id)
+
+    run(scenario)
+
+
+def test_legacy_lost_replacement_then_close_exits_after_upgrade() -> None:
+    # The reviewer's repro: 0004 skipped every EXIT, so pl2 stayed applied and
+    # invisible; three ticks went overdue and every SELL was refused.
+    async def scenario(state: World) -> None:
+        first, position_id = await _lost_replacement_then_close(state)
+        await upgrade_from_0002(state)
+        await _restart_closes_through_the_live_list(state, first, position_id)
+
+    run(scenario)
+
+
+def test_upgrade_keeps_the_list_an_exit_is_already_cancelling() -> None:
+    # An EXIT recorded on a protected position: pl1 is the protection on
+    # record, so it stays applied — the exit cancels it, nothing replays it.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        await first.worker._record(
+            position_id,
+            Operation.EXIT,
+            {
+                "reason": ExitReason.MANUAL.value,
+                "mechanism": ExitMechanism.MANUAL_CLOSE.value,
+            },
+        )
+        signal_id = (await state.position(first, position_id)).signal_id
+        await upgrade_from_0002(state)
+        [pl1] = [
+            a
+            for a in await state.attempts(first, signal_id)
+            if a.role == Role.LIST.value
+        ]
+        assert pl1.applied_at is not None
 
     run(scenario)
