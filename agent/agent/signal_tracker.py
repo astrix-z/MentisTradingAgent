@@ -137,6 +137,36 @@ class SignalTracker:
         self._market = market
         self._publish = publish
         self._clock = clock or (lambda: datetime.now(UTC))
+        #: Told of each crossing as soon as it is recorded (before the EXIT is
+        #: published): the engine's virtual position feedback (869f6m7vg).
+        self.on_closed: Callable[[SignalWatch], Awaitable[None]] | None = None
+
+    async def snapshot(
+        self, network: str, since: datetime
+    ) -> tuple[frozenset[str], list[SignalWatch]]:
+        """Symbols followed on ``network`` now, and its exits since ``since``."""
+        if self._sessions is None:
+            return frozenset(), []
+        async with self._sessions() as session:
+            open_symbols = (
+                await session.scalars(
+                    select(SignalWatch.symbol).where(
+                        SignalWatch.network == network,
+                        SignalWatch.exit_reason.is_(None),
+                    )
+                )
+            ).all()
+            exits = (
+                await session.scalars(
+                    select(SignalWatch)
+                    .where(
+                        SignalWatch.network == network,
+                        SignalWatch.exited_at >= since,
+                    )
+                    .order_by(SignalWatch.exited_at)
+                )
+            ).all()
+        return frozenset(open_symbols), list(exits)
 
     async def watch(self, signal: Signal, network: str) -> None:
         """Start following a published ENTRY; a repeated one is a no-op."""
@@ -256,6 +286,11 @@ class SignalTracker:
                     crossing.price,
                 )
             await session.commit()
+        if crossing is not None and self.on_closed is not None:
+            try:
+                await self.on_closed(row)
+            except Exception:  # noqa: BLE001 - the crossing is recorded
+                logger.exception("close of %s not delivered", row.signal_id)
 
     async def _publish_exits(self) -> int:
         assert self._sessions is not None

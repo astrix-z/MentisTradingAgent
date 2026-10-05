@@ -7,7 +7,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from pg import scratch_database
@@ -30,7 +30,8 @@ from test_strategy_runtime import (  # noqa: F401
 from agent.core.migrate import migrate
 from agent.execution.models import Position, SymbolCooldown
 from agent.execution.runtime import ExecutionContext, ExecutionRuntime
-from agent.strategies.base import PositionEvent, PositionsSnapshot
+from agent.models import SignalWatch
+from agent.strategies.base import PositionEvent, PositionsSnapshot, Signal
 from agent.strategies.tripple_screen.strategy import TripleScreenStrategy
 
 
@@ -330,6 +331,131 @@ def test_a_refused_start_delivers_its_buffer_to_the_run_still_going(
         assert engine._startup_feedback is None
         await engine.position_feedback(event("ETHUSDT", at=at), True)
         assert closed == ["BTCUSDT", "ETHUSDT"]  # and directly afterwards
+        await engine.shutdown()
+
+    asyncio.run(scenario())
+
+
+# --- signal-only runs: virtual positions from the signal tracker (869f6m7vg) -----------
+
+
+def _watch(symbol: str, signal_id: str, exited_at: datetime | None) -> SignalWatch:
+    return SignalWatch(
+        signal_id=signal_id,
+        network="testnet",
+        symbol=symbol,
+        entry_ref=Decimal(100),
+        stop=Decimal(90),
+        take=Decimal(110),
+        emitted_at=datetime.now(UTC) - timedelta(hours=2),
+        checked_until=0,
+        exit_reason=None if exited_at is None else "stop",
+        exited_at=exited_at,
+    )
+
+
+def _recording(strategy: Any) -> list[str]:
+    seen: list[str] = []
+
+    async def restore(snapshot: PositionsSnapshot) -> None:
+        seen.append(f"restore {sorted(snapshot.open_symbols)}")
+
+    async def opened(e: PositionEvent) -> None:
+        seen.append(f"opened {e.symbol}")
+
+    async def closed(e: PositionEvent) -> None:
+        seen.append(f"closed {e.symbol} at {e.at:%H:%M}")
+
+    strategy.restore_positions = AsyncMock(side_effect=restore)
+    strategy.on_position_opened = AsyncMock(side_effect=opened)
+    strategy.on_position_closed = AsyncMock(side_effect=closed)
+    return seen
+
+
+def test_a_signal_only_run_hears_of_its_virtual_positions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SENTUSDT emitted three ENTRYs while its first was still open: nothing
+    # told the strategy. Without real execution the tracker's ENTRY/EXIT are
+    # its positions — restored on Start, opened by an ENTRY, closed (and the
+    # cooldown started) at the crossing.
+    async def scenario() -> None:
+        engine, _redis, strategy, _streams = setup_engine(monkeypatch)
+        seen = _recording(strategy)
+        crossed = datetime.now(UTC).replace(second=0, microsecond=0)
+        tracker = Mock(
+            watch=AsyncMock(),
+            snapshot=AsyncMock(
+                return_value=(
+                    frozenset({"ETHUSDT"}),
+                    [
+                        _watch("SOLUSDT", "sol", crossed - timedelta(minutes=30)),
+                        # Followed again since: still open, not closed over.
+                        _watch("ETHUSDT", "eth-old", crossed - timedelta(hours=1)),
+                    ],
+                )
+            ),
+        )
+        engine.tracker = tracker
+        await start(engine)
+        assert seen == [
+            "restore ['ETHUSDT']",
+            f"closed SOLUSDT at {crossed - timedelta(minutes=30):%H:%M}",
+        ]
+        assert tracker.snapshot.await_args.args[0] == "testnet"
+
+        entry = Signal(
+            type="ENTRY",
+            symbol="SENTUSDT",
+            emitted_at=crossed,
+            epoch_id="SENTUSDT:1",
+            entry_ref=Decimal("0.023"),
+            swing_low_ref=Decimal("0.02198799"),
+            tp_rule="fill x 1.1",
+        )
+        await engine._on_signal(entry)
+        assert seen[-1] == "opened SENTUSDT"
+        await engine.virtual_closed(_watch("SENTUSDT", entry.signal_id, crossed))
+        assert seen[-1] == f"closed SENTUSDT at {crossed:%H:%M}"
+        await engine.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_with_real_execution_virtual_positions_are_not_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Real positions are the truth there (EXEC-07); an ENTRY admission refused
+    # must not hold the symbol as a virtual one.
+    async def scenario() -> None:
+        engine, _redis, strategy, _streams = setup_engine(monkeypatch)
+        seen = _recording(strategy)
+        tracker = Mock(watch=AsyncMock(), snapshot=AsyncMock())
+        engine.tracker = tracker
+        runtime = AsyncMock()
+        runtime.positions_snapshot = AsyncMock(return_value=PositionsSnapshot())
+        runtime.open_admission = lambda name: None
+        runtime.close_admission = lambda: None
+        runtime.heartbeat = lambda: {}
+        runtime.message = lambda: None
+        runtime.context = None
+        engine.execution = runtime
+        await start(engine, execution={"enabled": True})
+        tracker.snapshot.assert_not_awaited()
+        entry = Signal(
+            type="ENTRY",
+            symbol="SENTUSDT",
+            emitted_at=datetime.now(UTC),
+            entry_ref=Decimal("0.023"),
+            swing_low_ref=Decimal("0.02198799"),
+            tp_rule="fill x 1.1",
+        )
+        await engine._on_signal(entry)
+        tracker.watch.assert_awaited_once()  # still followed for the backend
+        await engine.virtual_closed(
+            _watch("SENTUSDT", entry.signal_id, datetime.now(UTC))
+        )
+        assert seen == ["restore []"]
         await engine.shutdown()
 
     asyncio.run(scenario())

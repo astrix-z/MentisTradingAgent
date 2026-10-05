@@ -397,6 +397,7 @@ async def run() -> None:
         db.settings_engine() if schema_ready else None, market, engine.publish_exit
     )
     engine.tracker = tracker
+    tracker.on_closed = engine.virtual_closed
 
     try:
         async with asyncio.TaskGroup() as tg:

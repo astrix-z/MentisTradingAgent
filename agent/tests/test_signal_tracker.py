@@ -309,3 +309,33 @@ def test_without_a_database_nothing_is_followed() -> None:
         assert await tracker.check() == 0
 
     asyncio.run(scenario())
+
+
+def test_a_crossing_is_reported_at_once_and_restored_by_the_snapshot() -> None:
+    # 869f6m7vg: the engine's virtual feedback hears of the close when it is
+    # recorded — Redis down or not — and a Start reads it back.
+    async def scenario(state: World) -> None:
+        tracker = state.tracker()
+        closed: list[tuple[str, datetime | None]] = []
+
+        async def on_closed(watch: SignalWatch) -> None:
+            closed.append((watch.symbol, watch.exited_at))
+
+        tracker.on_closed = on_closed
+        await tracker.watch(entry("AAAUSDT"), "live")
+        await tracker.watch(entry("BBBUSDT"), "live")
+        await tracker.watch(entry("CCCUSDT"), "testnet")
+        start = T0.replace(second=0) + timedelta(minutes=1)
+        state.market.bars["AAAUSDT"] = [
+            bar(start, "0.0225", "0.0226", "0.0210", "0.0211")
+        ]
+        state.now = start + timedelta(minutes=2)
+        state.redis_down = True
+        await tracker.check()
+        assert closed == [("AAAUSDT", start)]
+        open_symbols, exits = await tracker.snapshot("live", start - timedelta(hours=1))
+        assert open_symbols == frozenset({"BBBUSDT"})
+        assert [(w.symbol, w.exited_at) for w in exits] == [("AAAUSDT", start)]
+        assert (await tracker.snapshot("live", start + timedelta(minutes=1)))[1] == []
+
+    run(scenario)

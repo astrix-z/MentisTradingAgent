@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from redis.asyncio import Redis
@@ -34,6 +34,7 @@ from agent.exchange.streams import MarketStreams
 from agent.execution.admission import record_signal
 from agent.execution.runtime import ExecutionRuntime
 from agent.execution.settings import ExecutionSettings
+from agent.models import SignalWatch
 from agent.signal_tracker import SignalTracker
 from agent.strategies import Signal, Strategy, StrategyServices, build_strategy
 from agent.strategies.base import PositionEvent, PositionsSnapshot
@@ -84,6 +85,20 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+#: How far back a Start replays virtual exits: longer than any cooldown.
+_VIRTUAL_EXITS_WINDOW = timedelta(days=7)
+
+
+def _virtual_close(watch: SignalWatch) -> PositionEvent:
+    assert watch.exited_at is not None
+    return PositionEvent(
+        event_id=f"virtual-exit:{watch.signal_id}",
+        symbol=watch.symbol,
+        position_id=watch.signal_id,
+        at=watch.exited_at,
+    )
+
+
 class Engine:
     """Owns the live plane and exactly one running strategy."""
 
@@ -109,6 +124,9 @@ class Engine:
         self.execution: ExecutionRuntime | None = None
         #: Follows every published ENTRY to its first stop/take crossing.
         self.tracker: SignalTracker | None = None
+        #: Without real execution the strategy hears of its virtual positions
+        #: (the tracker's ENTRY/EXIT) instead (ClickUp 869f6m7vg).
+        self._virtual_feedback = False
 
         # SDK-backed services for the current run.
         self._rest: ExchangeRest | None = None
@@ -232,6 +250,11 @@ class Engine:
                         network=network, settings=execution_settings, params=params
                     )
                     snapshot = await self.execution.positions_snapshot()
+                self._virtual_feedback = (
+                    self.tracker is not None and not execution_settings.enabled
+                )
+                if self._virtual_feedback:
+                    snapshot = await self._virtual_snapshot(network, snapshot)
                 self._startup = asyncio.create_task(
                     self._start_run(
                         network, strategy, normalized, strategy_obj, snapshot
@@ -346,6 +369,32 @@ class Engine:
             return
         await self._deliver(strategy, event, closed)
 
+    async def _virtual_snapshot(
+        self, network: str, snapshot: PositionsSnapshot
+    ) -> PositionsSnapshot:
+        """The followed ENTRYs as open positions; recent exits replayed as closes.
+
+        A close carries the crossing time, so the strategy's cooldown runs from
+        it. A symbol followed again since is open: its older close is not
+        replayed over it.
+        """
+        assert self.tracker is not None
+        since = datetime.now(UTC) - _VIRTUAL_EXITS_WINDOW
+        open_symbols, exits = await self.tracker.snapshot(network, since)
+        assert self._startup_feedback is not None
+        for watch in exits:
+            if watch.symbol not in open_symbols:
+                self._startup_feedback.append((_virtual_close(watch), True))
+        return PositionsSnapshot(
+            open_symbols=snapshot.open_symbols | open_symbols,
+            cooldown_until=snapshot.cooldown_until,
+        )
+
+    async def virtual_closed(self, watch: SignalWatch) -> None:
+        """The tracker found the crossing of a followed ENTRY (its EXIT)."""
+        if self._virtual_feedback and watch.network == self._network:
+            await self.position_feedback(_virtual_close(watch), True)
+
     async def _replay_startup_feedback(self, strategy: Strategy) -> None:
         buffered = self._startup_feedback
         while buffered:  # may grow while a delivery awaits
@@ -450,6 +499,17 @@ class Engine:
                 await self.tracker.watch(signal, self._network)
             except Exception:  # noqa: BLE001 - the emit already succeeded
                 logger.exception("ENTRY %s is not followed", signal.signal_id)
+            else:
+                if self._virtual_feedback:
+                    await self.position_feedback(
+                        PositionEvent(
+                            event_id=f"virtual-entry:{signal.signal_id}",
+                            symbol=signal.symbol,
+                            position_id=signal.signal_id,
+                            at=signal.emitted_at,
+                        ),
+                        False,
+                    )
 
     async def publish_exit(self, signal: Signal) -> None:
         """Publish an EXIT of the signal tracker; raises if Redis does not take it.
