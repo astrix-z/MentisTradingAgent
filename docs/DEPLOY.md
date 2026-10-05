@@ -289,9 +289,9 @@ docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml start bac
 восстановлен; на `T0` `Fast` в её именах → `422 "timeframes must have tide:wave:ripple
 ratio 16:4:1"`, `Default` → `202`, команда `succeeded`. Повторная выкладка `2562f2e` —
 без сборки, `upgrade` до `a7e3c1d9f5b2`, `Default` и `Fast` снова в наборах, БД `agent` на
-прежней ревизии. Ограничение: без ключей testnet `Fast` на новой версии не дошёл до
-`running` (Start проверяет ключ на Binance), поэтому стратегия была запущена только в
-`desired` — именно его восстанавливает агент после отката.
+прежней ревизии. Повтор с ключами testnet: `Fast` на `2562f2e` в `actual = running`, тот же
+откат — `503`, Stop `succeeded`, `idle`; на `T0` `Fast` → `422` по `16:4:1`, `Default` →
+`actual = running`; обратная выкладка — `Fast` снова `running`.
 
 ## 7. Правила и предостережения
 
