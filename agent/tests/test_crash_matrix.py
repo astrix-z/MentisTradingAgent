@@ -1272,3 +1272,85 @@ def test_a_risk_change_still_open_defers_the_buy() -> None:
         await finish(state, await recover(state))
 
     matrix(scenario)
+
+
+# --- the settings the gate read are the settings at the send (review THIRD, R3) ------------
+
+
+def _at_boundary(stack: Stack, boundary: str, change: Callable[[], None]) -> None:
+    if boundary == "journal":
+        prepare = stack.orders.journal.prepare
+
+        async def changed(*args: Any, **kwargs: Any) -> Any:
+            result = await prepare(*args, **kwargs)
+            change()
+            return result
+
+        stack.orders.journal.prepare = changed  # type: ignore[method-assign]
+    else:
+        trade = stack.runtime.trade
+        assert trade is not None
+        acquire = trade.budget.acquire
+
+        async def waiting(priority: Any, *args: Any, **kwargs: Any) -> Any:
+            if priority is Priority.ENTRY:
+                trade.budget.acquire = acquire  # type: ignore[method-assign]
+                change()
+            return await acquire(priority, *args, **kwargs)
+
+        trade.budget.acquire = waiting  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize("boundary", ["journal", "budget"])
+def test_a_start_lowering_the_daily_limit_stops_a_reserved_buy(boundary: str) -> None:
+    # One loss, limit 5: ETH passes the gate. A Start sets the limit to 1
+    # (prepare_start assigns the settings) before the BUY goes out.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        await _losing_close(state, stack)
+        queued = await state.reserve(stack, "ETHUSDT")
+        runtime = stack.runtime
+        stricter = runtime.settings.model_copy(update={"daily_losing_trades_limit": 1})
+        _at_boundary(stack, boundary, lambda: setattr(runtime, "settings", stricter))
+        result = await stack.orders.execute_entry(queued)
+        assert (result.outcome, result.reason) == (
+            EntryOutcome.RELEASED,
+            "daily_loss_limit",
+        )
+        assert state.fake.orders_of("ETHUSDT", "BUY") == []
+        await finish(state, await recover(state))
+
+    matrix(scenario)
+
+
+@pytest.mark.parametrize("change", ["same", "raised"])
+def test_unchanged_or_raised_settings_never_block_an_entry(change: str) -> None:
+    # The same settings again: nothing changes, the BUY goes now. A raised
+    # limit is a change: the BUY is deferred, then goes on the next round.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        queued = await state.reserve(stack, "ETHUSDT")
+        runtime = stack.runtime
+        current = runtime.settings
+        new = (
+            current.model_copy()
+            if change == "same"
+            else current.model_copy(
+                update={
+                    "daily_losing_trades_limit": current.daily_losing_trades_limit + 1
+                }
+            )
+        )
+        _at_boundary(stack, "journal", lambda: setattr(runtime, "settings", new))
+        result = await stack.orders.execute_entry(queued)
+        if change == "same":
+            assert result.outcome is EntryOutcome.FILLED
+        else:
+            assert result.outcome is EntryOutcome.DEFERRED
+            assert state.fake.orders_of("ETHUSDT", "BUY") == []
+            assert (
+                await stack.orders.execute_entry(queued)
+            ).outcome is EntryOutcome.FILLED
+        await finish(state, await recover(state))
+
+    matrix(scenario)

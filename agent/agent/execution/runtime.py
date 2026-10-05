@@ -200,11 +200,12 @@ class ExecutionRuntime:
             else None
         )
         #: Risk version: raised when a transaction that changes what
-        #: ``admission.risk_block`` reads starts writing and when it ends; and
+        #: ``admission.risk_block`` reads starts writing and when it ends, or when the settings it reads
+        #: change (a Start's new daily limit); and
         #: how many such transactions are open now (_RiskTrackingSession).
         self.risk_version = 0
         self.risk_in_flight = 0
-        self.settings = ExecutionSettings()
+        self._settings = ExecutionSettings()
         self.context: ExecutionContext | None = None
         self.trade: TradeClient | None = None
         self.lock: LeaderLock | None = None
@@ -415,6 +416,23 @@ class ExecutionRuntime:
             and self.reconciled
             and self.trade is not None
         )
+
+    @property
+    def settings(self) -> ExecutionSettings:
+        return self._settings
+
+    @settings.setter
+    def settings(self, settings: ExecutionSettings) -> None:
+        """New execution settings; a change is a risk change too.
+
+        ``risk_block`` reads the daily limit from here: a Start that lowers
+        it while a reserved BUY waits must stop that BUY like a new loss
+        would (review 2026-10-05 THIRD, R3). The same settings again change
+        nothing, so they do not defer anything.
+        """
+        if settings != self._settings:
+            self.risk_version += 1
+        self._settings = settings
 
     def risk_mark(self) -> int | None:
         """The risk version to hold a BUY to, or ``None`` while a change is open.
