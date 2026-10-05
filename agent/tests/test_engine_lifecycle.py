@@ -368,3 +368,47 @@ def test_streams_close_partial_sdk_connection() -> None:
         assert not streams._kline_callbacks
 
     asyncio.run(scenario())
+
+
+def test_a_published_entry_is_followed_and_a_tracker_exit_is_published() -> None:
+    # ClickUp 869f6m7vn: the tracker learns of every ENTRY that went out; its
+    # failure does not undo the emit; its EXIT goes to the backend's channel.
+    async def scenario() -> None:
+        redis = Mock(publish=AsyncMock(return_value=None))
+        engine = Engine(redis)
+        engine.tracker = Mock(
+            watch=AsyncMock(side_effect=[None, RuntimeError("database down")])
+        )
+        now = datetime.now(UTC)
+        entry = Signal(
+            type="ENTRY",
+            symbol="SENTUSDT",
+            emitted_at=now,
+            epoch_id="epoch",
+            entry_ref=Decimal("0.023"),
+            swing_low_ref=Decimal("0.02198799"),
+            tp_rule="fill x 1.1",
+        )
+        await engine._on_signal(entry)
+        await engine._on_signal(entry)  # the tracker fails: the emit stands
+        assert engine.tracker.watch.await_count == 2
+        assert engine.tracker.watch.await_args.args[0] is entry
+        hold = Signal(type="HOLD", symbol="SENTUSDT", emitted_at=now)
+        await engine._on_signal(hold)
+        assert engine.tracker.watch.await_count == 2
+
+        exit_ = Signal(
+            type="EXIT",
+            symbol="SENTUSDT",
+            emitted_at=now,
+            exit_reason="stop",
+            entry_signal_id=entry.signal_id,
+            exit_price=Decimal("0.02198799"),
+        )
+        await engine.publish_exit(exit_)
+        payload = json.loads(redis.publish.call_args.args[1])
+        assert payload == {"kind": "signal", **exit_.transport()}
+        assert payload["entry_signal_id"] == entry.signal_id
+        assert payload["exit_price"] == "0.02198799"
+
+    asyncio.run(scenario())

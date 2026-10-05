@@ -138,6 +138,9 @@ class Signal:
     exit_policy: ExitPolicy | None = None
     # EXIT
     exit_reason: str | None = None
+    #: The ENTRY this EXIT closes, and the price it closed at (signal tracker).
+    entry_signal_id: str | None = None
+    exit_price: Decimal | None = None
     # Full per-screen provenance (bools, indicator values, timestamps).
     provenance: dict[str, Any] = field(default_factory=dict)
     signal_id: str = field(default_factory=lambda: str(uuid4()))

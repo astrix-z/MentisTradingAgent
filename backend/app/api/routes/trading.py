@@ -877,10 +877,12 @@ async def list_positions(session: SessionDep, _: SuperUserDep) -> PositionsList:
     """ENTRY-signal-derived virtual positions (see `SignalPositionPublic`).
 
     Recorded by ``app.core.signal_listener`` as ENTRY signals arrive on
-    ``agent:events``; a still-``open`` row is closed here, lazily, the first
-    time a read observes the last known price having crossed its stop or take
-    level — this endpoint is the only place that evaluates/persists that
-    transition, so "closed" always reflects what a viewer actually saw.
+    ``agent:events``, and closed there by the agent's EXIT: the 1m bar where
+    the price first crossed the stop or the take, and that price (the agent
+    alone reads the exchange). As a fallback for an EXIT that never arrived, a
+    still-``open`` row is also closed here the first time a read sees the last
+    known price beyond a level (``closed_by = "view"``); a later EXIT corrects
+    it.
     """
     rows = session.exec(
         select(SignalPosition).order_by(col(SignalPosition.emitted_at).desc())
@@ -935,6 +937,9 @@ def _position_public(
             row.status = crossed
             row.closed_at = datetime.now(UTC)
             row.closed_price = current
+            # A fallback: the agent's EXIT carries the crossing itself and
+            # replaces this (signal_listener._record_tracked_exit).
+            row.closed_by = "view"
             session.add(row)
     reference = row.closed_price if row.closed_price is not None else current
     return SignalPositionPublic(

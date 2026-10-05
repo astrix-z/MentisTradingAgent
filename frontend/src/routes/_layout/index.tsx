@@ -170,8 +170,8 @@ function Dashboard() {
           <CardDescription>
             Derived from ENTRY signals — the strategy never places a real order
             (D-SIGNAL-ONLY), so this shows "what would have happened", not an
-            actual exchange position. Closed once the last known price crossed
-            stop or take.
+            actual exchange position. Closed at the minute the price first
+            crossed stop or take, at that level (or the open, after a gap).
           </CardDescription>
         </CardHeader>
         <CardContent>

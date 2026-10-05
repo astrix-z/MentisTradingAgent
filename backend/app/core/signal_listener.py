@@ -215,6 +215,9 @@ def _record_exit(payload: dict[str, Any], network: str) -> None:
     """
     closed_at = datetime.fromisoformat(payload["emitted_at"])
     symbol = payload["symbol"]
+    if payload.get("entry_signal_id"):
+        _record_tracked_exit(payload, closed_at)
+        return
     with Session(engine) as session:
         _lock_symbol(session, network, symbol)
         applied = session.exec(
@@ -254,8 +257,60 @@ def _record_exit(payload: dict[str, Any], network: str) -> None:
             return
         position.status = _closed_status(payload.get("exit_reason"))
         position.closed_at = closed_at
+        position.closed_price = _price(payload.get("exit_price"))
+        position.closed_by = "exit"
         session.add(position)
         session.commit()
+
+
+def _record_tracked_exit(payload: dict[str, Any], closed_at: datetime) -> None:
+    """Close the one ENTRY this EXIT names, at the crossing it reports.
+
+    The agent's signal tracker (``agent/agent/signal_tracker.py``) sends the
+    1m bar where the price first crossed the stop or the take and that price.
+    It corrects a closure made by a view (``closed_by = "view"``, the last
+    known price at read time) and is otherwise applied once: a repeated EXIT
+    finds the position already closed by an EXIT. An unknown ENTRY (its own
+    message was lost) is not recorded: the EXIT does not name a symbol's next
+    position, unlike a strategy EXIT without ``entry_signal_id``.
+    """
+    with Session(engine) as session:
+        position = session.exec(
+            select(SignalPosition)
+            .where(SignalPosition.signal_id == payload["entry_signal_id"])
+            .with_for_update()
+        ).first()
+        if position is None:
+            logger.warning(
+                "EXIT for unknown ENTRY signal_id=%s, skipping",
+                payload["entry_signal_id"],
+            )
+            return
+        if position.closed_by == "exit":
+            return
+        position.status = _closed_status(payload.get("exit_reason"))
+        position.closed_at = closed_at
+        position.closed_price = _price(payload.get("exit_price"))
+        position.closed_by = "exit"
+        session.add(position)
+        session.commit()
+    logger.info(
+        "closed position signal_id=%s by %s at %s price=%s",
+        payload["entry_signal_id"],
+        payload.get("exit_reason"),
+        closed_at.isoformat(),
+        payload.get("exit_price"),
+    )
+
+
+def _price(value: Any) -> str | None:
+    """A decimal string from the payload, or ``None`` for a missing/bad one."""
+    if value is None:
+        return None
+    try:
+        return str(Decimal(str(value)))
+    except InvalidOperation:
+        return None
 
 
 async def _current_network(redis: Redis) -> str:

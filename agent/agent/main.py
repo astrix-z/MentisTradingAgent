@@ -32,10 +32,12 @@ from agent.engine import (
     REDIS_COMMAND_STREAM,
     Engine,
 )
+from agent.exchange.rest import ExchangeRest
 from agent.execution.runtime import ExecutionRuntime
 from agent.execution.service import build_execution
 from agent.monitoring import MONITORING_REFRESH_SECONDS, refresh_monitoring
 from agent.protocol import publish_catalog
+from agent.signal_tracker import SignalTracker
 from agent.symbols import latest_universe, publish_universe
 
 logger = logging.getLogger(__name__)
@@ -381,9 +383,25 @@ async def run() -> None:
     execution.admission.start()
     execution.start()
 
+    # Signal-level outcomes: every ENTRY to its first stop/take crossing.
+    public: dict[str, ExchangeRest] = {}
+
+    def market(network: str) -> ExchangeRest:
+        if network not in public:
+            public[network] = ExchangeRest.connect_public(
+                "live" if network == "live" else "testnet"
+            )
+        return public[network]
+
+    tracker = SignalTracker(
+        db.settings_engine() if schema_ready else None, market, engine.publish_exit
+    )
+    engine.tracker = tracker
+
     try:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(_listen(redis, engine, stop))
+            tg.create_task(tracker.run(stop))
             tg.create_task(_heartbeat_loop(engine, stop))
             tg.create_task(_catalog_loop(redis, stop))
             tg.create_task(_symbols_loop(redis, stop))

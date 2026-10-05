@@ -147,6 +147,10 @@ class SignalPosition(SQLModel, table=True):
         sa_type=DateTime(timezone=True),  # type: ignore
     )
     closed_price: str | None = None
+    #: Who closed it: ``exit`` — the agent's EXIT, at the bar where the price
+    #: first crossed a level and that price; ``view`` — a read that saw the
+    #: last known price beyond a level, a fallback the EXIT may still correct.
+    closed_by: str | None = None
     created_at: datetime = Field(
         default_factory=get_datetime_utc,
         sa_type=DateTime(timezone=True),  # type: ignore

@@ -72,7 +72,7 @@ def test_fresh_database_upgrades_to_head() -> None:
     async def scenario(engine: AsyncEngine) -> None:
         result = await migrate(engine)
         assert result.path is MigrationPath.FRESH
-        assert result.revision == "0004_legacy_lists"
+        assert result.revision == "0005_signal_watch"
         assert EXECUTION_TABLES | {"working_symbol", "monitored_symbol"} <= (
             await _tables(engine)
         )
@@ -85,7 +85,7 @@ def test_rerun_is_a_no_op_upgrade() -> None:
         await migrate(engine)
         again = await migrate(engine)
         assert again.path is MigrationPath.UPGRADE
-        assert again.revision == "0004_legacy_lists"
+        assert again.revision == "0005_signal_watch"
 
     run(scenario)
 
@@ -101,7 +101,7 @@ def test_legacy_database_is_adopted_and_keeps_its_rows() -> None:
         result = await migrate(engine)
 
         assert result.path is MigrationPath.ADOPTED
-        assert result.revision == "0004_legacy_lists"
+        assert result.revision == "0005_signal_watch"
         assert EXECUTION_TABLES <= await _tables(engine)
         async with _session(engine) as session:
             working = (await session.scalars(select(WorkingSymbol))).all()
@@ -198,6 +198,7 @@ def test_migrations_ship_inside_the_package() -> None:
         "0002_execution.py",
         "0003_attempt_applied.py",
         "0004_legacy_lists.py",
+        "0005_signal_watch.py",
     ]
 
 

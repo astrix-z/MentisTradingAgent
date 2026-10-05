@@ -34,6 +34,7 @@ from agent.exchange.streams import MarketStreams
 from agent.execution.admission import record_signal
 from agent.execution.runtime import ExecutionRuntime
 from agent.execution.settings import ExecutionSettings
+from agent.signal_tracker import SignalTracker
 from agent.strategies import Signal, Strategy, StrategyServices, build_strategy
 from agent.strategies.base import PositionEvent, PositionsSnapshot
 
@@ -106,6 +107,8 @@ class Engine:
         self.schema_ready = False
         #: Agent-level execution; lives across runs (set by ``agent.main``).
         self.execution: ExecutionRuntime | None = None
+        #: Follows every published ENTRY to its first stop/take crossing.
+        self.tracker: SignalTracker | None = None
 
         # SDK-backed services for the current run.
         self._rest: ExchangeRest | None = None
@@ -442,6 +445,31 @@ class Engine:
             logger.warning("signal recorded but not published (Redis unavailable)")
         if durable and signal.type == "ENTRY" and runtime is not None:
             runtime.wake_admission()
+        if signal.type == "ENTRY" and self.tracker is not None:
+            try:
+                await self.tracker.watch(signal, self._network)
+            except Exception:  # noqa: BLE001 - the emit already succeeded
+                logger.exception("ENTRY %s is not followed", signal.signal_id)
+
+    async def publish_exit(self, signal: Signal) -> None:
+        """Publish an EXIT of the signal tracker; raises if Redis does not take it.
+
+        Only the log and the backend's channel: such an EXIT describes a signal
+        and never reaches execution's inbox.
+        """
+        signal_logger.info(
+            "%s %s network=%s signal_id=%s entry_signal_id=%s exit_reason=%s "
+            "exit_price=%s at=%s",
+            signal.type,
+            signal.symbol,
+            self._network,
+            signal.signal_id,
+            signal.entry_signal_id,
+            signal.exit_reason,
+            signal.exit_price,
+            signal.emitted_at.isoformat(),
+        )
+        await self._publish_event("signal", signal)
 
     async def _publish_event(self, kind: str, signal: Signal) -> None:
         payload = {"kind": kind, **signal.transport()}
