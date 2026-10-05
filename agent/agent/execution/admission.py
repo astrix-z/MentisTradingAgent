@@ -307,26 +307,13 @@ class Admission:
         self, signal: SignalInbox, context: ExecutionContext, now: datetime
     ) -> str | None:
         async with self._runtime.session() as session:
-            limit = self._runtime.settings.daily_losing_trades_limit
-            if (
-                await losing_trades_today(
-                    session, context.account, context.network, now
-                )
-                >= limit
-            ):
-                return "daily_loss_limit"
-            if await unprotected_positions(session, context):
-                return "unprotected_position"
-            unknown = await session.scalar(
-                select(func.count()).where(
-                    ExecutionIntent.account == context.account,
-                    ExecutionIntent.network == context.network,
-                    ExecutionIntent.state == IntentState.UNKNOWN,
-                )
+            return await risk_block(
+                session,
+                context,
+                signal.symbol,
+                now,
+                limit=self._runtime.settings.daily_losing_trades_limit,
             )
-            if unknown:
-                return "unknown_entry"
-            return await _symbol_block(session, context, signal.symbol, now)
 
     async def _plan(
         self, signal: SignalInbox, context: ExecutionContext, now: datetime
@@ -511,8 +498,48 @@ async def _consume(session: AsyncSession, signal_id: uuid.UUID) -> None:
     signal.processed_at = datetime.now(UTC)
 
 
+async def risk_block(
+    session: AsyncSession,
+    context: ExecutionContext,
+    symbol: str,
+    now: datetime,
+    *,
+    limit: int,
+    own: uuid.UUID | None = None,
+) -> str | None:
+    """Why the database forbids a new ENTRY of ``symbol`` now, or ``None``.
+
+    Asked at admission and again right before an already reserved BUY is sent
+    (``own`` is that intent): a reservation is no licence — a fifth losing
+    trade, another entry gone UNKNOWN or a list taken down since then closes
+    it as well (review 2026-10-05, F1).
+    """
+    if (
+        await losing_trades_today(session, context.account, context.network, now)
+        >= limit
+    ):
+        return "daily_loss_limit"
+    if await unprotected_positions(session, context):
+        return "unprotected_position"
+    unknown = select(func.count()).where(
+        ExecutionIntent.account == context.account,
+        ExecutionIntent.network == context.network,
+        ExecutionIntent.state == IntentState.UNKNOWN,
+    )
+    if own is not None:
+        unknown = unknown.where(ExecutionIntent.signal_id != own)
+    if await session.scalar(unknown):
+        return "unknown_entry"
+    return await _symbol_block(session, context, symbol, now, own=own)
+
+
 async def _symbol_block(
-    session: AsyncSession, context: ExecutionContext, symbol: str, now: datetime
+    session: AsyncSession,
+    context: ExecutionContext,
+    symbol: str,
+    now: datetime,
+    *,
+    own: uuid.UUID | None = None,
 ) -> str | None:
     open_position = await session.scalar(
         select(func.count()).where(
@@ -524,15 +551,15 @@ async def _symbol_block(
     )
     if open_position:
         return "position_open"
-    pending = await session.scalar(
-        select(func.count()).where(
-            ExecutionIntent.account == context.account,
-            ExecutionIntent.network == context.network,
-            ExecutionIntent.symbol == symbol,
-            ExecutionIntent.state.in_(list(INTENT_HOLDING_STATES)),
-        )
+    holding = select(func.count()).where(
+        ExecutionIntent.account == context.account,
+        ExecutionIntent.network == context.network,
+        ExecutionIntent.symbol == symbol,
+        ExecutionIntent.state.in_(list(INTENT_HOLDING_STATES)),
     )
-    if pending:
+    if own is not None:
+        holding = holding.where(ExecutionIntent.signal_id != own)
+    if await session.scalar(holding):
         return "entry_pending"
     cooldown = await session.scalar(
         select(SymbolCooldown.cooldown_until).where(

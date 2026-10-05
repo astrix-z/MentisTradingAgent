@@ -1053,3 +1053,93 @@ def test_reprice_stuck_on_its_replacement_becomes_overdue_in_the_watchdog() -> N
         await finish(state, await recover(state, rounds=6))
 
     matrix(scenario)
+
+
+# --- a reservation is no licence (review 2026-10-05 ALL, F1) ---------------------------
+
+
+async def _losing_close(state: World, stack: Stack) -> None:
+    position_id = await state.protected(stack)
+    state.fake.set_price("BTCUSDT", Decimal(90))  # the stop sells at a loss
+    await Reconciler(stack.worker).run()
+    assert (await state.position(stack, position_id)).status == PositionStatus.CLOSED
+    state.fake.set_price("BTCUSDT", Decimal(100))
+    async with stack.runtime.session() as session, session.begin():
+        for row in (await session.scalars(select(SymbolCooldown))).all():
+            await session.delete(row)
+
+
+def test_a_reserved_buy_waiting_through_the_fifth_loss_is_not_sent() -> None:
+    # Reserved with four losses; the fifth comes before its BUY: not sent, and
+    # the next UTC day buys again.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        for _ in range(4):
+            await _losing_close(state, stack)
+        queued = await state.reserve(stack, "ETHUSDT")
+        await _losing_close(state, stack)
+        result = await stack.orders.execute_entry(queued)
+        assert (result.outcome, result.reason) == (
+            EntryOutcome.RELEASED,
+            "daily_loss_limit",
+        )
+        assert state.fake.orders_of("ETHUSDT", "BUY") == []
+        state.clock.advance(24 * 3600)
+        state.fake.set_price("ETHUSDT", state.fake.last["ETHUSDT"])  # fresh tape
+        again = await state.reserve(stack, "ETHUSDT")
+        assert (await stack.orders.execute_entry(again)).outcome is EntryOutcome.FILLED
+        await finish(state, await recover(state))
+
+    matrix(scenario)
+
+
+def test_recovery_does_not_send_a_reservation_the_fifth_loss_closed() -> None:
+    # Recovery executes every RESERVED intent after reconcile (service.py):
+    # one reserved before the fifth loss is released there, not bought.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        for _ in range(4):
+            await _losing_close(state, stack)
+        queued = await state.reserve(stack, "ETHUSDT")
+        await _losing_close(state, stack)
+        await state.kill(stack)
+        recovered = service(state)
+        recovered.runtime.open_admission("tripple_screen")  # the strategy runs
+        await recovered.runtime.boot()
+        await recovered.tick()
+        assert state.fake.orders_of("ETHUSDT", "BUY") == []
+        intent = await state.intent(stack, queued)
+        assert (intent.state, intent.reason) == (
+            IntentState.NO_FILL,
+            "daily_loss_limit",
+        )
+        await finish(state, recovered)
+
+    matrix(scenario)
+
+
+def test_a_reserved_buy_is_not_sent_while_another_entry_is_unknown() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        first = await state.reserve(stack, "BTCUSDT")
+        queued = await state.reserve(stack, "ETHUSDT")
+        state.fake.fault("new_order", "timeout_before")  # never reached the book
+        assert (await stack.orders.execute_entry(first)).outcome is EntryOutcome.UNKNOWN
+        result = await stack.orders.execute_entry(queued)
+        assert (result.outcome, result.reason) == (
+            EntryOutcome.RELEASED,
+            "unknown_entry",
+        )
+        assert state.fake.orders_of("ETHUSDT", "BUY") == []
+        # The UNKNOWN entry keeps what it holds until it is resolved.
+        assert (await state.intent(stack, first)).state == IntentState.UNKNOWN
+        for _ in range(3):  # proven absent once its time has passed
+            state.clock.advance(60)
+            await stack.orders.resolve_entries()
+        assert (await state.intent(stack, first)).state == IntentState.NO_FILL
+        state.fake.set_price("ETHUSDT", state.fake.last["ETHUSDT"])  # fresh tape
+        again = await state.reserve(stack, "ETHUSDT")
+        assert (await stack.orders.execute_entry(again)).outcome is EntryOutcome.FILLED
+        await finish(state, await recover(state))
+
+    matrix(scenario)

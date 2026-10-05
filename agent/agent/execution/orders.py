@@ -39,7 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.exchange.budget import Priority
 from agent.exchange.trade import RECV_WINDOW_MS, Outcome, TradeCallError, TradeResult
-from agent.execution.admission import release_intent, unprotected_positions
+from agent.execution.admission import release_intent, risk_block
 from agent.execution.attempts import (
     ABSENCE_GRACE,
     NOT_FOUND_CODES,
@@ -159,11 +159,18 @@ class OrderManager:
             return EntryResult(EntryOutcome.DEFERRED, "no execution lock")
         blocked = runtime.admission_block()
         if blocked is None:
-            # Reserved earlier; since then a reprice or a close may have taken
-            # a list down, or a fill left a position unprotected (plan §6.1).
+            # Reserved earlier: since then a loss may have reached the daily
+            # limit, another entry gone UNKNOWN, a list been taken down or the
+            # symbol cooled down — admission's database gates, asked again.
             async with runtime.session() as session:
-                if await unprotected_positions(session, _context(runtime)):
-                    blocked = "unprotected_position"
+                blocked = await risk_block(
+                    session,
+                    _context(runtime),
+                    intent.symbol,
+                    self.clock(),
+                    limit=runtime.settings.daily_losing_trades_limit,
+                    own=signal_id,
+                )
         if blocked is not None:
             await self._release(signal_id, blocked)
             return EntryResult(EntryOutcome.RELEASED, blocked)
