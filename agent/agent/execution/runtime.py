@@ -35,9 +35,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, union_all
+from sqlalchemy import event, func, inspect, select, union_all
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import ORMExecuteState, Session, SessionTransaction
 
 from agent.exchange.trade import RECV_WINDOW_MS, Outcome, TradeCallError, TradeClient
 from agent.execution.lock import LeaderLock
@@ -45,6 +46,8 @@ from agent.execution.models import (
     INTENT_HOLDING_STATES,
     AttemptState,
     ExecutionIntent,
+    Fill,
+    IntentState,
     OrderAttempt,
     Position,
     PositionStatus,
@@ -58,6 +61,80 @@ logger = logging.getLogger(__name__)
 #: ``error_type`` of a send refused by :meth:`ExecutionRuntime.guard_mutation`:
 #: nothing reached the exchange.
 NOT_LEADER = "NotLeader"
+
+#: ``Session.info`` key of the runtime whose risk version a session raises.
+_RISK_OWNER = "risk_owner"
+_RISK_OPEN = "risk_open"
+#: Tables whose writes change ``admission.risk_block``: losses and cooldowns
+#: (closes), open and unprotected positions, fills.
+_RISK_TABLES = frozenset({"position", "fill", "symbol_cooldown"})
+
+
+class _RiskTrackingSession(Session):
+    """A session that tells its runtime when it changes the risk state.
+
+    A reserved BUY passed the database risk gate before its journal writes,
+    the budget wait and the queue for a worker; a close committed meanwhile
+    (a fifth loss), a position gone unprotected or another entry gone UNKNOWN
+    must still stop it (review 2026-10-05 REPEAT, R1). Every transaction that
+    writes such a change — through any code path — raises the runtime's risk
+    version when it starts writing it and when it ends, and is counted open
+    in between; the send compares in its thread, right before the request.
+    """
+
+
+def _mark_risk(session: Session) -> None:
+    runtime = session.info.get(_RISK_OWNER)
+    if runtime is None or session.info.get(_RISK_OPEN):
+        return
+    session.info[_RISK_OPEN] = True
+    runtime.risk_in_flight += 1
+    runtime.risk_version += 1
+
+
+def _changes_risk(instance: object, *, new: bool) -> bool:
+    if isinstance(instance, (Fill, SymbolCooldown)):
+        return True
+    if isinstance(instance, Position):
+        if new:
+            return True
+        attrs = inspect(instance).attrs
+        return (
+            attrs.status.history.has_changes()
+            or attrs.unprotected_since.history.has_changes()
+        )
+    if isinstance(instance, ExecutionIntent):
+        return instance.state == IntentState.UNKNOWN and (
+            new or inspect(instance).attrs.state.history.has_changes()
+        )
+    return False
+
+
+@event.listens_for(_RiskTrackingSession, "before_flush")
+def _risk_before_flush(session: Session, _context: Any, _instances: Any) -> None:
+    if any(_changes_risk(o, new=True) for o in session.new) or any(
+        _changes_risk(o, new=False) for o in (*session.dirty, *session.deleted)
+    ):
+        _mark_risk(session)
+
+
+@event.listens_for(_RiskTrackingSession, "do_orm_execute")
+def _risk_execute(state: ORMExecuteState) -> None:
+    if not (state.is_insert or state.is_update or state.is_delete):
+        return
+    table = getattr(state.statement, "table", None)
+    if getattr(table, "name", None) in _RISK_TABLES:
+        _mark_risk(state.session)
+
+
+@event.listens_for(_RiskTrackingSession, "after_transaction_end")
+def _risk_end(session: Session, transaction: SessionTransaction) -> None:
+    if transaction.parent is not None or not session.info.pop(_RISK_OPEN, False):
+        return
+    runtime = session.info[_RISK_OWNER]
+    runtime.risk_in_flight -= 1
+    runtime.risk_version += 1
+
 
 WATCHDOG_SECONDS = 5.0
 CLOCK_CHECK_EVERY = timedelta(hours=1)
@@ -113,8 +190,20 @@ class ExecutionRuntime:
         self._lock_factory = lock_factory
         self._clock = clock
         self._sessions = (
-            async_sessionmaker(db, expire_on_commit=False) if db is not None else None
+            async_sessionmaker(
+                db,
+                expire_on_commit=False,
+                sync_session_class=_RiskTrackingSession,
+                info={_RISK_OWNER: self},
+            )
+            if db is not None
+            else None
         )
+        #: Risk version: raised when a transaction that changes what
+        #: ``admission.risk_block`` reads starts writing and when it ends; and
+        #: how many such transactions are open now (_RiskTrackingSession).
+        self.risk_version = 0
+        self.risk_in_flight = 0
         self.settings = ExecutionSettings()
         self.context: ExecutionContext | None = None
         self.trade: TradeClient | None = None
@@ -326,6 +415,18 @@ class ExecutionRuntime:
             and self.reconciled
             and self.trade is not None
         )
+
+    def risk_mark(self) -> int | None:
+        """The risk version to hold a BUY to, or ``None`` while a change is open.
+
+        Taken before the database risk gate is read; the send checks
+        :meth:`risk_unchanged` in its thread right before the request.
+        """
+        return None if self.risk_in_flight else self.risk_version
+
+    def risk_unchanged(self, mark: int) -> bool:
+        """No risk change began or ended since ``mark`` and none is open."""
+        return self.risk_in_flight == 0 and self.risk_version == mark
 
     def guard_mutation(self) -> None:
         """Last look before an order is placed or cancelled, in the sending thread.

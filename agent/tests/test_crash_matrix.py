@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
@@ -41,6 +42,7 @@ from test_market_streams import isolate_sdk_state  # noqa: F401
 from test_monitor_feed import Sdks
 
 from agent.engine import Engine
+from agent.exchange.budget import Priority
 from agent.exchange.hub import StreamHub
 from agent.execution.admission import record_signal
 from agent.execution.attempts import Role
@@ -59,7 +61,7 @@ from agent.execution.models import (
 from agent.execution.orders import EntryOutcome
 from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.quotes import QuoteProvider, QuoteSnapshot
-from agent.execution.reconcile import Reconciler
+from agent.execution.reconcile import Reconciler, ReconcileReport
 from agent.execution.runtime import ContextRefused, ExecutionRuntime
 from agent.execution.service import ExecutionService
 from agent.execution.settings import ExecutionSettings
@@ -1140,6 +1142,133 @@ def test_a_reserved_buy_is_not_sent_while_another_entry_is_unknown() -> None:
         state.fake.set_price("ETHUSDT", state.fake.last["ETHUSDT"])  # fresh tape
         again = await state.reserve(stack, "ETHUSDT")
         assert (await stack.orders.execute_entry(again)).outcome is EntryOutcome.FILLED
+        await finish(state, await recover(state))
+
+    matrix(scenario)
+
+
+# --- the risk read by the gate is the risk at the send (review 2026-10-05 REPEAT, R1) -------
+
+
+async def _fifth_loss(state: World, stack: Stack, position_id: Any) -> None:
+    """The protected fifth position's stop fills; its trades close it.
+
+    Only BTC's trades are synced: a whole reconcile would first resolve the
+    SUBMITTED ETH entry and wait for its lock, held by the BUY that is
+    waiting here (in production reconcile runs in its own task).
+    """
+    state.fake.set_price("BTCUSDT", Decimal(90))
+    reconciler = Reconciler(stack.worker)
+    await reconciler.sync_trades(CONTEXT, "BTCUSDT")
+    for position in await reconciler._open_positions(CONTEXT):
+        await reconciler._check_protection(position, ReconcileReport())
+    assert (await state.position(stack, position_id)).status == PositionStatus.CLOSED
+
+
+@pytest.mark.parametrize("boundary", ["journal", "budget"])
+def test_a_loss_after_the_risk_gate_stops_the_buy(boundary: str) -> None:
+    # Four losses, the fifth position still protected, ETH reserved: the gate
+    # passes. The fifth closes while the BUY writes its journal, or while it
+    # waits for the budget (only the check in the sending thread sees that).
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        for _ in range(4):
+            await _losing_close(state, stack)
+        fifth = await state.protected(stack)
+        queued = await state.reserve(stack, "ETHUSDT")
+        if boundary == "journal":
+            prepare = stack.orders.journal.prepare
+
+            async def closing(*args: Any, **kwargs: Any) -> Any:
+                result = await prepare(*args, **kwargs)
+                await _fifth_loss(state, stack, fifth)
+                return result
+
+            stack.orders.journal.prepare = closing  # type: ignore[method-assign]
+        else:
+            trade = stack.runtime.trade
+            assert trade is not None
+            acquire = trade.budget.acquire
+
+            async def waiting(priority: Any, *args: Any, **kwargs: Any) -> Any:
+                if priority is Priority.ENTRY:
+                    trade.budget.acquire = acquire  # type: ignore[method-assign]
+                    await _fifth_loss(state, stack, fifth)
+                return await acquire(priority, *args, **kwargs)
+
+            trade.budget.acquire = waiting  # type: ignore[method-assign]
+        result = await stack.orders.execute_entry(queued)
+        assert (result.outcome, result.reason) == (
+            EntryOutcome.RELEASED,
+            "daily_loss_limit",
+        )
+        assert state.fake.orders_of("ETHUSDT", "BUY") == []
+        await finish(state, await recover(state))
+
+    matrix(scenario)
+
+
+def test_an_unrelated_risk_change_defers_the_buy_and_it_goes_next_round() -> None:
+    # A cooldown written elsewhere during the journal writes changes the risk
+    # version, not this entry's verdict: nothing sent, RESERVED again, sent
+    # on the next round.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        queued = await state.reserve(stack, "ETHUSDT")
+        prepare = stack.orders.journal.prepare
+
+        async def elsewhere(*args: Any, **kwargs: Any) -> Any:
+            result = await prepare(*args, **kwargs)
+            async with stack.runtime.session() as session, session.begin():
+                session.add(
+                    SymbolCooldown(
+                        account=CONTEXT.account,
+                        network=CONTEXT.network,
+                        symbol="SOLUSDT",
+                        cooldown_until=state.clock.now(),
+                        position_id=uuid.uuid4(),
+                    )
+                )
+            return result
+
+        stack.orders.journal.prepare = elsewhere  # type: ignore[method-assign]
+        result = await stack.orders.execute_entry(queued)
+        assert result.outcome is EntryOutcome.DEFERRED
+        assert state.fake.orders_of("ETHUSDT", "BUY") == []
+        assert (await state.intent(stack, queued)).state == IntentState.RESERVED
+        stack.orders.journal.prepare = prepare  # type: ignore[method-assign]
+        assert (await stack.orders.execute_entry(queued)).outcome is EntryOutcome.FILLED
+        await finish(state, await recover(state))
+
+    matrix(scenario)
+
+
+def test_a_risk_change_still_open_defers_the_buy() -> None:
+    # A close flushed but not committed is invisible to the gate's read: the
+    # BUY waits for it instead of reading around it.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        queued = await state.reserve(stack, "ETHUSDT")
+        session = stack.runtime.session()
+        await session.begin()
+        session.add(
+            SymbolCooldown(
+                account=CONTEXT.account,
+                network=CONTEXT.network,
+                symbol="SOLUSDT",
+                cooldown_until=state.clock.now(),
+                position_id=uuid.uuid4(),
+            )
+        )
+        await session.flush()
+        result = await stack.orders.execute_entry(queued)
+        assert (result.outcome, result.reason) == (
+            EntryOutcome.DEFERRED,
+            "risk change in progress",
+        )
+        await session.commit()
+        await session.close()
+        assert (await stack.orders.execute_entry(queued)).outcome is EntryOutcome.FILLED
         await finish(state, await recover(state))
 
     matrix(scenario)

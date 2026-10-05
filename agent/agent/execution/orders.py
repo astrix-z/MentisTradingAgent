@@ -80,6 +80,8 @@ _FILL_SHARE = Decimal("0.99")
 _EXPIRED = "Expired"
 #: Refused by our own last check: Stop, Pause or a lost lock before the send.
 _NOT_ADMITTED = "NotAdmitted"
+#: Refused by our own last check: the risk state changed since the gate.
+_RISK_CHANGED = "RiskChanged"
 
 
 def _expired(signal: SignalInbox, now: datetime) -> bool:
@@ -157,6 +159,11 @@ class OrderManager:
         # when someone asks the database, so ask it now — not the flag.
         if not await runtime.confirm_lead():
             return EntryResult(EntryOutcome.DEFERRED, "no execution lock")
+        # Taken before the gate is read: a risk change that starts or ends
+        # from here to the request stops the BUY in its sending thread.
+        risk = runtime.risk_mark()
+        if risk is None:
+            return EntryResult(EntryOutcome.DEFERRED, "risk change in progress")
         blocked = runtime.admission_block()
         if blocked is None:
             # Reserved earlier: since then a loss may have reached the daily
@@ -219,6 +226,12 @@ class OrderManager:
                 raise TradeCallError(
                     Outcome.REJECTED, blocked, error_type=_NOT_ADMITTED
                 )
+            # The risk the gate read is still the risk now (R1): no close,
+            # unprotected position or UNKNOWN entry began or ended since.
+            if not runtime.risk_unchanged(risk):
+                raise TradeCallError(
+                    Outcome.REJECTED, "risk changed", error_type=_RISK_CHANGED
+                )
 
         async def place() -> TradeResult[Any]:
             # Last looks at the clock: the journal writes above took time, and
@@ -247,6 +260,8 @@ class OrderManager:
             if error.outcome is Outcome.UNKNOWN:
                 await self._mark_unknown(signal_id)
                 return EntryResult(EntryOutcome.UNKNOWN, error.message)
+            if error.error_type == _RISK_CHANGED:
+                return await self._after_risk_change(intent, signal_id)
             if error.outcome is Outcome.REJECTED and error.error_type not in (
                 _EXPIRED,
                 _NOT_ADMITTED,
@@ -259,6 +274,35 @@ class OrderManager:
             await asyncio.shield(self._mark_unknown(signal_id))
             raise
         return await self._settle(signal_id, cid, result.data, detected_at=self.clock())
+
+    async def _after_risk_change(
+        self, intent: ExecutionIntent, signal_id: uuid.UUID
+    ) -> EntryResult:
+        """Nothing was sent; read the risk gate again and decide.
+
+        Blocked now → released with that reason. Otherwise the change was
+        someone else's (another position's fill, a cooldown elsewhere): the
+        intent is RESERVED again and the next round sends it afresh.
+        """
+        runtime = self.runtime
+        async with runtime.session() as session:
+            blocked = await risk_block(
+                session,
+                _context(runtime),
+                intent.symbol,
+                self.clock(),
+                limit=runtime.settings.daily_losing_trades_limit,
+                own=signal_id,
+            )
+        if blocked is not None:
+            await self._release(signal_id, blocked)
+            return EntryResult(EntryOutcome.RELEASED, blocked)
+        async with runtime.session() as session, session.begin():
+            locked = await session.get(ExecutionIntent, signal_id, with_for_update=True)
+            assert locked is not None
+            if locked.state == IntentState.SUBMITTED:
+                locked.state = IntentState.RESERVED
+        return EntryResult(EntryOutcome.DEFERRED, "risk changed before the send")
 
     async def _presubmit(
         self, intent: ExecutionIntent, signal: SignalInbox
