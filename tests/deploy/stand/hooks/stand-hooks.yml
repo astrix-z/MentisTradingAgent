@@ -1,0 +1,10 @@
+# Stand-only override (run-matrix.py, scenario 33): the backend loads
+# hooks/sitecustomize.py, which can hold a Start right before its write.
+services:
+  backend:
+    environment:
+      PYTHONPATH: /stand-hooks
+      STAND_STATE: /stand-state
+    volumes:
+      - /home/jb/stand-hooks:/stand-hooks:ro
+      - /home/jb/stand-state:/stand-state

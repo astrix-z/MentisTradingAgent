@@ -6,6 +6,8 @@
 # once and removes itself:
 #   refuse      nothing is started, an error is returned (R106)
 #   lost-reply  the unit is started, an error is returned anyway (R102)
+#   vanish      another, instant unit takes the name and is collected, then
+#               an error: the unit is gone between the snapshots S0 and S1
 fault="$(cat "$HOME/faults/systemd-run" 2>/dev/null || true)"
 case "$fault" in
   refuse)
@@ -16,6 +18,12 @@ case "$fault" in
     rm -f "$HOME/faults/systemd-run"
     /usr/bin/systemd-run "$@" >/dev/null 2>&1
     echo "systemd-run-fault: started, reply lost" >&2
+    exit 1 ;;
+  vanish)
+    rm -f "$HOME/faults/systemd-run"
+    /usr/bin/systemd-run --user --collect --unit=mentis-deploy true >/dev/null 2>&1
+    sleep 1
+    echo "systemd-run-fault: a unit ran and was collected" >&2
     exit 1 ;;
 esac
 exec /usr/bin/systemd-run "$@"
