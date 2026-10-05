@@ -36,6 +36,7 @@ from agent.execution.ledger import lock_position, record_event
 from agent.execution.models import Position, PositionStatus
 from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.protection import Protector, Step, StepResult
+from agent.execution.runtime import NOT_LEADER
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,9 @@ class PositionWorker:
         """Step 2: cancel the old list; ``None`` once its fate is known."""
         if state.get("cancel") == "done":
             return None
+        # Recording the operation was awaited: ask the database, not the flag.
+        if not await self.runtime.confirm_lead():
+            return StepResult(Step.WAITING, "no execution lock")
         trade = self.protector._trade()
         try:
             await trade.delete_order_list(
@@ -235,6 +239,8 @@ class PositionWorker:
             if error.outcome is Outcome.UNKNOWN:
                 await self._note(position.id, cancel="unknown")
                 return StepResult(Step.WAITING, "cancel outcome unknown")
+            if error.error_type == NOT_LEADER:
+                return StepResult(Step.WAITING, "no execution lock")
             if error.exchange_code not in NOT_FOUND:
                 return StepResult(Step.WAITING, f"cancel refused: {error.message}")
             # Unknown list: it already finished (a leg filled) — the barrier

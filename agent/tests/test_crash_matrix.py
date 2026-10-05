@@ -845,3 +845,211 @@ def test_trailing_reprice_lost_then_crash_recovers_through_the_feed() -> None:
         await finish(state, second)
 
     matrix(scenario)
+
+
+# --- single writer after awaited work (review 2026-10-05, F1) -----------------------------
+
+_MUTATION = {
+    "initial_oco": "order_list_oco",
+    "cancel_oco": "delete_order_list",
+    "market_sell": "new_order",
+}
+
+
+async def _lose_lead(state: World, stack: Stack, *, noticed: bool) -> LeaderLock:
+    """Kill the leader's lock session and let another process take the lock.
+
+    ``noticed`` — the old process has already asked the database (watchdog);
+    otherwise its flag still says it leads.
+    """
+    lock = stack.runtime.lock
+    assert lock is not None
+    pid = await lock.backend_pid()
+    async with state.db.connect() as admin:
+        await admin.execute(text("select pg_terminate_backend(:p)"), {"p": pid})
+    if noticed:
+        assert not await lock.check()
+    rival = LeaderLock(state.url, CONTEXT.account, CONTEXT.network)
+    assert await rival.acquire()
+    return rival
+
+
+@pytest.mark.parametrize("when", ["during_preparation", "at_the_send"])
+@pytest.mark.parametrize("action", sorted(_MUTATION))
+def test_no_new_mutation_after_the_lock_is_lost(action: str, when: str) -> None:
+    # OCO and SELL after the quote read, cancel after the operation is
+    # recorded: a loss nobody noticed yet is caught by asking the database;
+    # one noticed while the request waits for the budget or a worker — by
+    # the last look in the sending thread. Nothing reaches the exchange, and
+    # the durable operation is left for the new owner.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        if action == "cancel_oco":
+            position_id = await state.protected(stack)
+        else:
+            position_id = await state.filled(stack)
+        method = _MUTATION[action]
+        before = state.fake.calls_to(method)
+        rivals: list[LeaderLock] = []
+
+        async def lose(noticed: bool) -> None:
+            if not rivals:
+                rivals.append(await _lose_lead(state, stack, noticed=noticed))
+
+        if when == "at_the_send":
+            trade = stack.runtime.trade
+            assert trade is not None
+            call = trade._call
+
+            async def send(name: str, *args: Any, **kwargs: Any) -> Any:
+                if name == method:
+                    await lose(noticed=True)
+                return await call(name, *args, **kwargs)
+
+            trade._call = send  # type: ignore[method-assign]
+        elif action == "cancel_oco":
+            record = stack.worker._record
+
+            async def recorded(*args: Any, **kwargs: Any) -> Any:
+                result = await record(*args, **kwargs)
+                await lose(noticed=False)
+                return result
+
+            stack.worker._record = recorded  # type: ignore[method-assign]
+        else:
+            quotes = stack.orders.quotes
+
+            class LateQuote:
+                async def snapshot(self, symbol: str) -> QuoteSnapshot:
+                    quote = await quotes(CONTEXT.network).snapshot(symbol)
+                    await lose(noticed=False)
+                    return quote
+
+            stack.orders.quotes = lambda network: LateQuote()  # type: ignore[assignment,return-value]
+        try:
+            if action == "initial_oco":
+                result = await stack.protector.protect(position_id)
+            else:
+                result = await stack.worker.close(
+                    position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
+                )
+            assert rivals, "the lock was never lost"
+            assert result.reason == "no execution lock"
+            assert state.fake.calls_to(method) == before
+            assert not stack.runtime.may_mutate()
+        finally:
+            for rival in rivals:
+                await rival.dispose()
+        await finish(state, await recover(state))
+
+    matrix(scenario)
+
+
+# --- a list taken down by an operation (review 2026-10-05, F2/F3) ---------------------------
+
+
+async def _list_down_with_lagging_fills(
+    state: World, stack: Any, position_id: Any, operation: str
+) -> None:
+    """Part of the stop leg filled, its trades not visible yet; then the
+    reprice or the close cancels the list and cannot prove the legs."""
+    position = await state.position(stack, position_id)
+    assert position.protection_list_id is not None
+    stop_leg = position.protection_list_id.replace("pl", "ps")
+    state.fake.fill_leg(stop_leg, Decimal("0.02"), Decimal(98))
+    leg = state.fake._by_client_id(stop_leg)
+    assert leg is not None
+    state.fake.hide_trades(leg.order_id)
+    if operation == "close":
+        result = await stack.worker.close(
+            position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
+        )
+    else:
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+    assert result.reason == "leg fills not proven yet", result
+    assert not [ol for ol in state.fake.lists.values() if ol.status == "EXECUTING"]
+
+
+@pytest.mark.parametrize("operation", ["close", "reprice"])
+def test_no_new_buy_while_an_operation_has_the_list_down(operation: str) -> None:
+    # Neither a new reservation nor an intent reserved before the operation
+    # may buy while the exchange holds no protection — without waiting for
+    # the 30 s deadline.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        reserved = await state.reserve(stack, "ETHUSDT")
+        await _list_down_with_lagging_fills(state, stack, position_id, operation)
+        async with stack.runtime.session() as session:
+            await record_signal(
+                session,
+                state.entry("SOLUSDT"),
+                context=CONTEXT,
+                strategy="tripple_screen",
+            )
+        [decision] = await stack.admission.drain()
+        assert decision.state == IntentState.REJECTED
+        assert decision.reason == "unprotected_position"
+        buys = len(state.fake.orders_of("ETHUSDT", "BUY"))
+        result = await stack.orders.execute_entry(reserved)
+        assert result.outcome is EntryOutcome.RELEASED
+        assert result.reason == "unprotected_position"
+        assert len(state.fake.orders_of("ETHUSDT", "BUY")) == buys
+        state.fake.reveal_trades()
+        await finish(state, await recover(state, rounds=6))
+
+    matrix(scenario)
+
+
+def test_close_with_lagging_fills_becomes_overdue_in_the_watchdog() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        await _list_down_with_lagging_fills(state, stack, position_id, "close")
+        state.clock.advance(31)
+        watchdog = service(state)
+        await watchdog.runtime.boot()
+        assert watchdog.runtime.context is not None
+        await watchdog._check_deadlines(watchdog.runtime.context)
+        position = await state.position(stack, position_id)
+        assert position.status == PositionStatus.PROTECTION_OVERDUE
+        # Overdue alerts; the exit and its barrier stay as they were.
+        assert position.operation == "exit"
+        assert "overdue:BTCUSDT" in watchdog.runtime.alerts
+        assert [
+            o for o in state.fake.orders_of("BTCUSDT", "SELL") if o.type == "MARKET"
+        ] == []
+        await watchdog.runtime.shutdown()
+        state.fake.reveal_trades()
+        await finish(state, await recover(state, rounds=6))
+
+    matrix(scenario)
+
+
+def test_reprice_stuck_on_its_replacement_becomes_overdue_in_the_watchdog() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        # The cancel of the old list hangs: the status still reads repricing.
+        entered, release = state.fake.gate("delete_order_list")
+        task = asyncio.create_task(stack.worker.reprice(position_id, Decimal("99.5")))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            assert (await state.position(stack, position_id)).status == (
+                PositionStatus.REPRICING
+            )
+            state.clock.advance(31)
+            watchdog = service(state)
+            await watchdog.runtime.boot()
+            assert watchdog.runtime.context is not None
+            await watchdog._check_deadlines(watchdog.runtime.context)
+            await watchdog.runtime.shutdown()
+            position = await state.position(stack, position_id)
+            assert position.status == PositionStatus.PROTECTION_OVERDUE
+            assert position.operation == "reprice"
+        finally:
+            release.set()
+            await task
+        await finish(state, await recover(state, rounds=6))
+
+    matrix(scenario)

@@ -39,7 +39,7 @@ from sqlalchemy import func, select, union_all
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from agent.exchange.trade import RECV_WINDOW_MS, TradeCallError, TradeClient
+from agent.exchange.trade import RECV_WINDOW_MS, Outcome, TradeCallError, TradeClient
 from agent.execution.lock import LeaderLock
 from agent.execution.models import (
     INTENT_HOLDING_STATES,
@@ -54,6 +54,10 @@ from agent.execution.settings import ExecutionSettings
 from agent.strategies.base import PositionEvent, PositionsSnapshot
 
 logger = logging.getLogger(__name__)
+
+#: ``error_type`` of a send refused by :meth:`ExecutionRuntime.guard_mutation`:
+#: nothing reached the exchange.
+NOT_LEADER = "NotLeader"
 
 WATCHDOG_SECONDS = 5.0
 CLOCK_CHECK_EVERY = timedelta(hours=1)
@@ -323,6 +327,19 @@ class ExecutionRuntime:
             and self.trade is not None
         )
 
+    def guard_mutation(self) -> None:
+        """Last look before an order is placed or cancelled, in the sending thread.
+
+        Only in-memory state, no awaits: a lock loss the watchdog or a
+        :meth:`confirm_lead` noticed while the request waited for the budget
+        or a worker still stops it. Not :meth:`admission_block`: a Stop or a
+        Pause must not stop protecting and closing what is open.
+        """
+        if not self.may_mutate():
+            raise TradeCallError(
+                Outcome.REJECTED, "no execution lock", error_type=NOT_LEADER
+            )
+
     async def confirm_lead(self) -> bool:
         """Ask the database, not the flag, whether this process still leads.
 
@@ -472,6 +489,7 @@ class ExecutionRuntime:
                 f"credentials for {network} belong to account {uid}, but unfinished "
                 f"work belongs to {expected_account}"
             )
+        trade.mutation_guard = self.guard_mutation
         self.trade = trade
         self.context = ExecutionContext(account=uid, network=network)
         self.alerts.pop("account", None)

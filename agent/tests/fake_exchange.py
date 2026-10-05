@@ -944,6 +944,8 @@ class FakeExchange:
         with self._lock:
             self._before("ticker_price", kwargs)
             symbol = kwargs["symbol"]
+            if symbol not in self.last:
+                raise BadRequestError("Invalid symbol.", -1121)
             payload = {"symbol": symbol, "price": fmt(self.last[symbol])}
         return response(TickerPriceResponse, payload)
 

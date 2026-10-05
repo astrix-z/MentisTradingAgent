@@ -290,6 +290,13 @@ def _check_client_id(*ids: str | None) -> None:
             )
 
 
+#: SDK methods that place or cancel orders: :attr:`TradeClient.mutation_guard`
+#: runs before each of them, in the sending thread.
+MUTATING = frozenset(
+    {"new_order", "order_list_oco", "delete_order_list", "delete_order"}
+)
+
+
 class TradeClient:
     """Signed, non-retrying access to the exchange for one network."""
 
@@ -308,6 +315,11 @@ class TradeClient:
         #: Requests whose thread is still running; held so an abandoned one is
         #: not collected before its feedback is applied.
         self._inflight: set[asyncio.Future[Any]] = set()
+        #: The owner's last word before any order is placed or cancelled
+        #: (:data:`MUTATING`): runs in the sending thread after the budget wait
+        #: and the queue for a worker; whatever it raises aborts the call with
+        #: nothing sent. Set by the execution runtime (single writer).
+        self.mutation_guard: Callable[[], None] | None = None
 
     @classmethod
     def connect(cls, network: Network) -> TradeClient:
@@ -351,8 +363,18 @@ class TradeClient:
         # The request runs in a thread that cancelling the caller cannot stop,
         # so the budget feedback (429/418/weight headers) is applied by the
         # task itself when the thread finishes, awaited or not.
+        check = before_send
+        guard = self.mutation_guard if name in MUTATING else None
+        if guard is not None:
+
+            def guarded() -> None:
+                if before_send is not None:
+                    before_send()
+                guard()
+
+            check = guarded
         call = asyncio.ensure_future(
-            asyncio.to_thread(self._invoke, method, kwargs, before_send)
+            asyncio.to_thread(self._invoke, method, kwargs, check)
         )
         self._inflight.add(call)
         call.add_done_callback(self._feedback)

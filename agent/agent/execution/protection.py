@@ -50,7 +50,7 @@ from agent.execution.models import AttemptState, OrderAttempt, Position, Positio
 from agent.execution.orders import OrderManager
 from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.quotes import QuoteSnapshot
-from agent.execution.runtime import ExecutionContext, ExecutionRuntime
+from agent.execution.runtime import NOT_LEADER, ExecutionContext, ExecutionRuntime
 from agent.execution.sizing import (
     Skip,
     sellable,
@@ -238,6 +238,10 @@ class Protector:
             return await self._exit(
                 position.id, ExitReason.EMERGENCY, ExitMechanism.MARKET_UNPROTECTED
             )
+        # The market reads were awaited: the lock may be gone meanwhile, and
+        # its flag only drops when someone asks the database (EXEC-05).
+        if not await runtime.confirm_lead():
+            return StepResult(Step.WAITING, "no execution lock")
         async with runtime.session() as session, session.begin():
             sequence = await self.orders.journal.next_sequence(
                 session, signal_id=position.signal_id, role=Role.LIST
@@ -280,6 +284,8 @@ class Protector:
                 ),
             )
         except TradeCallError as error:
+            if error.error_type == NOT_LEADER:
+                return StepResult(Step.WAITING, "no execution lock")
             if error.outcome is Outcome.REJECTED and _insufficient(error):
                 # Something else holds the asset — maybe an OCO we lost track
                 # of. Never a proof of protection: reconcile decides.
@@ -465,13 +471,20 @@ class Protector:
         )
 
     async def check_deadline(self, position_id: uuid.UUID) -> bool:
-        """Mark the position overdue once its deadline passed; True if overdue."""
+        """Mark the position overdue once its deadline passed; True if overdue.
+
+        Covers every unfinished operation that took the list down: a close
+        (cancel → barrier → exit) as much as a reprice (plan §6.7). The
+        operation and its state are kept: overdue only alerts and closes
+        entries, it never lets an unproven remainder be sold.
+        """
         async with self.runtime.session() as session, session.begin():
             position = await lock_position(session, position_id)
             if position.status not in (
                 PositionStatus.PROTECTING,
                 PositionStatus.UNPROTECTED,
                 PositionStatus.REPRICING,
+                PositionStatus.CLOSING,
             ):
                 return position.status == PositionStatus.PROTECTION_OVERDUE
             if (
@@ -579,6 +592,8 @@ class Protector:
         self, position: Position, qty: Decimal, reason: ExitReason
     ) -> StepResult | None:
         runtime = self.runtime
+        if not await runtime.confirm_lead():
+            return StepResult(Step.WAITING, "no execution lock")
         async with runtime.session() as session, session.begin():
             sequence = await self.orders.journal.next_sequence(
                 session, signal_id=position.signal_id, role=Role.EXIT
@@ -615,6 +630,8 @@ class Protector:
         except TradeCallError as error:
             if error.outcome is Outcome.UNKNOWN:
                 return StepResult(Step.WAITING, "exit outcome unknown")
+            if error.error_type == NOT_LEADER:
+                return StepResult(Step.WAITING, "no execution lock")
             if _insufficient(error):
                 return StepResult(Step.WAITING, "insufficient balance; reconcile")
             return StepResult(Step.WAITING, f"exit refused: {error.message}")

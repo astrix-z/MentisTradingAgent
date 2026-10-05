@@ -32,7 +32,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -67,6 +67,31 @@ UNSAFE_STATES = (
     PositionStatus.PROTECTION_OVERDUE,
     PositionStatus.UNKNOWN,
 )
+
+
+async def unprotected_positions(
+    session: AsyncSession, context: ExecutionContext
+) -> int:
+    """Open positions whose protection the exchange does not confirm now.
+
+    Besides :data:`UNSAFE_STATES`: a reprice or a close takes the list down
+    before its replacement or sale is proven — ``unprotected_since`` is set
+    while the status still reads ``repricing``/``closing`` (review 2026-10-05).
+    """
+    count = await session.scalar(
+        select(func.count()).where(
+            Position.account == context.account,
+            Position.network == context.network,
+            or_(
+                Position.status.in_(list(UNSAFE_STATES)),
+                and_(
+                    Position.status != PositionStatus.CLOSED,
+                    Position.unprotected_since.is_not(None),
+                ),
+            ),
+        )
+    )
+    return int(count or 0)
 
 
 def admission_lock_key(context: ExecutionContext) -> int:
@@ -290,14 +315,7 @@ class Admission:
                 >= limit
             ):
                 return "daily_loss_limit"
-            unsafe = await session.scalar(
-                select(func.count()).where(
-                    Position.account == context.account,
-                    Position.network == context.network,
-                    Position.status.in_(list(UNSAFE_STATES)),
-                )
-            )
-            if unsafe:
+            if await unprotected_positions(session, context):
                 return "unprotected_position"
             unknown = await session.scalar(
                 select(func.count()).where(

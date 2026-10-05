@@ -719,3 +719,25 @@ def test_upgrade_keeps_the_list_an_exit_is_already_cancelling() -> None:
         assert pl1.applied_at is not None
 
     run(scenario)
+
+
+def test_an_asset_with_no_usdt_market_does_not_stop_the_startup_reconcile() -> None:
+    # Rollback rehearsal 2026-10-05 (testnet): the account held assets with no
+    # USDT pair; their price lookup failed with -1121 and the reconcile before
+    # execution retried forever, so execution never started.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        await state.protected(first)
+        await state.kill(first)
+        state.fake.free["NOPAIR"] = Decimal(1000)  # no NOPAIRUSDT market
+        state.fake.free["SOL"] = Decimal(1)  # 100 USDT, no position explains it
+        started = service(state)
+        await started.runtime.boot()  # unfinished work: lock → startup reconcile
+        assert started.runtime.reconciled
+        assert "reconcile" not in started.runtime.alerts
+        # The unvaluable asset is ignored; a real one is still a divergence.
+        assert "divergence:balance:SOLUSDT" in started.runtime.alerts
+        assert not any("NOPAIR" in key for key in started.runtime.alerts)
+        await started.runtime.shutdown()
+
+    run(scenario)

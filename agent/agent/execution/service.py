@@ -30,10 +30,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from binance_common.errors import BadRequestError
 from sqlalchemy import select
 
 from agent.exchange.hub import StreamHub
-from agent.exchange.rest import ExchangeRest
+from agent.exchange.rest import ExchangeError, ExchangeRest
 from agent.execution.admission import Admission
 from agent.execution.exits import Exits
 from agent.execution.filters import FilterCache
@@ -117,7 +118,14 @@ class ExecutionService:
             context = runtime.context
             if context is None:
                 return None
-            ticker = await market(context.network).ticker_price(symbol)
+            try:
+                ticker = await market(context.network).ticker_price(symbol)
+            except ExchangeError as exc:
+                if isinstance(exc.__cause__, BadRequestError):
+                    # No such market (-1121): an asset held without a USDT
+                    # pair is no position of ours and cannot be valued.
+                    return None
+                raise
             value = getattr(getattr(ticker, "actual_instance", ticker), "price", None)
             return Decimal(value) if value else None
 
@@ -200,7 +208,9 @@ class ExecutionService:
         through an OCO whose outcome is not known.
         """
         for position in await self._open():
-            if position.status in UNSAFE:
+            # A reprice or a close stuck on an awaited request has its list
+            # down too (``unprotected_since``), whatever its status says.
+            if position.status in UNSAFE or position.unprotected_since is not None:
                 await self.protector.check_deadline(position.id)
 
     async def _on_reserved(self, signal_id: uuid.UUID) -> None:
