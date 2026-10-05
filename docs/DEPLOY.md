@@ -234,7 +234,7 @@ docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml start bac
 1. **Флаг.** `$COMPOSE exec -T redis redis-cli SET trading:start_fence "rollback <кто> <когда>"`.
    С этого момента ни один Start не записывается, Stop и чтение работают.
 2. **Stop и барьер доставки.** Stop через UI/API; дождаться: `GET
-   /trading/commands/{id}/state/` этой Stop — терминальный `ok`; `$COMPOSE exec -T redis
+   /trading/commands/{id}/state/` этой Stop — `status = succeeded`; `$COMPOSE exec -T redis
    redis-cli XINFO GROUPS agent:commands:stream` — `lag = 0` и `pending = 0`;
    `GET /trading/status/` — `actual.state = idle`. Нужны все три: пока агент стоит,
    а Start ещё в потоке, статус показывает `idle` и `online = true` (срок heartbeat
@@ -278,6 +278,20 @@ docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml start bac
 `T0` закрепляется первым запуском нового скрипта: `./scripts/deploy.sh --t0-revision 567f4f8`
 (§3). `T1` (09a + 01–03 без 04+) и `T2` (04–06) появятся в таблице, только если их
 выкатят отдельно; промежуточные коммиты master целями не являются.
+
+**Репетиция 2026-10-05** (изолированный стенд: контейнер с systemd, sshd и своим Docker,
+`DEPLOY_SSH`; история прода воспроизведена старым скриптом — `bef05d5`, затем `567f4f8`):
+`deploy.sh --t0-revision 567f4f8` закрепил `T0` и выкатил `2562f2e`; Start `Fast` записан
+в `desired`; шаги 1–9 выше: под флагом Start по обоим маршрутам — `503`, Stop
+`succeeded`, `lag = 0`, `pending = 0`, `idle`; `downgrade` до `b3f7a1c9d2e4` убрал таблицы
+наборов, списков и `signal_exit_pending`; `deploy.sh --revision 567f4f8` — без сборки,
+флаг снят, каталог `T0` со старыми именами и без `presets`, агент `idle`, `Fast` не
+восстановлен; на `T0` `Fast` в её именах → `422 "timeframes must have tide:wave:ripple
+ratio 16:4:1"`, `Default` → `202`, команда `succeeded`. Повторная выкладка `2562f2e` —
+без сборки, `upgrade` до `a7e3c1d9f5b2`, `Default` и `Fast` снова в наборах, БД `agent` на
+прежней ревизии. Ограничение: без ключей testnet `Fast` на новой версии не дошёл до
+`running` (Start проверяет ключ на Binance), поэтому стратегия была запущена только в
+`desired` — именно его восстанавливает агент после отката.
 
 ## 7. Правила и предостережения
 
