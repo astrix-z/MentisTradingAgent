@@ -344,7 +344,7 @@ class Row:
 #: The acceptance items of the PRESET-09a card ("Приёмка (локальный стек)")
 #: and the scenarios that answer them.
 COVERAGE: list[tuple[str, list[str]]] = [
-    ("Во время deploy Start по обоим маршрутам → 503 за один EVAL (код -1, без цикла); Stop при флаге принимается и пишет снапшот", ["27"]),
+    ("Во время deploy Start по обоим маршрутам → 503 за один EVAL (код -1, без цикла); Stop при флаге принимается и пишет снапшот", ["27", "33"]),
     ("Start, прошедший проверку до флага и приостановленный перед записью, после флага → 503, в потоке и в desired его нет", ["33"]),
     ("Каталог не опубликован за 2 мин → скрипт падает, флаг остаётся, агент цели работает", ["11"]),
     ("Сбой сборки → ни флага, ни остановки агента", ["7"]),
@@ -1023,7 +1023,9 @@ def api_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
         {
             "start/ — 503": s1 == 503,
             "commands/ start — 503": s2 == 503,
-            "по одному EVAL на Start, без повторов": len(evals) == 2,
+            # The early check refuses before any write (0); a Start that
+            # passed it is refused by the one EVAL of the write (scenario 33).
+            "не больше одного EVAL на Start, без повторов": len(evals) <= 2,
             "Stop принят": s3 == 202,
             "desired.running = false": status["desired"]["running"] is False,
             "выкладка — код 0": result.code == 0,
@@ -1157,6 +1159,12 @@ def preparation_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> Non
         while time.time() < deadline and p1.proc.poll() is None and p2.proc.poll() is None:
             time.sleep(0.5)
         loser_done = [p for p in (p1, p2) if p.proc.poll() is not None]
+        # The winner's own changes end with its retag at step (4); `up` then
+        # sleeps. From there to its .exit nothing may change the state.
+        winner = next((p for p in (p1, p2) if p.proc.poll() is None), None)
+        if winner is not None:
+            winner.wait_for("==> (4)")
+            time.sleep(3)
         mid_hash, mid_ids, mid_fence = app_hash(stand), latest_ids(stand), stand.fence()
         r1, r2 = p1.result(), p2.result()
         end_hash, end_ids = app_hash(stand), latest_ids(stand)
@@ -1178,7 +1186,7 @@ def preparation_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> Non
                 "отказ — идёт выкладка другой ревизии": "идёт выкладка ревизии" in outs,
                 "проигравшая решила раньше победителя": len(loser_done) == 1,
                 "флаг стоял, пока работал победитель": mid_fence != "—",
-                "APP_DIR/compose.yml и образы :latest не менялись после отказа": (mid_hash, mid_ids) == (end_hash, end_ids),
+                "compose.yml и образы :latest от шага (4) победителя до его .exit не менялись": (mid_hash, mid_ids) == (end_hash, end_ids),
             }
             title = "Одновременные подготовки двух ревизий, запуск одновременно (R103)"
             expected = "общее состояние меняет один юнит; другая — отказ до любых записей"
@@ -1214,8 +1222,23 @@ def held_start_scenario(stand: Stand, journal: Journal) -> None:
         time.sleep(0.2)
     held = stand.sh("test -e ~/stand-state/start-held && echo y", check=False) == "y"
     stand.compose('exec -T redis redis-cli SET trading:start_fence "stand: held start"')
+    monitor = subprocess.Popen(
+        [str(stand.ssh), f"cd {APP} && timeout 30 {COMPOSE} exec -T redis redis-cli MONITOR"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    time.sleep(1)
     stand.sh("rm -f ~/stand-state/pause-start")
     request.join(60)
+    time.sleep(1)
+    monitor.terminate()
+    seen, _ = monitor.communicate(timeout=30)
+    evals = [
+        line
+        for line in seen.splitlines()
+        if '"eval' in line.lower() and "trading:start_fence" in line
+    ]
     code, body = answer.get("r", (None, None))
     stream_after = stand.compose("exec -T redis redis-cli XLEN agent:commands:stream")
     _, status_after = api("GET", "/trading/status/")
@@ -1232,13 +1255,14 @@ def held_start_scenario(stand: Stand, journal: Journal) -> None:
         {
             "Start удержан перед записью": held,
             "ответ 503": code == 503,
+            "один EVAL записи (код -1), без повторов": len(evals) == 1,
             "поток команд не вырос": stream_before == stream_after,
             "desired не изменился": status_before["desired"] == status_after["desired"],
         },
         "Удержание — хук стенда (`tests/deploy/stand/hooks/sitecustomize.py`, override "
         "`stand-hooks.yml`) перед `_apply_command`; отказ дал Lua-скрипт записи "
         "(`COMMIT_RUNTIME_LUA`), код продукта не менялся.",
-        f"ответ: {body}",
+        f"ответ: {body}; EVAL с ключом флага после снятия паузы: {len(evals)}",
     )
 
 
