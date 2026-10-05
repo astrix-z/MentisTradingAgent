@@ -1,0 +1,39 @@
+#!/bin/bash
+# `docker compose` with one injected fault (PRESET-09a acceptance matrix).
+#
+# deploy.sh hands DEPLOY_COMPOSE to the fence unit; on the stand it is this
+# script. ~/faults/active names the fault; it fires once and removes itself,
+# so the fence's own recovery (trap) runs on a healthy compose:
+#   build            the build of the target fails
+#   flag             setting trading:start_fence fails (after the build)
+#   catalog-del      deleting agent:strategies fails (agent already stopped)
+#   up               `up` runs, then reports a failure (a partial up)
+#   catalog-timeout  `up` succeeds, then the new agent is paused: no catalog
+#   slow-up          `up` waits ~/faults/slow seconds first (default 60)
+set -u
+fault="$(cat "$HOME/faults/active" 2>/dev/null || true)"
+args=" $* "
+fired() { rm -f "$HOME/faults/active"; echo "compose-fault: $fault" >&2; }
+case "$fault" in
+  build)
+    if [[ "$args" == *" build "* || "$args" == *" build" ]]; then fired; exit 1; fi ;;
+  flag)
+    if [[ "$args" == *" SET trading:start_fence "* ]]; then fired; exit 1; fi ;;
+  catalog-del)
+    if [[ "$args" == *" DEL agent:strategies "* ]]; then fired; exit 1; fi ;;
+  up)
+    if [[ "$args" == *" up "* ]]; then docker compose "$@"; fired; exit 1; fi ;;
+  catalog-timeout)
+    if [[ "$args" == *" up "* ]]; then
+      docker compose "$@" || exit
+      fired
+      docker pause mentis-agent-1 >/dev/null
+      exit 0
+    fi ;;
+  slow-up)
+    if [[ "$args" == *" up "* ]]; then
+      fired
+      sleep "$(cat "$HOME/faults/slow" 2>/dev/null || echo 60)"
+    fi ;;
+esac
+exec docker compose "$@"
