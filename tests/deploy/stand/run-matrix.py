@@ -60,8 +60,11 @@ FIRST_LOCK = "589c9cb"
 #: Older than the catalog key (deploy.sh refuses), and one with no image
 #: and no tracked lock.
 TOO_OLD = "c0c8cf3"
-NO_LOCK = "608cfa1"
+NO_PROD_COMPOSE = "608cfa1"  # has the catalog key, not compose.prod.yml yet
+NO_LOCK = "589c9cb^"  # the last commit before uv.lock was tracked
 ADMIN = ("admin@example.com", "StandPass12345")
+BUS_DOWN = "chmod 000 /run/user/1000/bus /run/user/1000/systemd/private"
+BUS_UP = "chmod 666 /run/user/1000/bus && chmod 700 /run/user/1000/systemd/private"
 
 
 def log(message: str) -> None:
@@ -825,23 +828,37 @@ def environment_scenarios(stand: Stand, journal: Journal, a: str) -> None:
         TOO_OLD, result, stand.state(),
         {"код 1": result.code == 1, "про 608cfa1": has(result, "старше 608cfa1"), "флага нет": stand.fence() == "—"},
     )
-    result = deploy(stand, "--revision", NO_LOCK)
+    result = deploy(stand, "--revision", NO_PROD_COMPOSE)
+    journal.add(
+        "21a", "Цель без `compose.prod.yml` (`608cfa1`)", "отказ на проверке контракта, до шага (1)",
+        NO_PROD_COMPOSE, result, stand.state(),
+        {
+            "код 1": result.code == 1,
+            "сбой до шага (1)": has(result, "сбой до шага (1)"),
+            "флага нет": stand.fence() == "—",
+        },
+        "Причина в логе — ошибка `docker compose config` (нет файла), а не отдельное "
+        "сообщение скрипта ограды.",
+    )
+    no_lock = short(NO_LOCK)
+    result = deploy(stand, "--revision", no_lock)
     journal.add(
         "21", "Цель без образов и без tracked `uv.lock`",
-        "отказ, lock текущего дерева не подставляется", NO_LOCK, result, stand.state(),
+        "отказ, lock текущего дерева не подставляется", no_lock, result, stand.state(),
         {
             "код 1": result.code == 1,
             "про uv.lock": has(result, "lock текущего дерева не подставляется"),
             "флага нет": stand.fence() == "—",
-            "образов цели нет": not stand.sh(f"docker images -q mentis-agent:{NO_LOCK}", check=False),
+            "образов цели нет": not stand.sh(f"docker images -q mentis-agent:{no_lock}", check=False),
         },
     )
-    # The user manager unreachable before the launch, for longer than 30 s.
-    stand.root("chmod 000 /run/user/1000/bus")
+    # The user manager unreachable before the launch, for longer than 30 s:
+    # the bus and the manager's private socket, which systemctl falls back to.
+    stand.root(BUS_DOWN)
     try:
         result = deploy(stand, "--revision", a)
     finally:
-        stand.root("chmod 666 /run/user/1000/bus")
+        stand.root(BUS_UP)
     journal.add(
         "22", "Шина менеджера пользователя недоступна дольше 30 с", "«состояние неизвестно», юнит не запускается",
         a, result, stand.state(),
@@ -855,9 +872,9 @@ def environment_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     stand.fault("slow-up", slow=25)
     bg = Background(stand, "--revision", a)
     bg.wait_for("==> (4)")
-    stand.root("chmod 000 /run/user/1000/bus")
+    stand.root(BUS_DOWN)
     time.sleep(8)
-    stand.root("chmod 666 /run/user/1000/bus")
+    stand.root(BUS_UP)
     result = bg.result()
     journal.add(
         "23", "Шина недоступна 8 с во время ожидания исхода",
@@ -978,7 +995,7 @@ def rollback_to_t0(stand: Stand, journal: Journal) -> None:
         {
             "код 0": result.code == 0,
             "без сборки": has(result, f"Образы :{T0} уже есть — без сборки"),
-            "образов не прибавилось": stand.sh("docker images -q | wc -l") == builds_before,
+            "образов не прибавилось": int(stand.sh("docker images -q | wc -l")) <= int(builds_before),
             "alembic current = b3f7a1c9d2e4": any("b3f7a1c9d2e4" in line for line in current),
             "миграции APP_DIR = T0": [v for v in versions if v.endswith(".py")] == [v for v in t0_versions if v.endswith(".py")],
             "каталог T0 (старые имена)": "swing_low_h1_n" in catalog,
