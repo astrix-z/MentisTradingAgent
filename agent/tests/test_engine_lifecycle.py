@@ -371,13 +371,16 @@ def test_streams_close_partial_sdk_connection() -> None:
 
 
 def test_a_published_entry_is_followed_and_a_tracker_exit_is_published() -> None:
-    # ClickUp 869f6m7vn: the tracker learns of every ENTRY that went out; its
-    # failure does not undo the emit; its EXIT goes to the backend's channel.
+    # ClickUp 869f6m7vn: the tracker learns of every ENTRY before it goes
+    # out; without an inbox a failed watch fails the emit (review R2), and
+    # nothing is published; its EXIT goes to the backend's channel.
     async def scenario() -> None:
         redis = Mock(publish=AsyncMock(return_value=None))
         engine = Engine(redis)
         engine.tracker = Mock(
-            watch=AsyncMock(side_effect=[None, RuntimeError("database down")])
+            watch=AsyncMock(side_effect=[None, RuntimeError("database down")]),
+            forget=AsyncMock(),
+            is_open=AsyncMock(return_value=True),
         )
         now = datetime.now(UTC)
         entry = Signal(
@@ -390,9 +393,11 @@ def test_a_published_entry_is_followed_and_a_tracker_exit_is_published() -> None
             tp_rule="fill x 1.1",
         )
         await engine._on_signal(entry)
-        await engine._on_signal(entry)  # the tracker fails: the emit stands
+        with pytest.raises(RuntimeError):
+            await engine._on_signal(entry)  # the watch fails: so does the emit
         assert engine.tracker.watch.await_count == 2
         assert engine.tracker.watch.await_args.args[0] is entry
+        assert redis.publish.await_count == 1
         hold = Signal(type="HOLD", symbol="SENTUSDT", emitted_at=now)
         await engine._on_signal(hold)
         assert engine.tracker.watch.await_count == 2

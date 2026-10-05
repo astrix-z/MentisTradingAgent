@@ -34,14 +34,16 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import String, cast, delete, select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from agent.execution.models import SignalInbox
 from agent.models import SignalWatch
 from agent.strategies.base import Signal
 
@@ -51,6 +53,8 @@ MINUTE_MS = 60_000
 CHECK_SECONDS = 60.0
 #: Most bars one klines request returns.
 PAGE = 1000
+#: How far back the inbox is searched for ENTRYs left unwatched.
+REPAIR_WINDOW = timedelta(days=7)
 STOP = "stop"
 TAKE = "tp"  # what the backend reads as hit_take
 #: EXIT ids derive from their ENTRY's: a republished exit is the same signal.
@@ -122,6 +126,53 @@ def exit_signal(watch: SignalWatch) -> Signal:
     )
 
 
+def _watch_values(signal: Signal, network: str) -> dict[str, Any] | None:
+    if (
+        signal.type != "ENTRY"
+        or signal.entry_ref is None
+        or signal.swing_low_ref is None
+    ):
+        return None
+    take = take_level(signal.entry_ref, signal.tp_rule or "")
+    if take is None:
+        logger.warning(
+            "signal %s: tp_rule %r has no take level; not followed",
+            signal.signal_id,
+            signal.tp_rule,
+        )
+        return None
+    emitted_ms = int(signal.emitted_at.timestamp() * 1000)
+    return {
+        "signal_id": signal.signal_id,
+        "network": network,
+        "symbol": signal.symbol,
+        "entry_ref": signal.entry_ref,
+        "stop": signal.swing_low_ref,
+        "take": take,
+        "emitted_at": signal.emitted_at,
+        # The ENTRY's own minute holds trades from before it.
+        "checked_until": -(-emitted_ms // MINUTE_MS) * MINUTE_MS,
+    }
+
+
+def _entry_from(payload: dict[str, Any]) -> Signal:
+    """The ENTRY an inbox payload (``Signal.transport()``) describes."""
+
+    def dec(key: str) -> Decimal | None:
+        value = payload.get(key)
+        return None if value is None else Decimal(str(value))
+
+    return Signal(
+        type="ENTRY",
+        symbol=str(payload["symbol"]),
+        emitted_at=datetime.fromisoformat(str(payload["emitted_at"])),
+        entry_ref=dec("entry_ref"),
+        swing_low_ref=dec("swing_low_ref"),
+        tp_rule=payload.get("tp_rule"),
+        signal_id=str(payload["signal_id"]),
+    )
+
+
 class SignalTracker:
     def __init__(
         self,
@@ -140,6 +191,8 @@ class SignalTracker:
         #: Told of each crossing as soon as it is recorded (before the EXIT is
         #: published): the engine's virtual position feedback (869f6m7vg).
         self.on_closed: Callable[[SignalWatch], Awaitable[None]] | None = None
+        #: Told of a watch the repair added (an ENTRY found unwatched).
+        self.on_opened: Callable[[SignalWatch], Awaitable[None]] | None = None
 
     async def snapshot(
         self, network: str, since: datetime
@@ -168,41 +221,99 @@ class SignalTracker:
             ).all()
         return frozenset(open_symbols), list(exits)
 
+    @property
+    def enabled(self) -> bool:
+        return self._sessions is not None
+
     async def watch(self, signal: Signal, network: str) -> None:
-        """Start following a published ENTRY; a repeated one is a no-op."""
-        if (
-            self._sessions is None
-            or signal.type != "ENTRY"
-            or signal.entry_ref is None
-            or signal.swing_low_ref is None
-        ):
+        """Start following an ENTRY; a repeated one is a no-op."""
+        if self._sessions is None:
             return
-        take = take_level(signal.entry_ref, signal.tp_rule or "")
-        if take is None:
-            logger.warning(
-                "signal %s: tp_rule %r has no take level; not followed",
-                signal.signal_id,
-                signal.tp_rule,
-            )
-            return
-        emitted_ms = int(signal.emitted_at.timestamp() * 1000)
-        first = -(-emitted_ms // MINUTE_MS) * MINUTE_MS  # next full minute
         async with self._sessions() as session:
+            await self.watch_in(session, signal, network)
+            await session.commit()
+
+    async def watch_in(
+        self, session: AsyncSession, signal: Signal, network: str
+    ) -> None:
+        """Write the watch of ``signal`` in the caller's transaction.
+
+        Used to commit the watch together with the durable inbox record: an
+        ENTRY that exists is followed (review 2026-10-05 REPEAT, R2).
+        """
+        values = _watch_values(signal, network)
+        if values is not None:
             await session.execute(
                 insert(SignalWatch)
-                .values(
-                    signal_id=signal.signal_id,
-                    network=network,
-                    symbol=signal.symbol,
-                    entry_ref=signal.entry_ref,
-                    stop=signal.swing_low_ref,
-                    take=take,
-                    emitted_at=signal.emitted_at,
-                    checked_until=first,
-                )
+                .values(**values)
                 .on_conflict_do_nothing(index_elements=["signal_id"])
             )
+
+    async def forget(self, signal_id: str) -> None:
+        """Drop the watch of an ENTRY that was never published."""
+        if self._sessions is None:
+            return
+        async with self._sessions() as session:
+            await session.execute(
+                delete(SignalWatch).where(
+                    SignalWatch.signal_id == signal_id,
+                    SignalWatch.exit_reason.is_(None),
+                )
+            )
             await session.commit()
+
+    async def is_open(self, signal_id: str) -> bool:
+        if self._sessions is None:
+            return False
+        async with self._sessions() as session:
+            watch = await session.get(SignalWatch, signal_id)
+        return watch is not None and watch.exit_reason is None
+
+    async def repair(self, since: datetime) -> list[SignalWatch]:
+        """Follow every inbox ENTRY since ``since`` that has no watch.
+
+        A crash or an older agent may have left a recorded ENTRY unwatched;
+        the inbox is the record of what was emitted. Returns the new watches.
+        """
+        if self._sessions is None:
+            return []
+        async with self._sessions() as session:
+            try:
+                rows = (
+                    await session.execute(
+                        select(SignalInbox.network, SignalInbox.payload)
+                        .where(
+                            SignalInbox.type == "ENTRY",
+                            SignalInbox.emitted_at >= since,
+                            cast(SignalInbox.signal_id, String).not_in(
+                                select(SignalWatch.signal_id)
+                            ),
+                        )
+                        .order_by(SignalInbox.emitted_at)
+                    )
+                ).all()
+            except SQLAlchemyError as exc:  # no execution schema: nothing to repair
+                logger.debug("inbox not readable for watch repair: %s", exc)
+                return []
+            added: list[SignalWatch] = []
+            for network, payload in rows:
+                values = _watch_values(_entry_from(payload), network)
+                if values is None:
+                    continue
+                await session.execute(
+                    insert(SignalWatch)
+                    .values(**values)
+                    .on_conflict_do_nothing(index_elements=["signal_id"])
+                )
+                added.append(SignalWatch(**values))
+            await session.commit()
+        for watch in added:
+            logger.warning(
+                "ENTRY %s %s was not followed; followed from its emission now",
+                watch.symbol,
+                watch.signal_id,
+            )
+        return added
 
     async def check(self) -> int:
         """One round: find new crossings, publish every unpublished exit.
@@ -211,6 +322,12 @@ class SignalTracker:
         """
         if self._sessions is None:
             return 0
+        for watch in await self.repair(self._clock() - REPAIR_WINDOW):
+            if self.on_opened is not None:
+                try:
+                    await self.on_opened(watch)
+                except Exception:  # noqa: BLE001 - the watch is recorded
+                    logger.exception("open of %s not delivered", watch.signal_id)
         now_ms = int(self._clock().timestamp() * 1000)
         # The newest closed bar opened a full minute before the current one.
         last_closed = (now_ms // MINUTE_MS - 1) * MINUTE_MS

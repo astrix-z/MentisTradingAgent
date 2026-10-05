@@ -21,6 +21,7 @@ from typing import Any, Literal
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent.exchange import (
     ExchangeError,
@@ -444,12 +445,25 @@ class Engine:
                 network=runtime.context.network,
                 strategy=self._strategy_name,
             )
+            tracker = self.tracker if signal.type == "ENTRY" else None
+            network = self._network
+            identified = signal
+
+            async def followed(session: AsyncSession) -> None:
+                # The watch commits with the inbox record: a recorded ENTRY
+                # is followed, a failed watch is a failed emit (R2).
+                assert tracker is not None
+                await tracker.watch_in(session, identified, network)
+
             async with runtime.session() as session:
                 recorded = await record_signal(
                     session,
                     signal,
                     context=runtime.context,
                     strategy=self._strategy_name,
+                    with_it=followed
+                    if tracker is not None and tracker.enabled
+                    else None,
                 )
             if not recorded:
                 logger.info(
@@ -458,8 +472,17 @@ class Engine:
                     signal.symbol,
                     signal.epoch_id,
                 )
+                # A replay does not skip what the first emit may not have
+                # finished: the watch (an older record) and its feedback.
+                if tracker is not None:
+                    await tracker.watch(signal, network)
+                    await self._virtual_opened(signal)
                 return
             durable = True
+        elif signal.type == "ENTRY" and self.tracker is not None:
+            # No inbox: the watch is written before the publish, dropped if
+            # the publish fails (the strategy retries the epoch).
+            await self.tracker.watch(signal, self._network)
         logger.info(
             "signal %s %s reason=%s epoch=%s",
             signal.type,
@@ -490,26 +513,41 @@ class Engine:
             await self._publish_event("signal", signal)
         except RedisError:
             if not durable:
+                if signal.type == "ENTRY" and self.tracker is not None:
+                    await self.tracker.forget(signal.signal_id)
                 raise
             logger.warning("signal recorded but not published (Redis unavailable)")
         if durable and signal.type == "ENTRY" and runtime is not None:
             runtime.wake_admission()
         if signal.type == "ENTRY" and self.tracker is not None:
-            try:
-                await self.tracker.watch(signal, self._network)
-            except Exception:  # noqa: BLE001 - the emit already succeeded
-                logger.exception("ENTRY %s is not followed", signal.signal_id)
-            else:
-                if self._virtual_feedback:
-                    await self.position_feedback(
-                        PositionEvent(
-                            event_id=f"virtual-entry:{signal.signal_id}",
-                            symbol=signal.symbol,
-                            position_id=signal.signal_id,
-                            at=signal.emitted_at,
-                        ),
-                        False,
-                    )
+            await self._virtual_opened(signal)
+
+    async def _virtual_opened(self, signal: Signal) -> None:
+        """The strategy hears of a followed ENTRY as an open position."""
+        assert self.tracker is not None
+        if self._virtual_feedback and await self.tracker.is_open(signal.signal_id):
+            await self.position_feedback(
+                PositionEvent(
+                    event_id=f"virtual-entry:{signal.signal_id}",
+                    symbol=signal.symbol,
+                    position_id=signal.signal_id,
+                    at=signal.emitted_at,
+                ),
+                False,
+            )
+
+    async def virtual_opened(self, watch: SignalWatch) -> None:
+        """The tracker repaired a missing watch: an open position too."""
+        if self._virtual_feedback and watch.network == self._network:
+            await self.position_feedback(
+                PositionEvent(
+                    event_id=f"virtual-entry:{watch.signal_id}",
+                    symbol=watch.symbol,
+                    position_id=watch.signal_id,
+                    at=watch.emitted_at,
+                ),
+                False,
+            )
 
     async def publish_exit(self, signal: Signal) -> None:
         """Publish an EXIT of the signal tracker; raises if Redis does not take it.

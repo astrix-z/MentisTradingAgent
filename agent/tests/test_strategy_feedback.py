@@ -385,6 +385,7 @@ def test_a_signal_only_run_hears_of_its_virtual_positions(
         crossed = datetime.now(UTC).replace(second=0, microsecond=0)
         tracker = Mock(
             watch=AsyncMock(),
+            is_open=AsyncMock(return_value=True),
             snapshot=AsyncMock(
                 return_value=(
                     frozenset({"ETHUSDT"}),

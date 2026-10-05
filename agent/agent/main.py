@@ -398,6 +398,7 @@ async def run() -> None:
     )
     engine.tracker = tracker
     tracker.on_closed = engine.virtual_closed
+    tracker.on_opened = engine.virtual_opened
 
     try:
         async with asyncio.TaskGroup() as tg:

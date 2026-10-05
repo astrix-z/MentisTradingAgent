@@ -7,6 +7,7 @@ Pure crossing rules first, then the tracker on a throwaway PostgreSQL database
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -337,5 +338,179 @@ def test_a_crossing_is_reported_at_once_and_restored_by_the_snapshot() -> None:
         assert open_symbols == frozenset({"BBBUSDT"})
         assert [(w.symbol, w.exited_at) for w in exits] == [("AAAUSDT", start)]
         assert (await tracker.snapshot("live", start + timedelta(minutes=1)))[1] == []
+
+    run(scenario)
+
+
+# --- the watch is as durable as the ENTRY (review 2026-10-05 REPEAT, R2) -------------------
+
+
+def _engine(state: World, *, durable: bool) -> tuple[Any, Any, Any]:
+    from unittest.mock import AsyncMock, Mock
+
+    from agent.engine import Engine
+    from agent.execution.runtime import ExecutionContext, ExecutionRuntime
+
+    redis = Mock(publish=AsyncMock(), set=AsyncMock())
+    engine = Engine(redis)
+    engine._network = "testnet"
+    engine._strategy_name = "tripple_screen"
+    engine._state = "running"
+    strategy = Mock(on_position_opened=AsyncMock(), on_position_closed=AsyncMock())
+    engine._strategy = strategy
+    engine._virtual_feedback = True
+    if durable:
+        runtime = ExecutionRuntime(db=state.db, db_url=None, schema_ready=True)
+        runtime.context = ExecutionContext("1001", "testnet")
+        runtime.schema_ready = True  # set by boot after the migration check
+        engine.execution = runtime
+    tracker = state.tracker()
+    engine.tracker = tracker
+    tracker.on_opened = engine.virtual_opened
+    return engine, redis, strategy
+
+
+async def _inbox(state: World) -> list[tuple[str, str]]:
+    from sqlalchemy import select
+
+    from agent.execution.models import SignalInbox
+
+    async with async_sessionmaker(state.db)() as session:
+        rows = (
+            await session.execute(select(SignalInbox.symbol, SignalInbox.type))
+        ).all()
+    return [(symbol, kind) for symbol, kind in rows]
+
+
+async def _watched(state: World) -> list[str]:
+    async with async_sessionmaker(state.db)() as session:
+        return list(
+            (
+                await session.scalars(
+                    SignalWatch.__table__.select().with_only_columns(SignalWatch.symbol)
+                )
+            ).all()
+        )
+
+
+def test_a_failed_watch_fails_the_emit_and_the_retry_completes_it() -> None:
+    async def scenario(state: World) -> None:
+        from sqlalchemy.exc import OperationalError
+
+        engine, redis, strategy = _engine(state, durable=True)
+        real = engine.tracker.watch_in
+
+        async def broken(*args: Any, **kwargs: Any) -> None:
+            raise OperationalError("insert", {}, Exception("connection lost"))
+
+        engine.tracker.watch_in = broken
+        signal = entry()
+        try:
+            await engine._on_signal(signal)
+        except OperationalError:
+            pass
+        else:
+            raise AssertionError("the emit should fail with its watch")
+        # Nothing half done: no inbox record, nothing published, nothing held.
+        assert await _inbox(state) == []
+        redis.publish.assert_not_awaited()
+        strategy.on_position_opened.assert_not_awaited()
+        engine.tracker.watch_in = real
+        await engine._on_signal(signal)  # the strategy retries the epoch
+        assert await _inbox(state) == [("SENTUSDT", "ENTRY")]
+        assert await _watched(state) == ["SENTUSDT"]
+        assert redis.publish.await_count == 1
+        strategy.on_position_opened.assert_awaited_once()
+
+    run(scenario)
+
+
+def test_a_replay_completes_an_entry_recorded_without_its_watch() -> None:
+    # An inbox record from before this change (or any path that missed the
+    # watch): the replay of its epoch must not stop at the dedup.
+    async def scenario(state: World) -> None:
+        from agent.execution.admission import record_signal
+        from agent.execution.runtime import ExecutionContext
+
+        engine, redis, strategy = _engine(state, durable=True)
+        signal = entry().identified(
+            account_uid="1001", network="testnet", strategy="tripple_screen"
+        )
+        async with engine.execution.session() as session:
+            await record_signal(
+                session,
+                signal,
+                context=ExecutionContext("1001", "testnet"),
+                strategy="tripple_screen",
+            )
+        assert await _watched(state) == []
+        await engine._on_signal(signal)
+        assert await _watched(state) == ["SENTUSDT"]
+        redis.publish.assert_not_awaited()  # not re-emitted
+        strategy.on_position_opened.assert_awaited_once()
+
+    run(scenario)
+
+
+def test_the_tracker_repairs_unwatched_inbox_entries() -> None:
+    async def scenario(state: World) -> None:
+        from agent.execution.admission import record_signal
+        from agent.execution.runtime import ExecutionContext
+
+        engine, _redis, strategy = _engine(state, durable=True)
+        signal = entry().identified(
+            account_uid="1001", network="testnet", strategy="tripple_screen"
+        )
+        async with engine.execution.session() as session:
+            await record_signal(
+                session,
+                signal,
+                context=ExecutionContext("1001", "testnet"),
+                strategy="tripple_screen",
+            )
+        state.now = T0 + timedelta(minutes=5)
+        await engine.tracker.check()
+        assert await _watched(state) == ["SENTUSDT"]
+        strategy.on_position_opened.assert_awaited_once()
+        await engine.tracker.check()  # once
+        strategy.on_position_opened.assert_awaited_once()
+
+    run(scenario)
+
+
+def test_without_an_inbox_a_failed_publish_drops_the_watch() -> None:
+    async def scenario(state: World) -> None:
+        engine, redis, strategy = _engine(state, durable=False)
+        redis.publish.side_effect = RedisError("down")
+        try:
+            await engine._on_signal(entry())
+        except RedisError:
+            pass
+        else:
+            raise AssertionError("a failed publish fails the emit without an inbox")
+        assert await _watched(state) == []
+        strategy.on_position_opened.assert_not_awaited()
+        redis.publish.side_effect = None
+        await engine._on_signal(entry())
+        assert await _watched(state) == ["SENTUSDT"]
+        strategy.on_position_opened.assert_awaited_once()
+
+    run(scenario)
+
+
+def test_a_tracker_exit_never_reaches_the_execution_inbox() -> None:
+    async def scenario(state: World) -> None:
+        engine, redis, _strategy = _engine(state, durable=True)
+        engine.tracker._publish = engine.publish_exit
+        await engine._on_signal(entry())
+        start = T0.replace(second=0) + timedelta(minutes=1)
+        state.market.bars["SENTUSDT"] = [
+            bar(start, "0.0219", "0.0220", "0.0215", "0.0216")
+        ]
+        state.now = start + timedelta(minutes=2)
+        assert await engine.tracker.check() == 1
+        assert await _inbox(state) == [("SENTUSDT", "ENTRY")]
+        kinds = [json.loads(c.args[1])["type"] for c in redis.publish.await_args_list]
+        assert kinds == ["ENTRY", "EXIT"]
 
     run(scenario)

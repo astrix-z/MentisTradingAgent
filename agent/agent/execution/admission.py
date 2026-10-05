@@ -103,9 +103,18 @@ def admission_lock_key(context: ExecutionContext) -> int:
 
 
 async def record_signal(
-    session: AsyncSession, signal: Signal, *, context: ExecutionContext, strategy: str
+    session: AsyncSession,
+    signal: Signal,
+    *,
+    context: ExecutionContext,
+    strategy: str,
+    with_it: Callable[[AsyncSession], Awaitable[None]] | None = None,
 ) -> bool:
-    """Commit ``signal`` to the inbox; ``False`` if this ENTRY was already there."""
+    """Commit ``signal`` to the inbox; ``False`` if this ENTRY was already there.
+
+    ``with_it`` writes in the same transaction, only when the signal is new:
+    what must exist exactly when the signal does (the tracker's watch).
+    """
     payload = signal.transport()
     inserted = await session.execute(
         insert(SignalInbox)
@@ -127,8 +136,11 @@ async def record_signal(
         .on_conflict_do_nothing()
         .returning(SignalInbox.signal_id)
     )
+    recorded = inserted.scalar_one_or_none() is not None
+    if recorded and with_it is not None:
+        await with_it(session)
     await session.commit()
-    return inserted.scalar_one_or_none() is not None
+    return recorded
 
 
 # --- intent outcomes ----------------------------------------------------------------
