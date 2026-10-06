@@ -201,21 +201,21 @@ mentis-redis-1 redis:7-alpine
 
 
 ```
- Container mentis-backend-1 Recreate 
- Container mentis-agent-1 Recreated 
- Container mentis-backend-1 Recreated 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-db-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-backend-1 Starting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-backend-1 Started 
- Container mentis-agent-1 Started 
+ Container mentis-backend-1 Recreate
+ Container mentis-agent-1 Recreated
+ Container mentis-backend-1 Recreated
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-db-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-backend-1 Starting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-backend-1 Started
+ Container mentis-agent-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -277,8 +277,8 @@ mentis-redis-1 redis:7-alpine
 
 #37 [backend] resolving provenance for metadata file
 #37 DONE 0.0s
- Image mentis-agent:8e0a24c Built 
- Image mentis-backend:8e0a24c Built 
+ Image mentis-agent:8e0a24c Built
+ Image mentis-backend:8e0a24c Built
 ==> Установка 8e0a24c в /home/jb/apps/mentis-trading-agent
 ==> (1) флаг trading:start_fence
 compose-fault: flag
@@ -298,18 +298,18 @@ mentis-redis-1 redis:7-alpine
 
 ```
 ==> (2) остановка агента
- Container mentis-agent-1 Stopping 
- Container mentis-agent-1 Stopped 
+ Container mentis-agent-1 Stopping
+ Container mentis-agent-1 Stopped
 ==> (3) удаление agent:strategies
 compose-fault: catalog-del
 !!! 2026-10-05T17:32:42+00:00 сбой в фазе stopped (код 1)
 ==> trap: поднимаю прежнего агента (контейнер и образ не тронуты)
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-agent-1 Started 
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-agent-1 Started
     Образы сейчас:
     backend: mentis-backend:latest sha256:65b88b13b7dd03ff433ad0057af4c8477f4af453ad64caa563e43ca3cc681035 running
     agent: mentis-agent:latest sha256:71ff14ab48a842c32677920f3dd05a97790800ded812a5b191a03523a99f8a3e running
@@ -328,16 +328,16 @@ mentis-redis-1 redis:7-alpine
 
 
 ```
- Container mentis-db-1 Running 
- Container mentis-redis-1 Running 
- Container mentis-agent-1 Recreate 
- Container mentis-agent-1 Recreated 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-agent-1 Started 
+ Container mentis-db-1 Running
+ Container mentis-redis-1 Running
+ Container mentis-agent-1 Recreate
+ Container mentis-agent-1 Recreated
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-agent-1 Started
 ==> trap: mentis-backend:latest = образ работающего backend
     Backend мог быть пересоздан и применить миграции: при «новый backend +
     прежний агент» флаг снимается только повторным deploy.sh или решением человека.
@@ -360,15 +360,15 @@ mentis-redis-1 redis:7-alpine
 - `deploy.sh` ждал 139 с
 
 ```
- Container mentis-db-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-agent-1 Started 
+ Container mentis-db-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-agent-1 Started
 compose-fault: catalog-timeout
 ==> (5) ожидание каталога агента цели (до 120 с)
 ОШИБКА: агент цели не опубликовал agent:strategies за 120 с
@@ -391,19 +391,19 @@ mentis-redis-1 redis:7-alpine
 
 
 ```
- Container mentis-redis-1 Running 
- Container mentis-db-1 Running 
- Container mentis-backend-1 Running 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-agent-1 Started 
+ Container mentis-redis-1 Running
+ Container mentis-db-1 Running
+ Container mentis-backend-1 Running
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-agent-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -424,8 +424,8 @@ mentis-redis-1 redis:7-alpine
 
 ```
 ==> (2) остановка агента
- Container mentis-agent-1 Stopping 
- Container mentis-agent-1 Stopped 
+ Container mentis-agent-1 Stopping
+ Container mentis-agent-1 Stopped
 ==> (3) удаление agent:strategies
 ==> (4) :latest → :8e0a24c и up
 compose-fault: slow-up
@@ -438,8 +438,8 @@ compose-fault: slow-up
 ==> Установка 8e0a24c в /home/jb/apps/mentis-trading-agent
 ==> (1) флаг trading:start_fence
 ==> (2) остановка агента
- Container mentis-agent-1 Stopping 
- Container mentis-agent-1 Stopped 
+ Container mentis-agent-1 Stopping
+ Container mentis-agent-1 Stopped
 ==> (3) удаление agent:strategies
 ==> (4) :latest → :8e0a24c и up
 compose-fault: slow-up
@@ -463,8 +463,8 @@ mentis-redis-1 redis:7-alpine
 ==> Установка 7b0118a в /home/jb/apps/mentis-trading-agent
 ==> (1) флаг trading:start_fence
 ==> (2) остановка агента
- Container mentis-agent-1 Stopping 
- Container mentis-agent-1 Stopped 
+ Container mentis-agent-1 Stopping
+ Container mentis-agent-1 Stopped
 ==> (3) удаление agent:strategies
 ==> (4) :latest → :7b0118a и up
 compose-fault: slow-up
@@ -476,21 +476,21 @@ compose-fault: slow-up
 - ExecStart юнита: `ExecStart={ path=/usr/bin/bash ; argv[]=/usr/bin/bash /home/jb/apps/releases/deploy-fence-1791221858-856641-795faded.sh 8e0a24c 1791221858-856641-795faded ; ign`
 
 ```
- Container mentis-backend-1 Recreate 
- Container mentis-agent-1 Recreated 
- Container mentis-backend-1 Recreated 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-backend-1 Starting 
- Container mentis-agent-1 Started 
- Container mentis-backend-1 Started 
+ Container mentis-backend-1 Recreate
+ Container mentis-agent-1 Recreated
+ Container mentis-backend-1 Recreated
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-backend-1 Starting
+ Container mentis-agent-1 Started
+ Container mentis-backend-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -507,21 +507,21 @@ compose-fault: slow-up
 
 
 ```
- Container mentis-backend-1 Recreate 
- Container mentis-agent-1 Recreated 
- Container mentis-backend-1 Recreated 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-db-1 Healthy 
- Container mentis-backend-1 Starting 
- Container mentis-backend-1 Started 
- Container mentis-agent-1 Started 
+ Container mentis-backend-1 Recreate
+ Container mentis-agent-1 Recreated
+ Container mentis-backend-1 Recreated
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-db-1 Healthy
+ Container mentis-backend-1 Starting
+ Container mentis-backend-1 Started
+ Container mentis-agent-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -539,21 +539,21 @@ compose-fault: slow-up
 - маркер: `скрипт ограды 4f9aeddfb56d`, хеш первого `4f9aeddfb56d`
 
 ```
- Container mentis-backend-1 Recreate 
- Container mentis-agent-1 Recreated 
- Container mentis-backend-1 Recreated 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-backend-1 Starting 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-agent-1 Started 
- Container mentis-backend-1 Started 
+ Container mentis-backend-1 Recreate
+ Container mentis-agent-1 Recreated
+ Container mentis-backend-1 Recreated
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-backend-1 Starting
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-agent-1 Started
+ Container mentis-backend-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -659,19 +659,19 @@ mentis-redis-1 redis:7-alpine
 ```
 ==> (4) :latest → :7b0118a и up
 compose-fault: slow-up
- Container mentis-redis-1 Running 
- Container mentis-db-1 Running 
- Container mentis-backend-1 Running 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-db-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-agent-1 Started 
+ Container mentis-redis-1 Running
+ Container mentis-db-1 Running
+ Container mentis-backend-1 Running
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-db-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-agent-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -710,19 +710,19 @@ compose-fault: slow-up
 ```
 ==> (3) удаление agent:strategies
 ==> (4) :latest → :7b0118a и up
- Container mentis-redis-1 Running 
- Container mentis-db-1 Running 
- Container mentis-backend-1 Running 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-agent-1 Started 
+ Container mentis-redis-1 Running
+ Container mentis-db-1 Running
+ Container mentis-backend-1 Running
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-agent-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -807,21 +807,21 @@ mentis-redis-1 redis:7-alpine
 - EVAL с ключом флага за время двух Start: 0
 
 ```
- Container mentis-backend-1 Recreate 
- Container mentis-agent-1 Recreated 
- Container mentis-backend-1 Recreated 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-backend-1 Starting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-backend-1 Started 
- Container mentis-agent-1 Started 
+ Container mentis-backend-1 Recreate
+ Container mentis-agent-1 Recreated
+ Container mentis-backend-1 Recreated
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-backend-1 Starting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-backend-1 Started
+ Container mentis-agent-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -843,21 +843,21 @@ mentis-redis-1 redis:7-alpine
 - попытка `1791222358-901189-25119ac5` ждала перед systemd-run, пока шла выкладка `8e0a24c`
 
 ```
- Container mentis-agent-1 Recreate 
- Container mentis-agent-1 Recreated 
- Container mentis-backend-1 Recreated 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-redis-1 Healthy 
- Container mentis-backend-1 Starting 
- Container mentis-agent-1 Started 
- Container mentis-backend-1 Started 
+ Container mentis-agent-1 Recreate
+ Container mentis-agent-1 Recreated
+ Container mentis-backend-1 Recreated
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-redis-1 Healthy
+ Container mentis-backend-1 Starting
+ Container mentis-agent-1 Started
+ Container mentis-backend-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -876,21 +876,21 @@ mentis-redis-1 redis:7-alpine
 - логов попыток этих ревизий всего: 11
 
 ```
- Container mentis-backend-1 Recreate 
- Container mentis-agent-1 Recreated 
- Container mentis-backend-1 Recreated 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-backend-1 Starting 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-backend-1 Started 
- Container mentis-agent-1 Started 
+ Container mentis-backend-1 Recreate
+ Container mentis-agent-1 Recreated
+ Container mentis-backend-1 Recreated
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-backend-1 Starting
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-backend-1 Started
+ Container mentis-agent-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -909,19 +909,19 @@ mentis-redis-1 redis:7-alpine
 - логов попыток этих ревизий всего: 18
 
 ```
- Container mentis-backend-1 Recreated 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-redis-1 Healthy 
- Container mentis-backend-1 Starting 
- Container mentis-agent-1 Started 
- Container mentis-backend-1 Started 
+ Container mentis-backend-1 Recreated
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-redis-1 Healthy
+ Container mentis-backend-1 Starting
+ Container mentis-agent-1 Started
+ Container mentis-backend-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8
 ==> Healthcheck backend (до 120 с)
@@ -952,19 +952,19 @@ mentis-redis-1 redis:7-alpine
 
 
 ```
- Container mentis-agent-1 Recreated 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Waiting 
- Container mentis-redis-1 Waiting 
- Container mentis-db-1 Healthy 
- Container mentis-redis-1 Healthy 
- Container mentis-db-1 Healthy 
- Container mentis-agent-1 Starting 
- Container mentis-redis-1 Healthy 
- Container mentis-backend-1 Starting 
- Container mentis-agent-1 Started 
- Container mentis-backend-1 Started 
+ Container mentis-agent-1 Recreated
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Waiting
+ Container mentis-redis-1 Waiting
+ Container mentis-db-1 Healthy
+ Container mentis-redis-1 Healthy
+ Container mentis-db-1 Healthy
+ Container mentis-agent-1 Starting
+ Container mentis-redis-1 Healthy
+ Container mentis-backend-1 Starting
+ Container mentis-agent-1 Started
+ Container mentis-backend-1 Started
 ==> (5) ожидание каталога агента цели (до 120 с)
     schema_hash: 1f6a4457d33cfc28b2157c13183147a9882086f2a0620c241435f100dbe497e4
 ==> Healthcheck backend (до 120 с)

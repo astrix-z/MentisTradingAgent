@@ -113,7 +113,7 @@ class Stand:
         self.ssh.write_text(
             "#!/bin/sh\nexec ssh -o BatchMode=yes -o StrictHostKeyChecking=no "
             "-o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 "
-            f"-i {self.key} -p {SSH_PORT} jb@127.0.0.1 \"$@\"\n"
+            f'-i {self.key} -p {SSH_PORT} jb@127.0.0.1 "$@"\n'
         )
         self.ssh.chmod(0o755)
         # The same, but a command that launches the unit waits while its gate
@@ -121,36 +121,56 @@ class Stand:
         self.gated = self.work / "ssh-gated.sh"
         self.gated.write_text(
             "#!/bin/sh\n"
-            "case \"$*\" in *systemd-run*)\n"
-            "  if [ -n \"$STAND_GATE\" ] && [ -e \"$STAND_GATE\" ]; then\n"
-            "    touch \"$STAND_GATE.waiting\"\n"
-            "    while [ -e \"$STAND_GATE\" ]; do sleep 0.1; done\n"
+            'case "$*" in *systemd-run*)\n'
+            '  if [ -n "$STAND_GATE" ] && [ -e "$STAND_GATE" ]; then\n'
+            '    touch "$STAND_GATE.waiting"\n'
+            '    while [ -e "$STAND_GATE" ]; do sleep 0.1; done\n'
             "  fi ;;\n"
             "esac\n"
-            f"exec {self.ssh} \"$@\"\n"
+            f'exec {self.ssh} "$@"\n'
         )
         self.gated.chmod(0o755)
         log("building the stand image")
         run(
             [
-                "docker", "build", "-q", "-t", IMAGE,
-                "--build-arg", f"SSH_KEY={(self.key.with_suffix('.pub')).read_text().strip()}",
+                "docker",
+                "build",
+                "-q",
+                "-t",
+                IMAGE,
+                "--build-arg",
+                f"SSH_KEY={(self.key.with_suffix('.pub')).read_text().strip()}",
                 str(STAND_DIR),
             ],
             timeout=1800,
         )
         run(
             [
-                "docker", "run", "-d", "--name", NAME, "--hostname", "stand",
-                "--privileged", "--cgroupns=private",
-                "-v", f"{NAME}-docker:/var/lib/docker",
-                "-v", f"{NAME}-containerd:/var/lib/containerd",
-                "-p", f"127.0.0.1:{SSH_PORT}:22", "-p", f"127.0.0.1:{WEB_PORT}:8010",
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                NAME,
+                "--hostname",
+                "stand",
+                "--privileged",
+                "--cgroupns=private",
+                "-v",
+                f"{NAME}-docker:/var/lib/docker",
+                "-v",
+                f"{NAME}-containerd:/var/lib/containerd",
+                "-p",
+                f"127.0.0.1:{SSH_PORT}:22",
+                "-p",
+                f"127.0.0.1:{WEB_PORT}:8010",
                 IMAGE,
             ]
         )
         for _ in range(60):
-            if run([str(self.ssh), "docker info -f ok"], check=False).stdout.strip() == "ok":
+            if (
+                run([str(self.ssh), "docker info -f ok"], check=False).stdout.strip()
+                == "ok"
+            ):
                 break
             time.sleep(2)
         else:
@@ -159,15 +179,30 @@ class Stand:
         assert path.endswith("/home/jb/bin/systemd-run"), path
         self.sh("mkdir -p ~/stand-hooks ~/stand-state && chmod 777 ~/stand-state")
         for name in ("sitecustomize.py", "stand-hooks.yml"):
-            self.sh(f"cat > ~/stand-hooks/{name}", input=(STAND_DIR / "hooks" / name).read_text())
+            self.sh(
+                f"cat > ~/stand-hooks/{name}",
+                input=(STAND_DIR / "hooks" / name).read_text(),
+            )
 
     def remove(self) -> None:
         run(["docker", "rm", "-f", NAME], check=False)
-        run(["docker", "volume", "rm", f"{NAME}-docker", f"{NAME}-containerd"], check=False)
+        run(
+            ["docker", "volume", "rm", f"{NAME}-docker", f"{NAME}-containerd"],
+            check=False,
+        )
         run(["docker", "rmi", IMAGE], check=False)
 
-    def sh(self, command: str, *, check: bool = True, timeout: float = 600, input: str | None = None) -> str:
-        result = run([str(self.ssh), command], check=check, timeout=timeout, input=input)
+    def sh(
+        self,
+        command: str,
+        *,
+        check: bool = True,
+        timeout: float = 600,
+        input: str | None = None,
+    ) -> str:
+        result = run(
+            [str(self.ssh), command], check=check, timeout=timeout, input=input
+        )
         return result.stdout.strip()
 
     def root(self, command: str) -> str:
@@ -184,20 +219,27 @@ class Stand:
             self.sh(f"echo {name} > ~/faults/active")
 
     def fence(self) -> str:
-        out = self.compose("exec -T redis redis-cli GET trading:start_fence", check=False)
+        out = self.compose(
+            "exec -T redis redis-cli GET trading:start_fence", check=False
+        )
         return out or "—"
 
     def container(self, service: str) -> str:
-        cid = self.sh(f"cd {APP} && {COMPOSE} ps -aq {service} | head -n 1", check=False)
+        cid = self.sh(
+            f"cd {APP} && {COMPOSE} ps -aq {service} | head -n 1", check=False
+        )
         if not cid:
             return "нет контейнера"
         state = self.sh(f"docker inspect -f '{{{{.State.Status}}}}' {cid}", check=False)
         image = self.sh(f"docker inspect -f '{{{{.Image}}}}' {cid}", check=False)
         tags = self.sh(
-            f"docker image inspect -f '{{{{join .RepoTags \",\"}}}}' {image}", check=False
+            f"docker image inspect -f '{{{{join .RepoTags \",\"}}}}' {image}",
+            check=False,
         )
         revs = sorted(
-            t.split(":", 1)[1] for t in tags.split(",") if ":" in t and not t.endswith(":latest")
+            t.split(":", 1)[1]
+            for t in tags.split(",")
+            if ":" in t and not t.endswith(":latest")
         )
         return f"{'/'.join(revs) or image[7:19]} {state}"
 
@@ -311,7 +353,10 @@ def api(method: str, path: str, body: Any = None) -> tuple[int, Any]:
         base + path,
         data=data,
         method=method,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
@@ -345,37 +390,91 @@ class Row:
 #: The acceptance items of the PRESET-09a card ("Приёмка (локальный стек)")
 #: and the scenarios that answer them.
 COVERAGE: list[tuple[str, list[str]]] = [
-    ("Во время deploy Start по обоим маршрутам → 503 за один EVAL (код -1, без цикла); Stop при флаге принимается и пишет снапшот", ["27", "33"]),
-    ("Start, прошедший проверку до флага и приостановленный перед записью, после флага → 503, в потоке и в desired его нет", ["33"]),
-    ("Каталог не опубликован за 2 мин → скрипт падает, флаг остаётся, агент цели работает", ["11"]),
+    (
+        "Во время deploy Start по обоим маршрутам → 503 за один EVAL (код -1, без цикла); Stop при флаге принимается и пишет снапшот",
+        ["27", "33"],
+    ),
+    (
+        "Start, прошедший проверку до флага и приостановленный перед записью, после флага → 503, в потоке и в desired его нет",
+        ["33"],
+    ),
+    (
+        "Каталог не опубликован за 2 мин → скрипт падает, флаг остаётся, агент цели работает",
+        ["11"],
+    ),
     ("Сбой сборки → ни флага, ни остановки агента", ["7"]),
-    ("Сбой между остановкой агента и up → прежний агент поднят trap, его каталог опубликован, флаг стоит", ["9"]),
-    ("После отката чистым артефактом нет чужих файлов миграций; alembic current = цель", ["29"]),
+    (
+        "Сбой между остановкой агента и up → прежний агент поднят trap, его каталог опубликован, флаг стоит",
+        ["9"],
+    ),
+    (
+        "После отката чистым артефактом нет чужих файлов миграций; alembic current = цель",
+        ["29"],
+    ),
     ("После выкладки есть образы :<revision> и releases/current", ["5", "6", "12"]),
     ("Цель без образов и без tracked uv.lock → отказ", ["21"]),
-    ("T0: без --t0-revision → отказ; не совпадает с последним дампом → отказ", ["1", "2"]),
+    (
+        "T0: без --t0-revision → отказ; не совпадает с последним дампом → отказ",
+        ["1", "2"],
+    ),
     ("T0: контейнер создан раньше дампа → отказ, --t0-confirm снимает", ["3", "4"]),
-    ("T0: корректная выкладка с образом из кеша проходит сверку; образы помечены :<T0>", ["4", "5"]),
+    (
+        "T0: корректная выкладка с образом из кеша проходит сверку; образы помечены :<T0>",
+        ["4", "5"],
+    ),
     ("Откат на T0 на этих образах без сборки, строка T0 таблицы §7.1", ["29"]),
     ("После 11 выкладок образы T0 на месте, откат без сборки", ["6", "29"]),
-    ("Сбой внутри up → агент из releases/current, флаг стоит, напечатаны образы обоих сервисов", ["10"]),
+    (
+        "Сбой внутри up → агент из releases/current, флаг стоит, напечатаны образы обоих сервисов",
+        ["10"],
+    ),
     ("Сбой после сборки до флага → :latest указывает на работающую ревизию", ["8"]),
-    ("Барьер: Start в потоке, агент остановлен до обработки → Stop → барьер держит, пока Start не обработан", ["28"]),
+    (
+        "Барьер: Start в потоке, агент остановлен до обработки → Stop → барьер держит, пока Start не обработан",
+        ["28"],
+    ),
     ("Барьер: перезапуск агента на границе обработки — барьер держит", ["34"]),
-    ("Барьер: конкурентный Start между наблюдением барьера и остановкой backend → 503", ["35"]),
+    (
+        "Барьер: конкурентный Start между наблюдением барьера и остановкой backend → 503",
+        ["35"],
+    ),
     ("Linger выключен у пользователя SSH → отказ до шага (1)", ["19"]),
-    ("Цель без сервиса agent / образ не mentis-agent:latest / старше 608cfa1 → отказ до шага (1)", ["21b", "21c", "20"]),
-    ("Неудачный запуск X (таймаут шага (5)), затем повторный X → новая попытка, старый .exit не прочитан, флаг снимает новый успех", ["11", "12"]),
-    ("Два одновременных deploy.sh одной ревизии; то же при старом .exit (R97)", ["15", "16"]),
+    (
+        "Цель без сервиса agent / образ не mentis-agent:latest / старше 608cfa1 → отказ до шага (1)",
+        ["21b", "21c", "20"],
+    ),
+    (
+        "Неудачный запуск X (таймаут шага (5)), затем повторный X → новая попытка, старый .exit не прочитан, флаг снимает новый успех",
+        ["11", "12"],
+    ),
+    (
+        "Два одновременных deploy.sh одной ревизии; то же при старом .exit (R97)",
+        ["15", "16"],
+    ),
     ("Второй deploy.sh с изменённым скриптом ограды при живом юните (R98)", ["17"]),
-    ("systemd-run отказал, юнита нет (R106); юнит выгружен между S0 и S1; после фиксации ATTEMPT — «без кода»", ["25", "25b", "13"]),
+    (
+        "systemd-run отказал, юнита нет (R106); юнит выгружен между S0 и S1; после фиксации ATTEMPT — «без кода»",
+        ["25", "25b", "13"],
+    ),
     ("Загруженный юнит без DEPLOY_ATTEMPT или с неверным форматом (R109)", ["24"]),
-    ("Подготовленная, но не запущенная попытка переживает чужую выкладку и запускается штатно (R108)", ["30"]),
-    ("Недоступная шина: повтор чтения, та же попытка; после 30 с — «состояние неизвестно»", ["22", "23"]),
+    (
+        "Подготовленная, но не запущенная попытка переживает чужую выкладку и запускается штатно (R108)",
+        ["30"],
+    ),
+    (
+        "Недоступная шина: повтор чтения, та же попытка; после 30 с — «состояние неизвестно»",
+        ["22", "23"],
+    ),
     ("systemd-run вернул ошибку, а юнит работает со своей попыткой (R102)", ["26"]),
-    ("Одновременные подготовки одной и двух ревизий: состояние меняет один юнит, compose.yml и образы не меняются, флаг снимает он (R103)", ["31", "32", "18"]),
+    (
+        "Одновременные подготовки одной и двух ревизий: состояние меняет один юнит, compose.yml и образы не меняются, флаг снимает он (R103)",
+        ["31", "32", "18"],
+    ),
     ("Юнит убит до записи .exit → «без кода», не ждёт таймаута, флаг стоит", ["13"]),
-    ("Обрыв SSH сразу после остановки агента → скрипт на сервере доходит до конца, лог и код в releases/", ["14"]),
+    (
+        "Обрыв SSH сразу после остановки агента → скрипт на сервере доходит до конца, лог и код в releases/",
+        ["14"],
+    ),
 ]
 
 
@@ -415,24 +514,30 @@ class Journal:
         lines = [
             "# PRESET-09a: приёмка выкладки на реальном стеке",
             "",
-            f"Прогон {started:%Y-%m-%d %H:%M} – {datetime.now(UTC):%H:%M} UTC, "
-            f"скрипты выкладки из `{head}`. Стенд — контейнер с systemd (PID 1), sshd и "
-            "своим Docker (`tests/deploy/stand/`); `deploy.sh` ходит в него по SSH "
-            "(`DEPLOY_SSH`), скрипт ограды работает в юните `mentis-deploy` пользователя "
-            "с linger. Отказы вносит сам стенд: `~/bin/compose-fault` (это "
-            "`DEPLOY_COMPOSE` юнита), `~/bin/systemd-run`, chmod шины пользователя, "
-            "`loginctl disable-linger`, `systemctl --user kill`, kill локального "
-            "`deploy.sh`. Воспроизвести: `python3 tests/deploy/stand/run-matrix.py "
-            "--out <файл>`.",
+            (
+                f"Прогон {started:%Y-%m-%d %H:%M} – {datetime.now(UTC):%H:%M} UTC, "
+                f"скрипты выкладки из `{head}`. Стенд — контейнер с systemd (PID 1), sshd и "
+                "своим Docker (`tests/deploy/stand/`); `deploy.sh` ходит в него по SSH "
+                "(`DEPLOY_SSH`), скрипт ограды работает в юните `mentis-deploy` пользователя "
+                "с linger. Отказы вносит сам стенд: `~/bin/compose-fault` (это "
+                "`DEPLOY_COMPOSE` юнита), `~/bin/systemd-run`, chmod шины пользователя, "
+                "`loginctl disable-linger`, `systemctl --user kill`, kill локального "
+                "`deploy.sh`. Воспроизвести: `python3 tests/deploy/stand/run-matrix.py "
+                "--out <файл>`."
+            ),
             "",
             f"Итог: **{passed} из {len(self.rows)}** сценариев дали ожидаемый исход.",
             "",
-            "Состояние снято сразу после сценария: флаг `trading:start_fence`, образы "
-            "(ревизии по тегам) и состояние контейнеров backend и agent, "
-            "`releases/current`.",
+            (
+                "Состояние снято сразу после сценария: флаг `trading:start_fence`, образы "
+                "(ревизии по тегам) и состояние контейнеров backend и agent, "
+                "`releases/current`."
+            ),
             "",
-            "| # | Сценарий | Ожидаемо | Ревизия | Код `deploy.sh` | Флаг | backend | agent "
-            "| current | Итог |",
+            (
+                "| # | Сценарий | Ожидаемо | Ревизия | Код `deploy.sh` | Флаг | backend | agent "
+                "| current | Итог |"
+            ),
             "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for row in self.rows:
@@ -448,15 +553,21 @@ class Journal:
                 f"`{row.state.get('current', '—')}`",
                 "✅" if row.ok else "❌",
             ]
-            lines.append("| " + " | ".join(c.replace("|", "\\|").replace("\n", " ") for c in cells) + " |")
+            lines.append(
+                "| "
+                + " | ".join(c.replace("|", "\\|").replace("\n", " ") for c in cells)
+                + " |"
+            )
         verdict = {row.sid: row.ok for row in self.rows}
         lines += [
             "",
             "## Соответствие приёмке карточки PRESET-09a",
             "",
-            "Каждый пункт раздела «Приёмка (локальный стек)» карточки и сценарии этого "
-            "журнала, которые на него отвечают. Общий gate (ruff, mypy, biome, tsc, "
-            "pytest, Playwright) — вне стенда, его прогон указан в комментарии задачи.",
+            (
+                "Каждый пункт раздела «Приёмка (локальный стек)» карточки и сценарии этого "
+                "журнала, которые на него отвечают. Общий gate (ruff, mypy, biome, tsc, "
+                "pytest, Playwright) — вне стенда, его прогон указан в комментарии задачи."
+            ),
             "",
             "| Пункт приёмки | Сценарии | Итог |",
             "|---|---|---|",
@@ -495,7 +606,9 @@ def old_deploy(stand: Stand, rev: str, services: str = "") -> None:
             f"|| rm -f ~/backups/mentis-trading-agent/pre-deploy-{db}-{rev}-{stamp}.dump",
             check=False,
         )
-    tar = subprocess.Popen(["git", "-C", str(REPO), "archive", rev], stdout=subprocess.PIPE)
+    tar = subprocess.Popen(
+        ["git", "-C", str(REPO), "archive", rev], stdout=subprocess.PIPE
+    )
     subprocess.run([str(stand.ssh), f"tar -x -C {APP}"], stdin=tar.stdout, check=True)
     tar.wait()
     lock = run(["git", "-C", str(REPO), "show", f"{FIRST_LOCK}:uv.lock"]).stdout
@@ -503,7 +616,9 @@ def old_deploy(stand: Stand, rev: str, services: str = "") -> None:
     stand.compose(f"build -q {services}")
     stand.compose(f"up -d --remove-orphans {services}")
     for _ in range(60):
-        if stand.sh("curl -fsS http://127.0.0.1:8010/api/v1/utils/health-check/", check=False):
+        if stand.sh(
+            "curl -fsS http://127.0.0.1:8010/api/v1/utils/health-check/", check=False
+        ):
             return
         time.sleep(3)
     raise RuntimeError(f"old deploy of {rev}: backend unhealthy")
@@ -526,7 +641,10 @@ def setup_production_copy(stand: Stand) -> None:
         for line in env
     ]
     stand.sh(f"mkdir -p {APP} ~/backups/mentis-trading-agent")
-    stand.sh(f"cat > {APP}/.env.prod && chmod 600 {APP}/.env.prod", input="\n".join(lines) + "\n")
+    stand.sh(
+        f"cat > {APP}/.env.prod && chmod 600 {APP}/.env.prod",
+        input="\n".join(lines) + "\n",
+    )
     old_deploy(stand, BEFORE_T0)
     time.sleep(5)
     # On the server the agent's image did not change in 567f4f8: only the
@@ -537,7 +655,11 @@ def setup_production_copy(stand: Stand) -> None:
 def t0_scenarios(stand: Stand, journal: Journal, first: str) -> None:
     result = deploy(stand, "--revision", first)
     journal.add(
-        "1", "Первый запуск без `--t0-revision`", "отказ до шага (1)", first, result,
+        "1",
+        "Первый запуск без `--t0-revision`",
+        "отказ до шага (1)",
+        first,
+        result,
         stand.state(),
         {
             "код 1": result.code == 1,
@@ -548,8 +670,12 @@ def t0_scenarios(stand: Stand, journal: Journal, first: str) -> None:
     )
     result = deploy(stand, "--revision", first, "--t0-revision", BEFORE_T0)
     journal.add(
-        "2", "`--t0-revision` не совпадает с последним дампом", "отказ сверки T0",
-        first, result, stand.state(),
+        "2",
+        "`--t0-revision` не совпадает с последним дампом",
+        "отказ сверки T0",
+        first,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "сверка не пройдена": has(result, "сверка T0 не пройдена"),
@@ -564,8 +690,12 @@ def t0_scenarios(stand: Stand, journal: Journal, first: str) -> None:
     stand.sh(f"docker exec mentis-db-1 pg_dump -Fc -U postgres app > {fake}")
     result = deploy(stand, "--revision", first, "--t0-revision", T0)
     journal.add(
-        "3", "Оба контейнера созданы раньше последнего дампа (выкладка T0 упала на сборке)",
-        "отказ сверки T0", first, result, stand.state(),
+        "3",
+        "Оба контейнера созданы раньше последнего дампа (выкладка T0 упала на сборке)",
+        "отказ сверки T0",
+        first,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "сверка не пройдена": has(result, "сверка T0 не пройдена"),
@@ -575,11 +705,19 @@ def t0_scenarios(stand: Stand, journal: Journal, first: str) -> None:
     stand.fault("build")
     result = deploy(stand, "--revision", first, "--t0-revision", T0, "--t0-confirm")
     pinned = stand.sh(f"cat {RELEASES}/pinned 2>/dev/null", check=False)
-    tags = stand.sh("docker images --format '{{.Repository}}:{{.Tag}}' | grep ':" + T0 + "$' | sort", check=False)
+    tags = stand.sh(
+        "docker images --format '{{.Repository}}:{{.Tag}}' | grep ':"
+        + T0
+        + "$' | sort",
+        check=False,
+    )
     journal.add(
-        "4", "То же с `--t0-confirm` (сборка цели затем падает)",
+        "4",
+        "То же с `--t0-confirm` (сборка цели затем падает)",
         "T0 закреплён решением человека; сбой сборки — ни флага, ни остановки агента",
-        first, result, stand.state(),
+        first,
+        result,
+        stand.state(),
         {
             "T0 в pinned": pinned == T0,
             "оба образа помечены :T0": tags.count(":" + T0) == 2,
@@ -599,8 +737,11 @@ def t0_scenarios(stand: Stand, journal: Journal, first: str) -> None:
     result = deploy(stand, "--revision", first, "--t0-revision", T0)
     pinned = stand.sh(f"cat {RELEASES}/pinned 2>/dev/null", check=False)
     journal.add(
-        "5", "Корректная выкладка T0: агент не пересоздавался (образ из кеша), backend — после дампа",
-        "сверка пройдена, T0 закреплён, выкладка первой ревизии", first, result,
+        "5",
+        "Корректная выкладка T0: агент не пересоздавался (образ из кеша), backend — после дампа",
+        "сверка пройдена, T0 закреплён, выкладка первой ревизии",
+        first,
+        result,
         stand.state(),
         {
             "код 0": result.code == 0,
@@ -617,17 +758,29 @@ def eleven_deploys(stand: Stand, journal: Journal, revisions: list[str]) -> None
         result = deploy(stand, "--revision", rev)
         if result.code != 0:
             journal.add(
-                "6", f"Выкладка {i} из {len(revisions)}", "успех", rev, result, stand.state(),
+                "6",
+                f"Выкладка {i} из {len(revisions)}",
+                "успех",
+                rev,
+                result,
+                stand.state(),
                 {"код 0": False},
             )
             return
-    tags = stand.sh("docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^mentis-' | sort", check=False)
+    tags = stand.sh(
+        "docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^mentis-' | sort",
+        check=False,
+    )
     journal.add(
-        "6", f"{len(revisions) + 1} выкладок подряд (с первой), ротация образов",
+        "6",
+        f"{len(revisions) + 1} выкладок подряд (с первой), ротация образов",
         "образы T0 на месте (pinned), ротация оставляет 10 ревизий журнала",
-        revisions[-1], None, stand.state(),
+        revisions[-1],
+        None,
+        stand.state(),
         {
-            "образы :T0 на месте": f"mentis-agent:{T0}" in tags and f"mentis-backend:{T0}" in tags,
+            "образы :T0 на месте": f"mentis-agent:{T0}" in tags
+            and f"mentis-backend:{T0}" in tags,
             "current = последняя": stand.current() == revisions[-1],
         },
         "ревизии: " + ", ".join(f"`{r}`" for r in revisions),
@@ -650,27 +803,39 @@ def fault_scenarios(stand: Stand, journal: Journal, running: str, target: str) -
     app_before = app_files()
     result = deploy(stand, "--revision", target)
     journal.add(
-        "7", "Сбой сборки цели", "ни флага, ни остановки агента; APP_DIR — работающая ревизия",
-        target, result, stand.state(),
+        "7",
+        "Сбой сборки цели",
+        "ни флага, ни остановки агента; APP_DIR — работающая ревизия",
+        target,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "сообщает: сбой до шага (1)": has(result, "сбой до шага (1)"),
             "флага нет": stand.fence() == "—",
-            "агент прежней ревизии работает": agent_is(running) and stand.container("agent").endswith("running"),
+            "агент прежней ревизии работает": agent_is(running)
+            and stand.container("agent").endswith("running"),
             "APP_DIR не тронут": app_files() == app_before,
         },
     )
     stand.fault("flag")
     result = deploy(stand, "--revision", target)
     latest = stand.sh("docker image inspect -f '{{.Id}}' mentis-agent:latest")
-    running_id = stand.sh(f"docker image inspect -f '{{{{.Id}}}}' mentis-agent:{running}")
+    running_id = stand.sh(
+        f"docker image inspect -f '{{{{.Id}}}}' mentis-agent:{running}"
+    )
     journal.add(
-        "8", "Сбой после сборки, до флага (SET флага не прошёл)",
+        "8",
+        "Сбой после сборки, до флага (SET флага не прошёл)",
         "образы цели собраны, `:latest` — работающая ревизия, флага нет",
-        target, result, stand.state(),
+        target,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
-            "образ :target собран": bool(stand.sh(f"docker images -q mentis-agent:{target}")),
+            "образ :target собран": bool(
+                stand.sh(f"docker images -q mentis-agent:{target}")
+            ),
             ":latest = работающая": latest == running_id,
             "флага нет": stand.fence() == "—",
             "агент прежней ревизии работает": agent_is(running),
@@ -678,15 +843,21 @@ def fault_scenarios(stand: Stand, journal: Journal, running: str, target: str) -
     )
     stand.fault("catalog-del")
     result = deploy(stand, "--revision", target)
-    catalog = stand.compose("exec -T redis redis-cli EXISTS agent:strategies", check=False)
+    catalog = stand.compose(
+        "exec -T redis redis-cli EXISTS agent:strategies", check=False
+    )
     journal.add(
-        "9", "Сбой между остановкой агента и `up` (удаление каталога упало)",
+        "9",
+        "Сбой между остановкой агента и `up` (удаление каталога упало)",
         "`trap` поднял прежнего агента, его каталог опубликован, флаг стоит, печатает, что делать",
-        target, result, stand.state(),
+        target,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "trap поднял прежнего": has(result, "trap: поднимаю прежнего агента"),
-            "агент прежней ревизии работает": agent_is(running) and stand.container("agent").endswith("running"),
+            "агент прежней ревизии работает": agent_is(running)
+            and stand.container("agent").endswith("running"),
             "каталог есть": catalog == "1",
             "флаг стоит": stand.fence() != "—",
             "отсылает к runbook": has(result, "docs/DEPLOY.md §6"),
@@ -695,15 +866,23 @@ def fault_scenarios(stand: Stand, journal: Journal, running: str, target: str) -
     stand.fault("up")
     result = deploy(stand, "--revision", target)
     backend_latest = stand.sh("docker image inspect -f '{{.Id}}' mentis-backend:latest")
-    backend_running = stand.sh(f"cd {APP} && {COMPOSE} ps -q backend | xargs docker inspect -f '{{{{.Image}}}}'")
+    backend_running = stand.sh(
+        f"cd {APP} && {COMPOSE} ps -q backend | xargs docker inspect -f '{{{{.Image}}}}'"
+    )
     journal.add(
-        "10", "Сбой внутри `up` (частичный up)",
+        "10",
+        "Сбой внутри `up` (частичный up)",
         "работает агент из `releases/current`, `mentis-backend:latest` = работающий backend, флаг стоит",
-        target, result, stand.state(),
+        target,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
-            "агент из releases/current": has(result, "trap: агент из releases/current") and agent_is(running),
-            "напечатаны образы обоих сервисов": has(result, "---- образы сервисов ----") and has(result, "mentis-backend-1") and has(result, "mentis-agent-1"),
+            "агент из releases/current": has(result, "trap: агент из releases/current")
+            and agent_is(running),
+            "напечатаны образы обоих сервисов": has(result, "---- образы сервисов ----")
+            and has(result, "mentis-backend-1")
+            and has(result, "mentis-agent-1"),
             "backend:latest = работающий": backend_latest == backend_running,
             "флаг стоит": stand.fence() != "—",
         },
@@ -713,31 +892,43 @@ def fault_scenarios(stand: Stand, journal: Journal, running: str, target: str) -
     result = deploy(stand, "--revision", target)
     waited = time.time() - started
     journal.add(
-        "11", "Агент цели не публикует каталог (поставлен на паузу после `up`)",
+        "11",
+        "Агент цели не публикует каталог (поставлен на паузу после `up`)",
         "ожидание 2 мин, отказ, флаг стоит, агент цели запущен",
-        target, result, stand.state(),
+        target,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "таймаут каталога": has(result, "не опубликовал agent:strategies за 120"),
             "ждал ≥ 120 с": waited >= 120,
             "флаг стоит": stand.fence() != "—",
-            "агент цели (на паузе)": agent_is(target) and "paused" in stand.container("agent"),
+            "агент цели (на паузе)": agent_is(target)
+            and "paused" in stand.container("agent"),
         },
         f"`deploy.sh` ждал {waited:.0f} с",
     )
     stand.sh("docker unpause mentis-agent-1", check=False)
-    first_attempts = set(stand.sh(f"ls {RELEASES} | grep '^deploy-{target}-.*\\.exit$'").split())
+    first_attempts = set(
+        stand.sh(f"ls {RELEASES} | grep '^deploy-{target}-.*\\.exit$'").split()
+    )
     result = deploy(stand, "--revision", target)
-    attempts = set(stand.sh(f"ls {RELEASES} | grep '^deploy-{target}-.*\\.exit$'").split())
+    attempts = set(
+        stand.sh(f"ls {RELEASES} | grep '^deploy-{target}-.*\\.exit$'").split()
+    )
     journal.add(
-        "12", "Повторный `deploy.sh` той же ревизии после неудачи (таймаут шага (5))",
+        "12",
+        "Повторный `deploy.sh` той же ревизии после неудачи (таймаут шага (5))",
         "новая попытка, старый `.exit` не читается, флаг снимает только новый успех",
-        target, result, stand.state(),
+        target,
+        result,
+        stand.state(),
         {
             "код 0": result.code == 0,
             "новая попытка": len(attempts - first_attempts) == 1,
             "флаг снят": stand.fence() == "—",
-            "агент цели работает": agent_is(target) and stand.container("agent").endswith("running"),
+            "агент цели работает": agent_is(target)
+            and stand.container("agent").endswith("running"),
             "current = цель": stand.current() == target,
         },
     )
@@ -754,9 +945,12 @@ def unit_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
     started = time.time()
     result = bg.result(timeout=600)
     journal.add(
-        "13", "Юнит убит `systemctl --user kill -s KILL` до записи `.exit`",
+        "13",
+        "Юнит убит `systemctl --user kill -s KILL` до записи `.exit`",
         "`deploy.sh`: «завершился без кода», не ждёт до таймаута, флаг стоит",
-        b, result, stand.state(),
+        b,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "«без кода»": has(result, "завершился без кода"),
@@ -773,19 +967,27 @@ def unit_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
     bg.kill()
     attempt = stand.sh(f"cat {RELEASES}/deploy.current").split()[1]
     for _ in range(120):
-        code = stand.sh(f"cat {RELEASES}/deploy-{a}-{attempt}.exit 2>/dev/null", check=False)
+        code = stand.sh(
+            f"cat {RELEASES}/deploy-{a}-{attempt}.exit 2>/dev/null", check=False
+        )
         if code:
             break
         time.sleep(2)
     journal.add(
-        "14", "Обрыв SSH (kill локального `deploy.sh`) сразу после остановки агента",
+        "14",
+        "Обрыв SSH (kill локального `deploy.sh`) сразу после остановки агента",
         "скрипт на сервере доходит до конца; лог и код выхода в `releases/`",
-        a, Deploy(-9, bg.out), stand.state(),
+        a,
+        Deploy(-9, bg.out),
+        stand.state(),
         {
             "юнит завершился с кодом 0": code == "0",
-            "лог есть": bool(stand.sh(f"ls {RELEASES}/deploy-{a}-{attempt}.log", check=False)),
+            "лог есть": bool(
+                stand.sh(f"ls {RELEASES}/deploy-{a}-{attempt}.log", check=False)
+            ),
             "флаг снят": stand.fence() == "—",
-            "агент цели работает": a in stand.container("agent") and stand.container("agent").endswith("running"),
+            "агент цели работает": a in stand.container("agent")
+            and stand.container("agent").endswith("running"),
         },
         f"попытка `{attempt}`, код в `.exit`: {code or '—'}",
     )
@@ -798,14 +1000,18 @@ def unit_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
     r1, r2 = first.result(), second.result()
     logs = stand.sh(f"ls {RELEASES} | grep -c '^deploy-{b}-.*\\.log$'")
     journal.add(
-        "15", "Два одновременных `deploy.sh` одной ревизии",
+        "15",
+        "Два одновременных `deploy.sh` одной ревизии",
         "один юнит, второй подключается к его логу; оба получают исход одной попытки",
-        b, Deploy(r2.code, r2.out), stand.state(),
+        b,
+        Deploy(r2.code, r2.out),
+        stand.state(),
         {
             "оба код 0": r1.code == 0 and r2.code == 0,
             "второй подключился": "подключаюсь к ней" in r2.out,
             "никто не сообщил «без кода»": "без кода" not in r1.out + r2.out,
-            "скрипт ограды — абсолютный путь в releases/": "/home/jb/apps/releases/deploy-fence-" in exec_start,
+            "скрипт ограды — абсолютный путь в releases/": "/home/jb/apps/releases/deploy-fence-"
+            in exec_start,
         },
         f"первый: код {r1.code}; логов попыток ревизии: {logs}",
         f"ExecStart юнита: `{exec_start[:160]}`",
@@ -819,19 +1025,26 @@ def unit_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
     second = Background(stand, "--revision", a)
     r1, r2 = first.result(), second.result()
     journal.add(
-        "16", "То же при прошлой неудачной попытке этой ревизии с `.exit` на диске",
+        "16",
+        "То же при прошлой неудачной попытке этой ревизии с `.exit` на диске",
         "ни один не сообщает её код; оба получают исход новой попытки",
-        a, Deploy(r2.code, r2.out), stand.state(),
+        a,
+        Deploy(r2.code, r2.out),
+        stand.state(),
         {
             "прошлая попытка упала": failed.code == 1,
             "оба код 0": r1.code == 0 and r2.code == 0,
             "второй подключился": "подключаюсь к ней" in r2.out,
-            "никто не сообщил прошлый код": "завершился с кодом 1" not in r1.out + r2.out,
+            "никто не сообщил прошлый код": "завершился с кодом 1"
+            not in r1.out + r2.out,
         },
     )
     # A second deploy.sh with a changed fence script while the first runs.
     tree = Path(tempfile.mkdtemp(prefix="stand-tree-"))
-    run(["git", "-C", str(REPO), "worktree", "add", "--detach", str(tree), "HEAD"], timeout=120)
+    run(
+        ["git", "-C", str(REPO), "worktree", "add", "--detach", str(tree), "HEAD"],
+        timeout=120,
+    )
     try:
         fence = tree / "scripts/deploy-fence.sh"
         fence.write_text(fence.read_text() + "\n# changed for scenario 17\n")
@@ -841,12 +1054,17 @@ def unit_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
         second = Background(stand, "--revision", b, repo=tree)
         r1, r2 = first.result(), second.result()
         attempt = stand.sh(f"cat {RELEASES}/deploy.current").split()[1]
-        marker = stand.sh(f"grep -o 'скрипт ограды [0-9a-f]*' {RELEASES}/deploy-{b}-{attempt}.log | head -n1")
+        marker = stand.sh(
+            f"grep -o 'скрипт ограды [0-9a-f]*' {RELEASES}/deploy-{b}-{attempt}.log | head -n1"
+        )
         ours = run(["sha256sum", str(REPO / "scripts/deploy-fence.sh")]).stdout[:12]
         journal.add(
-            "17", "Второй `deploy.sh` той же ревизии с изменённым скриптом ограды, пока первый жив",
+            "17",
+            "Второй `deploy.sh` той же ревизии с изменённым скриптом ограды, пока первый жив",
             "первый дорабатывает свою версию (маркер в логе), второй подключается",
-            b, Deploy(r2.code, r2.out), stand.state(),
+            b,
+            Deploy(r2.code, r2.out),
+            stand.state(),
             {
                 "оба код 0": r1.code == 0 and r2.code == 0,
                 "второй подключился": "подключаюсь к ней" in r2.out,
@@ -855,7 +1073,10 @@ def unit_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
             f"маркер: `{marker}`, хеш первого `{ours}`",
         )
     finally:
-        run(["git", "-C", str(REPO), "worktree", "remove", "--force", str(tree)], check=False)
+        run(
+            ["git", "-C", str(REPO), "worktree", "remove", "--force", str(tree)],
+            check=False,
+        )
     # Another revision while one runs.
     stand.fault("slow-up", slow=30)
     first = Background(stand, "--revision", a)
@@ -865,9 +1086,12 @@ def unit_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
     stages_after = stand.sh(f"ls -d {RELEASES}/stage-* | wc -l")
     r1 = first.result()
     journal.add(
-        "18", "`deploy.sh` другой ревизии, пока идёт выкладка",
+        "18",
+        "`deploy.sh` другой ревизии, пока идёт выкладка",
         "отказ, ничего не меняя; идущая выкладка завершается",
-        b, other, stand.state(),
+        b,
+        other,
+        stand.state(),
         {
             "отказ": other.code == 1,
             "файлов попыток не прибавилось": stages == stages_after,
@@ -882,8 +1106,12 @@ def environment_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     before = stand.state()
     result = deploy(stand, "--revision", a)
     journal.add(
-        "19", "Linger выключен у пользователя SSH", "отказ до шага (1): ни флага, ни остановки агента",
-        a, result, stand.state(),
+        "19",
+        "Linger выключен у пользователя SSH",
+        "отказ до шага (1): ни флага, ни остановки агента",
+        a,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "про linger": has(result, "выключен linger"),
@@ -893,19 +1121,34 @@ def environment_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     )
     stand.root("loginctl enable-linger jb")
     for _ in range(30):
-        if stand.sh("systemctl --user is-system-running", check=False) in ("running", "degraded"):
+        if stand.sh("systemctl --user is-system-running", check=False) in (
+            "running",
+            "degraded",
+        ):
             break
         time.sleep(1)
     result = deploy(stand, "--revision", TOO_OLD)
     journal.add(
-        "20", "Цель старше `608cfa1` (агент не публикует каталог)", "отказ до шага (1)",
-        TOO_OLD, result, stand.state(),
-        {"код 1": result.code == 1, "про 608cfa1": has(result, "старше 608cfa1"), "флага нет": stand.fence() == "—"},
+        "20",
+        "Цель старше `608cfa1` (агент не публикует каталог)",
+        "отказ до шага (1)",
+        TOO_OLD,
+        result,
+        stand.state(),
+        {
+            "код 1": result.code == 1,
+            "про 608cfa1": has(result, "старше 608cfa1"),
+            "флага нет": stand.fence() == "—",
+        },
     )
     result = deploy(stand, "--revision", NO_PROD_COMPOSE)
     journal.add(
-        "21a", "Цель без `compose.prod.yml` (`608cfa1`)", "отказ на проверке контракта, до шага (1)",
-        NO_PROD_COMPOSE, result, stand.state(),
+        "21a",
+        "Цель без `compose.prod.yml` (`608cfa1`)",
+        "отказ на проверке контракта, до шага (1)",
+        NO_PROD_COMPOSE,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "сбой до шага (1)": has(result, "сбой до шага (1)"),
@@ -917,13 +1160,19 @@ def environment_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     no_lock = short(NO_LOCK)
     result = deploy(stand, "--revision", no_lock)
     journal.add(
-        "21", "Цель без образов и без tracked `uv.lock`",
-        "отказ, lock текущего дерева не подставляется", no_lock, result, stand.state(),
+        "21",
+        "Цель без образов и без tracked `uv.lock`",
+        "отказ, lock текущего дерева не подставляется",
+        no_lock,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "про uv.lock": has(result, "lock текущего дерева не подставляется"),
             "флага нет": stand.fence() == "—",
-            "образов цели нет": not stand.sh(f"docker images -q mentis-agent:{no_lock}", check=False),
+            "образов цели нет": not stand.sh(
+                f"docker images -q mentis-agent:{no_lock}", check=False
+            ),
         },
     )
     # The user manager unreachable before the launch, for longer than 30 s:
@@ -934,12 +1183,17 @@ def environment_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     finally:
         stand.root(BUS_UP)
     journal.add(
-        "22", "Шина менеджера пользователя недоступна дольше 30 с", "«состояние неизвестно», юнит не запускается",
-        a, result, stand.state(),
+        "22",
+        "Шина менеджера пользователя недоступна дольше 30 с",
+        "«состояние неизвестно», юнит не запускается",
+        a,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "«неизвестно»": has(result, "неизвестно"),
-            "юнит не запускался": "not-found" in stand.sh("systemctl --user show -p LoadState mentis-deploy"),
+            "юнит не запускался": "not-found"
+            in stand.sh("systemctl --user show -p LoadState mentis-deploy"),
         },
     )
     # Unreachable for a few seconds while deploy.sh waits for the outcome.
@@ -951,27 +1205,42 @@ def environment_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     stand.root(BUS_UP)
     result = bg.result()
     journal.add(
-        "23", "Шина недоступна 8 с во время ожидания исхода",
+        "23",
+        "Шина недоступна 8 с во время ожидания исхода",
         "повтор чтения; после восстановления — та же попытка, без нового запуска",
-        a, result, stand.state(),
-        {"код 0": result.code == 0, "«неизвестно» не было": "неизвестно" not in result.out},
+        a,
+        result,
+        stand.state(),
+        {
+            "код 0": result.code == 0,
+            "«неизвестно» не было": "неизвестно" not in result.out,
+        },
     )
     # A loaded unit of the same name without the attempt's metadata.
     stand.sh("systemd-run --user --unit=mentis-deploy sleep 300")
     result = deploy(stand, "--revision", a)
     stand.sh("systemctl --user stop mentis-deploy", check=False)
     journal.add(
-        "24", "Загруженный юнит `mentis-deploy` без `DEPLOY_ATTEMPT` (R109)",
+        "24",
+        "Загруженный юнит `mentis-deploy` без `DEPLOY_ATTEMPT` (R109)",
         "«метаданные попытки отсутствуют или некорректны», без подключения и запуска",
-        a, result, stand.state(),
-        {"код 1": result.code == 1, "про метаданные": has(result, "метаданные попытки отсутствуют")},
+        a,
+        result,
+        stand.state(),
+        {
+            "код 1": result.code == 1,
+            "про метаданные": has(result, "метаданные попытки отсутствуют"),
+        },
     )
     stand.sh("mkdir -p ~/faults && echo refuse > ~/faults/systemd-run")
     result = deploy(stand, "--revision", a)
     journal.add(
-        "25", "`systemd-run` отказал, юнита нет (R106)",
+        "25",
+        "`systemd-run` отказал, юнита нет (R106)",
         "«юнит отсутствует: запуск не подтверждён…», stderr `systemd-run`, G4 не запускается",
-        a, result, stand.state(),
+        a,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "«юнит отсутствует»": has(result, "юнит mentis-deploy отсутствует"),
@@ -982,23 +1251,37 @@ def environment_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     stand.sh("echo lost-reply > ~/faults/systemd-run")
     result = deploy(stand, "--revision", a)
     journal.add(
-        "26", "`systemd-run` вернул ошибку, а юнит работает со своей попыткой (R102)",
+        "26",
+        "`systemd-run` вернул ошибку, а юнит работает со своей попыткой (R102)",
         "`deploy.sh` ждёт свою попытку и получает её исход",
-        a, result, stand.state(),
-        {"код 0": result.code == 0, "ответ потерян, ждёт": has(result, "ответ systemd-run потерян")},
+        a,
+        result,
+        stand.state(),
+        {
+            "код 0": result.code == 0,
+            "ответ потерян, ждёт": has(result, "ответ systemd-run потерян"),
+        },
     )
 
 
 def api_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
     params = default_params()
-    start = {"network": "testnet", "strategy": "tripple_screen", "symbols": ["BTCUSDT"], "params": params}
+    start = {
+        "network": "testnet",
+        "strategy": "tripple_screen",
+        "symbols": ["BTCUSDT"],
+        "params": params,
+    }
     stand.fault("slow-up", slow=30)
     bg = Background(stand, "--revision", b)
     bg.wait_for("==> (4)")
     # Every command the backend sends Redis meanwhile: a refused Start is one
     # EVAL of the commit script (the flag among its keys), no retry loop.
     monitor = subprocess.Popen(
-        [str(stand.ssh), f"cd {APP} && timeout 30 {COMPOSE} exec -T redis redis-cli MONITOR"],
+        [
+            str(stand.ssh),
+            f"cd {APP} && timeout 30 {COMPOSE} exec -T redis redis-cli MONITOR",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -1018,9 +1301,12 @@ def api_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
     _, status = api("GET", "/trading/status/")
     result = bg.result()
     journal.add(
-        "27", "Start во время выкладки (между флагом и каталогом цели), оба маршрута; Stop",
+        "27",
+        "Start во время выкладки (между флагом и каталогом цели), оба маршрута; Stop",
         "Start — 503 «starting is closed for maintenance»; Stop принят",
-        b, result, stand.state(),
+        b,
+        result,
+        stand.state(),
         {
             "start/ — 503": s1 == 503,
             "commands/ start — 503": s2 == 503,
@@ -1047,30 +1333,44 @@ def api_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> None:
         if state_stop and state_stop.get("status") == "succeeded":
             break
         time.sleep(2)
-    groups_after = stand.compose("exec -T redis redis-cli XINFO GROUPS agent:commands:stream")
+    groups_after = stand.compose(
+        "exec -T redis redis-cli XINFO GROUPS agent:commands:stream"
+    )
     _, status = api("GET", "/trading/status/")
     lag = groups_after.splitlines()
     journal.add(
-        "28", "Барьер доставки: Start в потоке при остановленном агенте, затем Stop",
+        "28",
+        "Барьер доставки: Start в потоке при остановленном агенте, затем Stop",
         "барьер не проходит, пока агент не обработал обе команды; после — Stop succeeded, lag 0, pending 0, idle",
-        a, None, stand.state(),
+        a,
+        None,
+        stand.state(),
         {
             "Start и Stop приняты": s_start == 202 and s_stop == 202,
             "до запуска агента Stop не succeeded": blocked,
-            "Stop succeeded": bool(state_stop) and state_stop.get("status") == "succeeded",
-            "lag 0, pending 0": lag[lag.index("lag") + 1] == "0" and lag[lag.index("pending") + 1] == "0",
-            "агент idle, desired.running false": status["actual"]["state"] == "idle" and not status["desired"]["running"],
+            "Stop succeeded": bool(state_stop)
+            and state_stop.get("status") == "succeeded",
+            "lag 0, pending 0": lag[lag.index("lag") + 1] == "0"
+            and lag[lag.index("pending") + 1] == "0",
+            "агент idle, desired.running false": status["actual"]["state"] == "idle"
+            and not status["desired"]["running"],
         },
         "XINFO при остановленном агенте: " + " ".join(groups.split()),
     )
 
 
-def contract_scenarios(stand: Stand, journal: Journal, no_agent: str, other_image: str) -> None:
+def contract_scenarios(
+    stand: Stand, journal: Journal, no_agent: str, other_image: str
+) -> None:
     """Targets that break the contract (throwaway commits made by main())."""
     result = deploy(stand, "--revision", no_agent)
     journal.add(
-        "21b", "Цель без сервиса `agent` в compose-файлах", "отказ до шага (1)",
-        no_agent, result, stand.state(),
+        "21b",
+        "Цель без сервиса `agent` в compose-файлах",
+        "отказ до шага (1)",
+        no_agent,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "про сервис agent": has(result, "нет сервиса agent"),
@@ -1081,8 +1381,12 @@ def contract_scenarios(stand: Stand, journal: Journal, no_agent: str, other_imag
     )
     result = deploy(stand, "--revision", other_image)
     journal.add(
-        "21c", "Образ агента цели не `mentis-agent:latest`", "отказ до шага (1)",
-        other_image, result, stand.state(),
+        "21c",
+        "Образ агента цели не `mentis-agent:latest`",
+        "отказ до шага (1)",
+        other_image,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "про образ agent": has(result, "не mentis-agent:latest"),
@@ -1132,9 +1436,12 @@ def preparation_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> Non
     held.unlink()
     r1 = first.result()
     journal.add(
-        "30", "Подготовленная, но не запущенная попытка (пауза клиента) переживает чужую выкладку (R108)",
+        "30",
+        "Подготовленная, но не запущенная попытка (пауза клиента) переживает чужую выкладку (R108)",
         "её stage и копия скрипта сохранены; её запуск затем проходит штатно",
-        a, r1, stand.state(),
+        a,
+        r1,
+        stand.state(),
         {
             "чужая выкладка — код 0": other.code == 0,
             "stage и скрипт сохранены": kept == "yes",
@@ -1157,7 +1464,9 @@ def preparation_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> Non
         g2.unlink()
         # The loser decides within seconds; the winner sleeps in `up`.
         deadline = time.time() + 60
-        while time.time() < deadline and p1.proc.poll() is None and p2.proc.poll() is None:
+        while (
+            time.time() < deadline and p1.proc.poll() is None and p2.proc.poll() is None
+        ):
             time.sleep(0.5)
         loser_done = [p for p in (p1, p2) if p.proc.poll() is not None]
         # The winner's own changes end with its retag at step (4); `up` then
@@ -1170,7 +1479,8 @@ def preparation_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> Non
         r1, r2 = p1.result(), p2.result()
         end_hash, end_ids = app_hash(stand), latest_ids(stand)
         units = stand.sh(
-            f"ls {RELEASES} | grep -c -E '^deploy-({rev1}|{rev2})-.*\\.log$'", check=False
+            f"ls {RELEASES} | grep -c -E '^deploy-({rev1}|{rev2})-.*\\.log$'",
+            check=False,
         )
         outs = r1.out + r2.out
         if rev1 == rev2:
@@ -1187,14 +1497,28 @@ def preparation_scenarios(stand: Stand, journal: Journal, a: str, b: str) -> Non
                 "отказ — идёт выкладка другой ревизии": "идёт выкладка ревизии" in outs,
                 "проигравшая решила раньше победителя": len(loser_done) == 1,
                 "флаг стоял, пока работал победитель": mid_fence != "—",
-                "compose.yml и образы :latest от шага (4) победителя до его .exit не менялись": (mid_hash, mid_ids) == (end_hash, end_ids),
+                "compose.yml и образы :latest от шага (4) победителя до его .exit не менялись": (
+                    mid_hash,
+                    mid_ids,
+                )
+                == (end_hash, end_ids),
             }
             title = "Одновременные подготовки двух ревизий, запуск одновременно (R103)"
-            expected = "общее состояние меняет один юнит; другая — отказ до любых записей"
-        checks["своя stage проигравшей убрана"] = int(stand.sh(f"ls -d {RELEASES}/stage-* | wc -l")) <= int(stages_before)
+            expected = (
+                "общее состояние меняет один юнит; другая — отказ до любых записей"
+            )
+        checks["своя stage проигравшей убрана"] = int(
+            stand.sh(f"ls -d {RELEASES}/stage-* | wc -l")
+        ) <= int(stages_before)
         checks["флаг снят (снял победитель)"] = stand.fence() == "—"
         journal.add(
-            sid, title, expected, f"{rev1}/{rev2}", Deploy(r2.code, outs), stand.state(), checks,
+            sid,
+            title,
+            expected,
+            f"{rev1}/{rev2}",
+            Deploy(r2.code, outs),
+            stand.state(),
+            checks,
             f"compose.yml: {mid_hash} → {end_hash}; образы :latest: {mid_ids} → {end_ids}",
             f"логов попыток этих ревизий всего: {units}",
         )
@@ -1206,16 +1530,25 @@ def held_start_scenario(stand: Stand, journal: Journal) -> None:
     plain_up = f"cd {APP} && docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml up -d backend"
     stand.sh(f"cd {APP} && docker compose --env-file .env.prod {hooks} up -d backend")
     for _ in range(60):
-        if stand.sh("curl -fsS http://127.0.0.1:8010/api/v1/utils/health-check/", check=False):
+        if stand.sh(
+            "curl -fsS http://127.0.0.1:8010/api/v1/utils/health-check/", check=False
+        ):
             break
         time.sleep(2)
     params = default_params()
-    start = {"network": "testnet", "strategy": "tripple_screen", "symbols": ["BTCUSDT"], "params": params}
+    start = {
+        "network": "testnet",
+        "strategy": "tripple_screen",
+        "symbols": ["BTCUSDT"],
+        "params": params,
+    }
     stand.sh("rm -f ~/stand-state/start-held && touch ~/stand-state/pause-start")
     stream_before = stand.compose("exec -T redis redis-cli XLEN agent:commands:stream")
     _, status_before = api("GET", "/trading/status/")
     answer: dict[str, Any] = {}
-    request = threading.Thread(target=lambda: answer.update(r=api("POST", "/trading/start/", start)))
+    request = threading.Thread(
+        target=lambda: answer.update(r=api("POST", "/trading/start/", start))
+    )
     request.start()
     for _ in range(100):
         if stand.sh("test -e ~/stand-state/start-held && echo y", check=False) == "y":
@@ -1224,7 +1557,10 @@ def held_start_scenario(stand: Stand, journal: Journal) -> None:
     held = stand.sh("test -e ~/stand-state/start-held && echo y", check=False) == "y"
     stand.compose('exec -T redis redis-cli SET trading:start_fence "stand: held start"')
     monitor = subprocess.Popen(
-        [str(stand.ssh), f"cd {APP} && timeout 30 {COMPOSE} exec -T redis redis-cli MONITOR"],
+        [
+            str(stand.ssh),
+            f"cd {APP} && timeout 30 {COMPOSE} exec -T redis redis-cli MONITOR",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -1246,13 +1582,18 @@ def held_start_scenario(stand: Stand, journal: Journal) -> None:
     stand.compose("exec -T redis redis-cli DEL trading:start_fence")
     stand.sh(plain_up)
     for _ in range(60):
-        if stand.sh("curl -fsS http://127.0.0.1:8010/api/v1/utils/health-check/", check=False):
+        if stand.sh(
+            "curl -fsS http://127.0.0.1:8010/api/v1/utils/health-check/", check=False
+        ):
             break
         time.sleep(2)
     journal.add(
-        "33", "Start прошёл раннюю проверку до флага, приостановлен перед записью; флаг поставлен",
+        "33",
+        "Start прошёл раннюю проверку до флага, приостановлен перед записью; флаг поставлен",
         "503; в потоке и в desired его нет",
-        "—", None, stand.state(),
+        "—",
+        None,
+        stand.state(),
         {
             "Start удержан перед записью": held,
             "ответ 503": code == 503,
@@ -1269,10 +1610,17 @@ def held_start_scenario(stand: Stand, journal: Journal) -> None:
 
 def barrier_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     params = default_params()
-    start = {"network": "testnet", "strategy": "tripple_screen", "symbols": ["BTCUSDT"], "params": params}
+    start = {
+        "network": "testnet",
+        "strategy": "tripple_screen",
+        "symbols": ["BTCUSDT"],
+        "params": params,
+    }
 
     def groups() -> dict[str, str]:
-        out = stand.compose("exec -T redis redis-cli XINFO GROUPS agent:commands:stream").splitlines()
+        out = stand.compose(
+            "exec -T redis redis-cli XINFO GROUPS agent:commands:stream"
+        ).splitlines()
         return dict(zip(out[0::2], out[1::2]))
 
     # The agent dies right after it took the Start (read, not acknowledged).
@@ -1284,24 +1632,35 @@ def barrier_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     )
     taken = groups()
     _, state_stop = api("GET", f"/trading/commands/{stopped['id']}/state/")
-    held = (state_stop or {}).get("status") != "succeeded" and taken.get("pending") != "0"
+    held = (state_stop or {}).get("status") != "succeeded" and taken.get(
+        "pending"
+    ) != "0"
     stand.compose("start agent")
     for _ in range(90):
         _, state_stop = api("GET", f"/trading/commands/{stopped['id']}/state/")
-        if state_stop and state_stop.get("status") == "succeeded" and groups().get("pending") == "0":
+        if (
+            state_stop
+            and state_stop.get("status") == "succeeded"
+            and groups().get("pending") == "0"
+        ):
             break
         time.sleep(2)
     after = groups()
     _, status = api("GET", "/trading/status/")
     journal.add(
-        "34", "Перезапуск агента на границе обработки: Start прочитан, не подтверждён",
+        "34",
+        "Перезапуск агента на границе обработки: Start прочитан, не подтверждён",
         "барьер держит (pending ≠ 0), после рестарта агент дочитывает; затем Stop succeeded, lag 0, pending 0",
-        a, None, stand.state(),
+        a,
+        None,
+        stand.state(),
         {
             "барьер держал": held,
-            "Stop succeeded": bool(state_stop) and state_stop.get("status") == "succeeded",
+            "Stop succeeded": bool(state_stop)
+            and state_stop.get("status") == "succeeded",
             "pending 0, lag 0": after.get("pending") == "0" and after.get("lag") == "0",
-            "агент idle, desired.running false": status["actual"]["state"] == "idle" and not status["desired"]["running"],
+            "агент idle, desired.running false": status["actual"]["state"] == "idle"
+            and not status["desired"]["running"],
         },
         f"после чтения за агента: pending={taken.get('pending')}, lag={taken.get('lag')}",
     )
@@ -1320,11 +1679,15 @@ def barrier_scenarios(stand: Stand, journal: Journal, a: str) -> None:
     length_after = stand.compose("exec -T redis redis-cli XLEN agent:commands:stream")
     stand.compose("exec -T redis redis-cli DEL trading:start_fence")
     journal.add(
-        "35", "Конкурентный Start между последним наблюдением барьера и остановкой backend",
+        "35",
+        "Конкурентный Start между последним наблюдением барьера и остановкой backend",
         "503 по обоим маршрутам (флаг поставлен на шаге 1), поток не растёт",
-        a, None, stand.state(),
+        a,
+        None,
+        stand.state(),
         {
-            "барьер пройден": observed.get("pending") == "0" and observed.get("lag") == "0",
+            "барьер пройден": observed.get("pending") == "0"
+            and observed.get("lag") == "0",
             "start/ — 503": late == 503,
             "commands/ start — 503": late2 == 503,
             "поток не вырос": length == length_after,
@@ -1336,9 +1699,12 @@ def unit_vanish_scenario(stand: Stand, journal: Journal, a: str) -> None:
     stand.sh("mkdir -p ~/faults && echo vanish > ~/faults/systemd-run")
     result = deploy(stand, "--revision", a)
     journal.add(
-        "25b", "`systemd-run` отказал, а юнит выгружен между снимками S0 и S1 (R106)",
+        "25b",
+        "`systemd-run` отказал, а юнит выгружен между снимками S0 и S1 (R106)",
         "«юнит отсутствует…», G4 не запускается",
-        a, result, stand.state(),
+        a,
+        result,
+        stand.state(),
         {
             "код 1": result.code == 1,
             "«юнит отсутствует»": has(result, "юнит mentis-deploy отсутствует"),
@@ -1361,32 +1727,55 @@ def rollback_to_t0(stand: Stand, journal: Journal) -> None:
     versions = sorted(stand.sh(f"ls {APP}/backend/app/alembic/versions").split())
     t0_versions = sorted(
         Path(p).name
-        for p in run(["git", "-C", str(REPO), "ls-tree", "--name-only", f"{T0}:backend/app/alembic/versions"]).stdout.split()
+        for p in run(
+            [
+                "git",
+                "-C",
+                str(REPO),
+                "ls-tree",
+                "--name-only",
+                f"{T0}:backend/app/alembic/versions",
+            ]
+        ).stdout.split()
     )
     current = stand.compose("exec -T backend alembic current", check=False).splitlines()
     catalog = stand.compose("exec -T redis redis-cli GET agent:strategies", check=False)
     # The T0 row of the table in plan §7.1: Default passes, Fast (in T0's
     # field names, without the fields T0 lacks) is refused by 16:4:1.
     t0_default = default_params()
-    t0_fast = dict(t0_default, tide_interval="1h", wave_interval="15m", ripple_interval="5m",
-                   tp_pct="5", signal_validity_minutes=5)
+    t0_fast = dict(
+        t0_default,
+        tide_interval="1h",
+        wave_interval="15m",
+        ripple_interval="5m",
+        tp_pct="5",
+        signal_validity_minutes=5,
+    )
     body = {"network": "testnet", "strategy": "tripple_screen", "symbols": ["BTCUSDT"]}
     fast_code, fast_body = api("POST", "/trading/start/", {**body, "params": t0_fast})
     default_code, _ = api("POST", "/trading/start/", {**body, "params": t0_default})
     api("POST", "/trading/stop/")
     journal.add(
-        "29", "Откат на T0 по runbook после всех выкладок",
+        "29",
+        "Откат на T0 по runbook после всех выкладок",
         "без сборки, на закреплённых образах; alembic = ревизия T0; в APP_DIR нет чужих миграций; каталог T0",
-        T0, result, stand.state(),
+        T0,
+        result,
+        stand.state(),
         {
             "код 0": result.code == 0,
             "без сборки": has(result, f"Образы :{T0} уже есть — без сборки"),
-            "образов не прибавилось": int(stand.sh("docker images -q | wc -l")) <= int(builds_before),
-            "alembic current = b3f7a1c9d2e4": any("b3f7a1c9d2e4" in line for line in current),
-            "миграции APP_DIR = T0": [v for v in versions if v.endswith(".py")] == [v for v in t0_versions if v.endswith(".py")],
+            "образов не прибавилось": int(stand.sh("docker images -q | wc -l"))
+            <= int(builds_before),
+            "alembic current = b3f7a1c9d2e4": any(
+                "b3f7a1c9d2e4" in line for line in current
+            ),
+            "миграции APP_DIR = T0": [v for v in versions if v.endswith(".py")]
+            == [v for v in t0_versions if v.endswith(".py")],
             "каталог T0 (старые имена)": "swing_low_h1_n" in catalog,
             "флаг снят": stand.fence() == "—",
-            "строка T0: Fast → 422 по 16:4:1": fast_code == 422 and "16:4:1" in json.dumps(fast_body),
+            "строка T0: Fast → 422 по 16:4:1": fast_code == 422
+            and "16:4:1" in json.dumps(fast_body),
             "строка T0: Default → 202": default_code == 202,
         },
     )
@@ -1399,7 +1788,10 @@ def throwaway_targets(work: Path) -> tuple[str, str]:
     """Two commits on a throwaway branch that break the target contract."""
     tree = work / "throwaway"
     run(["git", "-C", str(REPO), "branch", "-D", THROWAWAY], check=False)
-    run(["git", "-C", str(REPO), "worktree", "add", "-b", THROWAWAY, str(tree), "HEAD"], timeout=120)
+    run(
+        ["git", "-C", str(REPO), "worktree", "add", "-b", THROWAWAY, str(tree), "HEAD"],
+        timeout=120,
+    )
     try:
         compose, prod = tree / "compose.yml", tree / "compose.prod.yml"
         original, original_prod = compose.read_text(), prod.read_text()
@@ -1409,11 +1801,16 @@ def throwaway_targets(work: Path) -> tuple[str, str]:
         run(["git", "-C", str(tree), "commit", "-qam", "stand: no agent service"])
         no_agent = short_in(tree, "HEAD")
         prod.write_text(original_prod)
-        compose.write_text(original.replace("image: mentis-agent:", "image: mentis-other-agent:", 1))
+        compose.write_text(
+            original.replace("image: mentis-agent:", "image: mentis-other-agent:", 1)
+        )
         run(["git", "-C", str(tree), "commit", "-qam", "stand: another agent image"])
         other_image = short_in(tree, "HEAD")
     finally:
-        run(["git", "-C", str(REPO), "worktree", "remove", "--force", str(tree)], check=False)
+        run(
+            ["git", "-C", str(REPO), "worktree", "remove", "--force", str(tree)],
+            check=False,
+        )
     return no_agent, other_image
 
 
@@ -1434,7 +1831,16 @@ def main() -> int:
     # Deployable revisions after T0, oldest first: all have a tracked uv.lock;
     # the last two have the same schema as HEAD for the fault scenarios.
     chain = run(
-        ["git", "-C", str(REPO), "rev-list", "--first-parent", "--reverse", "--abbrev-commit", f"{FIRST_LOCK}..HEAD"]
+        [
+            "git",
+            "-C",
+            str(REPO),
+            "rev-list",
+            "--first-parent",
+            "--reverse",
+            "--abbrev-commit",
+            f"{FIRST_LOCK}..HEAD",
+        ]
     ).stdout.split()
     picks = [chain[round(i * (len(chain) - 3) / 10)] for i in range(11)]
     sequence = list(dict.fromkeys(short(r) for r in picks))
@@ -1458,7 +1864,16 @@ def main() -> int:
         barrier_scenarios(stand, journal, a)
         rollback_to_t0(stand, journal)
     except Exception as exc:  # the journal says where it stopped
-        journal.add("!", "Прогон прерван", "—", "—", None, {}, {"без исключения": False}, textwrap.shorten(str(exc), 900))
+        journal.add(
+            "!",
+            "Прогон прерван",
+            "—",
+            "—",
+            None,
+            {},
+            {"без исключения": False},
+            textwrap.shorten(str(exc), 900),
+        )
         raise
     finally:
         journal.write(options.out, head=head, started=started)

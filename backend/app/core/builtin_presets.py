@@ -160,8 +160,8 @@ def _rollback_quietly(session: Session) -> None:
 def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
     # 1. The lock row; every worker's sync of this strategy queues behind it,
     # but not for longer than LOCK_TIMEOUT.
-    session.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
-    session.execute(
+    session.execute(text(f"SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))  # ty: ignore[deprecated]
+    session.execute(  # ty: ignore[deprecated]
         text(
             "INSERT INTO strategy_builtin_sync (strategy, content_hash, status) "
             "VALUES (:s, '', 'never') ON CONFLICT DO NOTHING"
@@ -169,7 +169,7 @@ def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
         {"s": strategy},
     )
     row = (
-        session.execute(
+        session.execute(  # ty: ignore[deprecated]
             text(
                 "SELECT content_hash, errors FROM strategy_builtin_sync "
                 "WHERE strategy = :s FOR UPDATE"
@@ -213,7 +213,7 @@ def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
     # 4. Upsert what was accepted; a user's row with that name is not touched.
     conflicts: list[dict[str, Any]] = []
     for record in parsed.accepted:
-        written = session.execute(
+        written = session.execute(  # ty: ignore[deprecated]
             text(
                 "INSERT INTO strategy_preset (strategy, name, params, is_builtin) "
                 "VALUES (:s, :name, CAST(:params AS jsonb), true) "
@@ -230,7 +230,7 @@ def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
             continue
         # Nothing returned: either our own unchanged row, or someone else's —
         # read after the upsert, so a row inserted concurrently is seen too.
-        is_builtin = session.execute(
+        is_builtin = session.execute(  # ty: ignore[deprecated]
             text(
                 "SELECT is_builtin FROM strategy_preset "
                 "WHERE strategy = :s AND lower(name) = lower(:name)"
@@ -245,7 +245,7 @@ def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
     # 5. Retire only by an authoritative list: a list with parse errors may
     # have lost a preset to a defect, and hiding it would be wrong.
     if not parsed.has_errors:
-        session.execute(
+        session.execute(  # ty: ignore[deprecated]
             text(
                 "UPDATE strategy_preset SET retired_at = now(), updated_at = now() "
                 "WHERE strategy = :s AND is_builtin AND retired_at IS NULL "
@@ -258,7 +258,7 @@ def _sync(session: Session, redis: Redis, strategy: str) -> SyncOutcome:
     # 6. The new state of the sync.
     errors = parsed.errors + conflicts
     status = "partial" if errors else "ok"
-    session.execute(
+    session.execute(  # ty: ignore[deprecated]
         text(
             "UPDATE strategy_builtin_sync SET content_hash = :key, status = :status, "
             "errors = CAST(:errors AS jsonb), synced_at = now() WHERE strategy = :s"
@@ -294,7 +294,7 @@ def _regroup_by_database(session: Session, parsed: PresetsParse) -> PresetsParse
     named = [record for record in parsed.records if record.name is not None]
     if len(named) < 2:
         return parsed
-    result = session.execute(
+    result = session.execute(  # ty: ignore[deprecated]
         text(
             "SELECT i, lower(n) FROM unnest(CAST(:names AS text[])) "
             "WITH ORDINALITY AS t(n, i)"

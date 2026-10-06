@@ -1136,7 +1136,7 @@ async def get_command_state(
     redis = get_redis()
     key = f"{REDIS_COMMAND_STATE_PREFIX}{command_id}"
     try:
-        raw = await redis.hgetall(key)  # type: ignore[misc]
+        raw = await redis.hgetall(key)  # type: ignore[misc] # ty: ignore[invalid-await]
     except RedisError as exc:
         raise _redis_unavailable(exc) from exc
     if not raw:

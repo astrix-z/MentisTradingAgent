@@ -135,7 +135,7 @@ def _record_entry(payload: dict[str, Any], network: str) -> None:
     )
     with Session(engine) as session:
         _lock_symbol(session, network, position.symbol)
-        inserted = session.execute(statement).first() is not None
+        inserted = session.execute(statement).first() is not None  # ty: ignore[deprecated]
         closed_by = _take_pending_exit(session, position) if inserted else None
         session.commit()
     if not inserted:
@@ -155,7 +155,7 @@ def _lock_symbol(session: Session, network: str, symbol: str) -> None:
     may run alongside — or after — the new leader's. Under this lock each
     write sees every earlier commit of the symbol whole.
     """
-    session.execute(
+    session.execute(  # ty: ignore[deprecated]
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
         {"key": f"signal-exit:{network}:{symbol}"},
     )
@@ -180,7 +180,7 @@ def _take_pending_exit(session: Session, position: SignalPosition) -> datetime |
     ).first()
     if pending is None:
         return None
-    session.execute(
+    session.execute(  # ty: ignore[deprecated]
         update(SignalPosition)
         .where(col(SignalPosition.signal_id) == position.signal_id)
         .values(
@@ -239,7 +239,7 @@ def _record_exit(payload: dict[str, Any], network: str) -> None:
             .with_for_update()
         ).first()
         if position is None:
-            session.execute(
+            session.execute(  # ty: ignore[deprecated]
                 pg_insert(SignalExitPending)
                 .values(
                     **SignalExitPending(
@@ -433,7 +433,7 @@ async def listen_for_signals(redis: Redis, lease: Lease | None = None) -> None:
 async def _renew(redis: Redis, token: str, lease: Lease) -> bool:
     """Extend the lock if it is still ours; False if lost or unanswered."""
     sent_at = lease.now()
-    renew: Awaitable[int] = redis.eval(  # type: ignore[assignment]
+    renew: Awaitable[int] = redis.eval(  # type: ignore[assignment] # ty: ignore[invalid-assignment]
         _RENEW_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token, str(_LEADER_TTL_MS)
     )
     try:
@@ -509,7 +509,7 @@ async def run_signal_listener(redis: Redis) -> None:
         finally:
             listener.cancel()
             crashed = await _drain(redis, token, listener, lease)
-            release: Awaitable[int] = redis.eval(  # type: ignore[assignment]
+            release: Awaitable[int] = redis.eval(  # type: ignore[assignment] # ty: ignore[invalid-assignment]
                 _RELEASE_SCRIPT, 1, REDIS_LISTENER_LOCK_KEY, token
             )
             # A stalled release must not keep this worker from electing
