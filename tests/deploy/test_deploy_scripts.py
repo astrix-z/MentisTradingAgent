@@ -315,6 +315,7 @@ def server(tmp_path: Path, request: pytest.FixtureRequest) -> Server:
         "STATE": str(state),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "DEPLOY_SSH": "bash -c",
+        "DEPLOY_BRANCH": "",
         "DEPLOY_POLL_S": "0.1",
         "DEPLOY_READ_RETRY_S": "1",
         "DEPLOY_READ_PAUSE_S": "0.1",
@@ -727,6 +728,34 @@ def test_a_revision_older_than_the_catalog_key_is_refused(server: Server) -> Non
     result = server.deploy("--revision", BEFORE_CATALOG)
     assert result.returncode == 1
     assert "608cfa1" in result.stdout
+
+
+def production_remote(server: Server, tmp_path: Path, tip: str) -> None:
+    """A remote whose ``production`` branch stops at ``tip``."""
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    git("push", "-q", str(remote), f"{tip}:refs/heads/production")
+    server.env["DEPLOY_REMOTE"] = str(remote)
+    server.env["DEPLOY_BRANCH"] = "production"
+
+
+def test_a_revision_outside_the_production_branch_is_refused(
+    server: Server, tmp_path: Path
+) -> None:
+    production_remote(server, tmp_path, f"{REVISION}^")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "не в ветке production" in result.stdout
+    assert not list(server.releases.glob("stage-*"))
+    assert not any("systemd-run" in call for call in server.calls())
+
+
+def test_the_production_tip_passes_the_branch_check(
+    server: Server, tmp_path: Path
+) -> None:
+    production_remote(server, tmp_path, REVISION)
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_a_running_deploy_of_the_same_revision_is_joined(server: Server) -> None:

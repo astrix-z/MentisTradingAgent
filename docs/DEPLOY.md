@@ -56,13 +56,20 @@
 
 ## 2. Регулярный деплой (основной сценарий)
 
+Ветки: `development` — разработка (ветка по умолчанию, сюда идут PR), `stage` —
+кандидат в выпуск, `production` — то, что работает на 55.40. Код поднимается
+только вперёд: `development` → `stage` → `production`, merge через PR.
+На 2026-10-06 `production` и `stage` стоят на `567f4f8` — ревизии, выложенной
+2026-09-23 (`T0`, §3).
+
 ```sh
-git add ... && git commit -m "..."     # деплоится только закоммиченное
-./scripts/deploy.sh                    # HEAD; --revision <rev> — любая ревизия, в том числе откат
+git switch production && git pull       # деплоится только то, что есть в origin/production
+./scripts/deploy.sh                     # HEAD; --revision <rev> — откат на ревизию из истории production
 ```
 
 Скрипт (по умолчанию `DEPLOY_SERVER=192.168.55.40`, `DEPLOY_USER=jb`) локально
-только проверяет (SSH, ревизия не старше `608cfa1`, linger — §3) и загружает файлы
+только проверяет (SSH, ревизия не старше `608cfa1`, ревизия — вершина или предок
+`production` в `origin` (`DEPLOY_REMOTE`/`DEPLOY_BRANCH`), linger — §3) и загружает файлы
 **своей попытки**: артефакт ревизии в `~/apps/releases/stage-<попытка>/` и копию
 `scripts/deploy-fence.sh` из текущего дерева. Всё остальное делает **скрипт ограды на
 сервере** в юните пользователя `mentis-deploy` (`systemctl --user status mentis-deploy`),
@@ -279,7 +286,7 @@ docker compose --env-file .env.prod -f compose.yml -f compose.prod.yml start bac
 как `Default` — отказ должен быть по `16:4:1` (`15m ≠ 4 × 5m`), а не по лишним ключам.
 `T0` закрепляется первым запуском нового скрипта: `./scripts/deploy.sh --t0-revision 567f4f8`
 (§3). `T1` (09a + 01–03 без 04+) и `T2` (04–06) появятся в таблице, только если их
-выкатят отдельно; промежуточные коммиты master целями не являются.
+выкатят отдельно; промежуточные коммиты development целями не являются.
 
 **Репетиция 2026-10-05** (изолированный стенд: контейнер с systemd, sshd и своим Docker,
 `DEPLOY_SSH`; история прода воспроизведена старым скриптом — `bef05d5`, затем `567f4f8`):

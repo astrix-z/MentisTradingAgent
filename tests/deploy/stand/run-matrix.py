@@ -226,6 +226,7 @@ def deploy_env(stand: Stand, gate: Path | None = None, **extra: str) -> dict[str
     env = dict(os.environ)
     env.update(
         DEPLOY_SSH=str(stand.gated if gate is not None else stand.ssh),
+        DEPLOY_BRANCH="",
         STAND_GATE=str(gate or ""),
         DEPLOY_SERVER="stand",
         DEPLOY_COMPOSE=FAULT_COMPOSE,

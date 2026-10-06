@@ -14,6 +14,9 @@
 #   DEPLOY_SERVER=192.168.55.40   DEPLOY_USER=jb
 #   DEPLOY_COMPOSE="docker compose"   # команда compose на сервере
 #   DEPLOY_SSH                        # команда доступа к серверу вместо ssh (для тестов)
+#   DEPLOY_REMOTE=origin DEPLOY_BRANCH=production
+#                                     # выкладывается только история этой ветки
+#                                     # remote; DEPLOY_BRANCH="" — без проверки (тесты)
 #
 # Как устроено (docs/STRATEGY_PRESETS_PLAN.md §4.6 G4, docs/DEPLOY.md):
 #   Здесь — только проверки без записи и файлы СВОЕЙ попытки: артефакт ревизии
@@ -44,6 +47,8 @@ UNIT="mentis-deploy"
 CATALOG_SINCE="608cfa1"
 WAIT_TIMEOUT_S="${DEPLOY_WAIT_TIMEOUT_S:-3600}"
 READ_RETRY_S="${DEPLOY_READ_RETRY_S:-30}"
+DEPLOY_REMOTE="${DEPLOY_REMOTE:-origin}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH-production}"
 POLL_S="${DEPLOY_POLL_S:-3}"
 READ_PAUSE_S="${DEPLOY_READ_PAUSE_S:-2}"
 #: Предел одного удалённого вызова и загрузки артефакта (R126).
@@ -99,6 +104,14 @@ if [[ "$REV_ARG" == HEAD && -n "$(git status --porcelain)" && "$ALLOW_DIRTY" -ne
 fi
 git merge-base --is-ancestor "$CATALOG_SINCE" "$REVISION" 2>/dev/null \
   || die "ревизия $REVISION старше $CATALOG_SINCE: её агент не публикует agent:strategies, G4 не пройдёт"
+# На сервере работает ветка production: цель — её вершина или предок (откат),
+# по состоянию remote, а не локальной ветки, которую никто не пушил.
+if [[ -n "$DEPLOY_BRANCH" ]]; then
+  git fetch -q "$DEPLOY_REMOTE" "$DEPLOY_BRANCH" \
+    || die "не удалось получить ${DEPLOY_BRANCH} из ${DEPLOY_REMOTE}"
+  git merge-base --is-ancestor "$REVISION" FETCH_HEAD \
+    || die "ревизия $REVISION не в ветке ${DEPLOY_BRANCH} (${DEPLOY_REMOTE}): сначала влейте её в ${DEPLOY_BRANCH} и запушьте"
+fi
 if [[ -n "$T0_REVISION" ]]; then
   T0_REVISION="$(git rev-parse --short=7 "${T0_REVISION}^{commit}" 2>/dev/null)" \
     || die "нет такой ревизии T0"

@@ -3,7 +3,9 @@ name: Test Docker Compose
 on:
   push:
     branches:
-      - master
+      - development
+      - stage
+      - production
   pull_request:
 permissions:
   contents: read
