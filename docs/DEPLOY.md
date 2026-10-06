@@ -67,6 +67,28 @@ git switch production && git pull       # деплоится только то, 
 ./scripts/deploy.sh                     # HEAD; --revision <rev> — откат на ревизию из истории production
 ```
 
+Прямой `git push` в `production` и `stage` запрещён — эти ветки меняются только
+merge PR. Запрет держится на договорённости: защита веток на GitHub для
+приватного репозитория без Pro недоступна (API отвечает `403`).
+
+### Хотфикс
+
+Исправление прода идёт мимо `development` и `stage`, но тоже через PR:
+
+```sh
+git switch -c hotfix/<что-чиним> origin/production   # от того, что работает на сервере
+# исправление, коммит
+git push -u origin hotfix/<что-чиним>
+gh pr create --base production --fill
+gh pr merge --merge
+git switch production && git pull && ./scripts/deploy.sh
+```
+
+Затем исправление возвращается назад, иначе следующий выпуск его затрёт: merge
+`production` → `stage` и `stage` → `development` (через PR, конфликты решаются в
+ветке PR). Если сервер нужно спасти раньше, чем готово исправление, — откат без
+push: `./scripts/deploy.sh --revision <предыдущая ревизия production>` (§6).
+
 Скрипт (по умолчанию `DEPLOY_SERVER=192.168.55.40`, `DEPLOY_USER=jb`) локально
 только проверяет (SSH, ревизия не старше `608cfa1`, ревизия — вершина или предок
 `production` в `origin` (`DEPLOY_REMOTE`/`DEPLOY_BRANCH`), linger — §3) и загружает файлы
