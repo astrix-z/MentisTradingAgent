@@ -20,4 +20,4 @@ async def request_validation_error(
 
 
 def install_error_handlers(app: FastAPI) -> None:
-    app.add_exception_handler(RequestValidationError, request_validation_error)  # type: ignore[arg-type]
+    app.add_exception_handler(RequestValidationError, request_validation_error)  # type: ignore[arg-type] # ty: ignore[invalid-argument-type]

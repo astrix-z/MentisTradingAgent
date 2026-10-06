@@ -427,10 +427,12 @@ export class TradingService {
      * ENTRY-signal-derived virtual positions (see `SignalPositionPublic`).
      *
      * Recorded by ``app.core.signal_listener`` as ENTRY signals arrive on
-     * ``agent:events``; a still-``open`` row is closed here, lazily, the first
-     * time a read observes the last known price having crossed its stop or take
-     * level — this endpoint is the only place that evaluates/persists that
-     * transition, so "closed" always reflects what a viewer actually saw.
+     * ``agent:events``, and closed there by the agent's EXIT: the 1m bar where
+     * the price first crossed the stop or the take, and that price (the agent
+     * alone reads the exchange). As a fallback for an EXIT that never arrived, a
+     * still-``open`` row is also closed here the first time a read sees the last
+     * known price beyond a level (``closed_by = "view"``); a later EXIT corrects
+     * it.
      */
     public static listPositions<ThrowOnError extends boolean = true>(options?: Options<tradingListPositionsData, ThrowOnError>) {
         return (options?.client ?? client).get<tradingListPositionsResponses, unknown, ThrowOnError>({
