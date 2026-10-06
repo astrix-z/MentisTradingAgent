@@ -14,7 +14,9 @@ import type {
   TradingStatus,
   WorkingSymbols,
 } from "../../src/client"
-import strategyCatalog from "../fixtures/strategy-catalog.json"
+import strategyCatalog from "../fixtures/strategy-catalog.json" with {
+  type: "json",
+}
 
 export const firstId = "11111111-1111-4111-8111-111111111111"
 export const secondId = "22222222-2222-4222-8222-222222222222"

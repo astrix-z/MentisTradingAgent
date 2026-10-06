@@ -1,6 +1,8 @@
 import { expect, test } from "@playwright/test"
 import type { TradingStatus } from "../src/client"
-import strategyCatalog from "./fixtures/strategy-catalog.json"
+import strategyCatalog from "./fixtures/strategy-catalog.json" with {
+  type: "json",
+}
 import {
   accepted,
   at,

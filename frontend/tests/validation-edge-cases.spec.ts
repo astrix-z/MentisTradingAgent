@@ -6,7 +6,9 @@
 import { readFileSync } from "node:fs"
 import { expect, type Page, test } from "@playwright/test"
 import type { TradingStatus } from "../src/client"
-import strategyCatalog from "./fixtures/strategy-catalog.json"
+import strategyCatalog from "./fixtures/strategy-catalog.json" with {
+  type: "json",
+}
 import { accepted, expectBlocked, mock, snapshot } from "./utils/tradingMock"
 
 type Outcome =
