@@ -37,7 +37,7 @@ jobs:
           changed:
             - backend/**
             - frontend/**
-            - .env
+            - .env.example
             - compose*.yml
             - .github/workflows/playwright.yml
 
@@ -81,6 +81,8 @@ jobs:
     - name: Check frontend types
       run: bun run typecheck
       working-directory: frontend
+    # .env is not tracked; client generation and Compose read the example defaults.
+    - run: cp .env.example .env
     - run: bash scripts/generate-client.sh
     - run: docker compose build
     - run: docker compose down -v --remove-orphans
