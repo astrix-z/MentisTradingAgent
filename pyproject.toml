@@ -47,3 +47,10 @@ cummulative = "cummulative"
 mis = "mis"
 pn = "pn"
 unparseable = "unparseable"
+
+# session.execute() is deprecated in SQLModel, but exec() has no overload for
+# text(). Not inline: _regroup_by_database's source is hashed into the preset
+# pipeline version (PIPELINE_SOURCE_SHA256), so comments there would change it.
+[[tool.ty.overrides]]
+include = ["backend/app/core/builtin_presets.py"]
+rules = { deprecated = "ignore" }
