@@ -34,6 +34,8 @@ jobs:
       # [tool.mypy] and silently drops strict mode (TASKS.md T01).
       - name: Check types
         run: uv run --directory backend mypy app
+      # .env is not tracked; Compose and the backend settings read the example defaults.
+      - run: cp .env.example .env
       - run: docker compose down -v --remove-orphans
       - run: docker compose up -d --wait db mailpit
       - name: Migrate DB
