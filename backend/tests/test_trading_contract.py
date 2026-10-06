@@ -18,7 +18,8 @@ from fastapi.testclient import TestClient
 from redis.exceptions import RedisError
 
 from app.api import deps
-from app.api.routes import trading
+from app.api.errors import install_error_handlers
+from app.api.routes import presets, trading
 from app.core.security import create_access_token
 from app.core.strategy_catalog import REDIS_STRATEGIES_KEY
 from app.models import User
@@ -54,6 +55,7 @@ def catalog_payload() -> dict[str, Any]:
                 "name": "tripple_screen",
                 "label": "Triple Screen",
                 "description": "Test strategy.",
+                "legacy_keys": {"take_profit_pct": "tp_pct"},
                 "settings_schema": {
                     "type": "object",
                     "additionalProperties": False,
@@ -131,6 +133,39 @@ def catalog_payload() -> dict[str, Any]:
                 ],
             }
         ],
+        "execution": {
+            "name": "execution",
+            "label": "Execution",
+            "description": "Test execution settings.",
+            "settings_schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "title": "ExecutionSettings",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "title": "Real execution",
+                        "default": False,
+                    },
+                    "max_slippage_pct": {
+                        "anyOf": [
+                            {
+                                "type": "number",
+                                "exclusiveMinimum": 0.0,
+                                "maximum": 5.0,
+                            },
+                            {
+                                "type": "string",
+                                "pattern": "[+-]?0*\\d*\\.?\\d*",
+                            },
+                        ],
+                        "title": "Max entry slippage %",
+                        "default": "0.3",
+                    },
+                },
+            },
+            "constraints": [],
+        },
     }
 
 
@@ -177,6 +212,7 @@ class MemoryRedis:
         self.hashes: dict[str, dict[str, str]] = {}
         self.publications: list[tuple[str, dict[str, Any], str | None]] = []
         self.conflicts = 0
+        self.evals = 0
         self.fail: str | None = None
 
     async def get(self, key: str) -> str | None:
@@ -185,6 +221,11 @@ class MemoryRedis:
         raw = self.values.get(key)
         await asyncio.sleep(0)
         return raw
+
+    async def exists(self, key: str) -> int:
+        if self.fail == "get":
+            raise RedisError("read failed")
+        return int(key in self.values)
 
     async def hgetall(self, key: str) -> dict[str, str]:
         if self.fail == "get":
@@ -218,18 +259,25 @@ class MemoryRedis:
         script: str,
         numkeys: int,
         key: str,
+        fence: str,
         expected: str,
         snapshot: str,
         stream: str,
         envelope: str,
         maxlen: str,
+        is_start: str,
     ) -> int:
         assert command == "EVAL"
         assert script == trading.COMMIT_RUNTIME_LUA
-        assert numkeys == 1
+        assert numkeys == 2
+        assert fence == trading.REDIS_START_FENCE_KEY
+        self.evals += 1
         await asyncio.sleep(0)
         if self.fail == "eval":
             raise RedisError("commit failed")
+        # Same order as the script: the fence first, then the snapshot CAS.
+        if is_start == "1" and fence in self.values:
+            return -1
         if self.values.get(key, "") != expected:
             self.conflicts += 1
             return 0
@@ -247,6 +295,7 @@ def redis(monkeypatch: pytest.MonkeyPatch) -> MemoryRedis:
     # declared. Tests that need "the agent has not run yet" delete this key.
     store.values[REDIS_STRATEGIES_KEY] = json.dumps(catalog_payload())
     monkeypatch.setattr(trading, "get_redis", lambda: store)
+    monkeypatch.setattr(presets, "get_redis", lambda: store)
     monkeypatch.setattr(trading, "_now", lambda: NOW)
     return store
 
@@ -254,7 +303,9 @@ def redis(monkeypatch: pytest.MonkeyPatch) -> MemoryRedis:
 @pytest.fixture
 def client(redis: MemoryRedis) -> Iterator[TestClient]:
     app = FastAPI()
+    install_error_handlers(app)
     app.include_router(trading.router, prefix="/api/v1")
+    app.include_router(presets.router, prefix="/api/v1")
     users = {
         "admin": User(
             email="admin@example.com", hashed_password="unused", is_superuser=True
@@ -267,12 +318,16 @@ def client(redis: MemoryRedis) -> Iterator[TestClient]:
     session.get.side_effect = lambda _model, user_id: next(
         (user for user in users.values() if str(user.id) == user_id), None
     )
+    # No option lists (plan §4.3.5 step 5 checks nothing then); the preset
+    # runner of test_validation_edge_cases stores the fixture's lists instead.
+    session.exec.return_value.all.return_value = []
     app.dependency_overrides[deps.get_db] = lambda: session
     with TestClient(app) as test_client:
         test_client.app_state["tokens"] = {
             role: create_access_token(user.id, timedelta(minutes=5))
             for role, user in users.items()
         }
+        test_client.app_state["session"] = session
         yield test_client
     assert redis is not None
 
@@ -334,6 +389,37 @@ def test_status_keeps_desired_and_actual_separate(
     }
 
 
+def test_status_passes_execution_alerts_without_the_account(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    alert = "order mta-0123456789abcdef01234567-e1 (BTCUSDT) outcome unknown"
+    # As ``Engine.publish_heartbeat`` writes it.
+    redis.values[trading.REDIS_HEARTBEAT_KEY] = json.dumps(
+        {
+            "state": "running",
+            "message": f"execution: unknown: {alert}",
+            "execution": {
+                "mode": "enabled",
+                "account": "1001",
+                "network": "live",
+                "leader": True,
+                "open_positions": 0,
+                "alerts": {"unknown": alert},
+            },
+            "network": "live",
+            "updated_at": NOW.isoformat(),
+        }
+    )
+    response = client.get("/api/v1/trading/status/", headers=headers(client))
+    assert response.status_code == 200
+    assert response.json()["actual"]["execution"] == {
+        "mode": "enabled",
+        "leader": True,
+        "open_positions": 0,
+        "alerts": {"unknown": alert},
+    }
+
+
 def test_missing_heartbeat_is_not_confirmed_running(
     client: TestClient,
     redis: MemoryRedis,
@@ -366,6 +452,7 @@ def test_start_stop_preserves_form_and_increments_revision(
     assert status["desired"] == {
         **START,
         "symbols": ["BTCUSDT"],
+        "execution": {},
         "running": False,
         "last_command": "stop",
         "updated_at": "2026-09-12T00:00:00Z",
@@ -600,6 +687,148 @@ def test_cross_field_rejection_carries_the_published_message(
     assert not redis.publications
 
 
+def test_start_errors_point_at_body_params(
+    client: TestClient,
+    redis: MemoryRedis,
+) -> None:
+    """Field, rule and unknown-key errors share one location scheme (§4.3.4)."""
+    for path, body in (
+        ("/api/v1/trading/start/", {**START, "params": {"tp_pct": True}}),
+        (
+            "/api/v1/trading/commands/",
+            {"type": "start", "payload": {**START, "params": {"tp_pct": True}}},
+        ),
+    ):
+        response = client.post(path, json=body, headers=headers(client))
+        assert response.status_code == 422
+        assert [error["loc"] for error in response.json()["detail"]] == [
+            ["body", "params", "tp_pct"]
+        ]
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "params": {"kline_window": 10}},
+        headers=headers(client),
+    )
+    assert [error["loc"] for error in response.json()["detail"]] == [["body", "params"]]
+    assert not redis.publications
+
+
+@pytest.mark.parametrize(
+    ("execution", "field", "kind"),
+    [
+        ({"enabled": "true"}, "enabled", "bool_type"),
+        ({"enabled": 1}, "enabled", "bool_type"),
+    ],
+)
+def test_execution_settings_are_strict_too(
+    client: TestClient,
+    redis: MemoryRedis,
+    execution: dict[str, Any],
+    field: str,
+    kind: str,
+) -> None:
+    """R69: the compiler is shared, so execution gets the same wire types."""
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "execution": execution},
+        headers=headers(client),
+    )
+    assert response.status_code == 422
+    assert [(e["loc"], e["type"]) for e in response.json()["detail"]] == [
+        (["body", "execution", field], kind)
+    ]
+    assert not redis.publications
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        '{"tp_pct": NaN}',
+        '{"tp_pct": Infinity}',
+        '{"ema_tide_periods": [5, 13, Infinity]}',
+    ],
+)
+def test_non_finite_literals_are_a_422_not_a_500(
+    client: TestClient,
+    redis: MemoryRedis,
+    literal: str,
+) -> None:
+    """R74: Python's JSON parser accepts NaN/Infinity; the answer must be a 422."""
+    body = json.dumps({**START, "params": {}}).replace(
+        '"params": {}', f'"params": {literal}'
+    )
+    response = client.post(
+        "/api/v1/trading/start/",
+        content=body,
+        headers={**headers(client), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert not redis.publications
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        (
+            "/api/v1/trading/start/",
+            json.dumps(START).replace('["btcusdt"]', "[NaN]"),
+        ),
+        ("/api/v1/trading/commands/", '{"type": "start", "payload": NaN}'),
+    ],
+)
+def test_non_finite_literals_in_the_wrapper_are_a_422_not_a_500(
+    client: TestClient,
+    redis: MemoryRedis,
+    path: str,
+    body: str,
+) -> None:
+    """R79: FastAPI's own 422 could not write a NaN ``input``; now it can."""
+    response = client.post(
+        path,
+        content=body,
+        headers={**headers(client), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422, response.text
+    assert "NaN" not in response.text.replace('"nan"', "")
+    assert not redis.publications
+
+
+def test_an_integer_too_long_to_parse_is_refused_without_enqueue(
+    client: TestClient,
+    redis: MemoryRedis,
+) -> None:
+    """R70: 4301 digits exceed Python's int parsing limit; the body is a 400."""
+    body = json.dumps({**START, "params": {"kline_window": 0}}).replace(
+        '"kline_window": 0', '"kline_window": ' + "9" * 4301
+    )
+    response = client.post(
+        "/api/v1/trading/start/",
+        content=body,
+        headers={**headers(client), "Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+def test_a_renamed_parameter_is_refused_with_a_reload_hint(
+    client: TestClient,
+    redis: MemoryRedis,
+) -> None:
+    """An open tab from before a rename still sends the old name (plan G2)."""
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "params": {"take_profit_pct": 12, "tp_pct": 12}},
+        headers=headers(client),
+    )
+    assert response.status_code == 422
+    assert [error["msg"] for error in response.json()["detail"]] == [
+        "parameter 'take_profit_pct' was renamed to 'tp_pct'; reload the page"
+    ]
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
 def test_start_is_refused_when_no_catalog_is_published(
     client: TestClient,
     redis: MemoryRedis,
@@ -655,6 +884,7 @@ def test_strategies_endpoint_serves_the_published_catalog(
         "Take profit %"
     )
     assert len(entry["constraints"]) == 3
+    assert entry["legacy_keys"] == {"take_profit_pct": "tp_pct"}
 
 
 def test_strategies_endpoint_reports_a_missing_agent_without_erroring(
@@ -1083,3 +1313,197 @@ def test_indicator_snapshot_documents_the_agent_result_shape() -> None:
         }
     )
     assert snapshot.rows[0].groups["tide"].values["ema_fast"].current == "64210.5"
+
+
+def test_start_carries_validated_execution_settings(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "execution": {"enabled": True, "max_slippage_pct": "0.5"}},
+        headers=headers(client),
+    )
+    assert response.status_code == 202
+    assert response.json()["payload"]["execution"] == {
+        "enabled": True,
+        "max_slippage_pct": "0.5",
+    }
+    snapshot = json.loads(redis.values[trading.REDIS_RUNTIME_KEY])
+    assert snapshot["execution"] == {"enabled": True, "max_slippage_pct": "0.5"}
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        {"max_slippage_pct": 50},
+        {"enabled": "sometimes"},
+        {"no_such_setting": 1},
+    ],
+)
+def test_invalid_execution_settings_are_rejected_before_redis(
+    client: TestClient, redis: MemoryRedis, execution: dict[str, Any]
+) -> None:
+    response = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "execution": execution},
+        headers=headers(client),
+    )
+    assert response.status_code == 422
+    assert all(
+        error["loc"][:2] == ["body", "execution"] for error in response.json()["detail"]
+    )
+    assert not redis.publications
+
+
+def test_execution_settings_need_a_published_execution_section(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    catalog = catalog_payload()
+    del catalog["execution"]
+    redis.values[REDIS_STRATEGIES_KEY] = json.dumps(catalog)
+    refused = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "execution": {"enabled": True}},
+        headers=headers(client),
+    )
+    assert refused.status_code == 503
+    plain = client.post("/api/v1/trading/start/", json=START, headers=headers(client))
+    assert plain.status_code == 202
+
+
+@pytest.mark.parametrize("command", ["execution_pause", "execution_resume"])
+def test_execution_pause_and_resume_do_not_touch_the_running_intent(
+    client: TestClient, redis: MemoryRedis, command: str
+) -> None:
+    response = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": command, "payload": {}},
+        headers=headers(client),
+    )
+    assert response.status_code == 202
+    assert redis.publications[0][1]["type"] == command
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+def test_close_position_needs_a_valid_symbol(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    refused = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": "close_position", "payload": {"symbol": "not a symbol"}},
+        headers=headers(client),
+    )
+    assert refused.status_code == 422 and not redis.publications
+    accepted = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": "close_position", "payload": {"symbol": "btcusdt"}},
+        headers=headers(client),
+    )
+    assert accepted.status_code == 202
+    assert redis.publications[0][1]["payload"] == {"symbol": "BTCUSDT"}
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+def test_release_entry_needs_an_entry_client_id(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    for cid in ("", "web_manual_1", "mta-0123456789abcdef01234567-pl1"):
+        refused = client.post(
+            "/api/v1/trading/commands/",
+            json={"type": "release_entry", "payload": {"client_order_id": cid}},
+            headers=headers(client),
+        )
+        assert refused.status_code == 422, cid
+    assert not redis.publications
+    cid = "mta-0123456789abcdef01234567-e1"
+    accepted = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": "release_entry", "payload": {"client_order_id": f" {cid} "}},
+        headers=headers(client),
+    )
+    assert accepted.status_code == 202
+    assert redis.publications[0][1]["payload"] == {"client_order_id": cid}
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+# --- Start fence (plan §4.6 G4, PRESET-09a) -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        ("/api/v1/trading/start/", START),
+        ("/api/v1/trading/commands/", {"type": "start", "payload": START}),
+    ],
+)
+def test_the_start_fence_refuses_both_start_routes_early(
+    client: TestClient, redis: MemoryRedis, path: str, body: dict[str, Any]
+) -> None:
+    redis.values[trading.REDIS_START_FENCE_KEY] = "deploy abc1234 at 2026-09-28"
+    response = client.post(path, json=body, headers=headers(client))
+    assert response.status_code == 503
+    assert response.json()["detail"] == "starting is closed for maintenance"
+    assert redis.evals == 0  # refused before validation and the commit
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        ("/api/v1/trading/start/", START),
+        ("/api/v1/trading/commands/", {"type": "start", "payload": START}),
+    ],
+)
+def test_a_start_validated_before_the_fence_is_refused_at_the_write(
+    client: TestClient,
+    redis: MemoryRedis,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    body: dict[str, Any],
+) -> None:
+    """The early check passed; the fence is set while the Start is validated.
+
+    The script refuses it in the one EVAL that would have written it: code -1,
+    no retry, nothing in the stream or the runtime snapshot.
+    """
+    real = trading._enforce_strategy_params
+
+    async def fence_meanwhile(*args: Any) -> None:
+        await real(*args)
+        redis.values[trading.REDIS_START_FENCE_KEY] = "deploy"
+
+    monkeypatch.setattr(trading, "_enforce_strategy_params", fence_meanwhile)
+    response = client.post(path, json=body, headers=headers(client))
+    assert response.status_code == 503
+    assert redis.evals == 1
+    assert not redis.publications
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
+def test_stop_is_written_while_the_fence_stands(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    assert (
+        client.post(
+            "/api/v1/trading/start/", json=START, headers=headers(client)
+        ).status_code
+        == 202
+    )
+    redis.values[trading.REDIS_START_FENCE_KEY] = "deploy"
+    response = client.post("/api/v1/trading/stop/", headers=headers(client))
+    assert response.status_code == 202
+    snapshot = json.loads(redis.values[trading.REDIS_RUNTIME_KEY])
+    assert (snapshot["running"], snapshot["last_command"]) == (False, "stop")
+    assert [p[1]["type"] for p in redis.publications] == ["start", "stop"]
+
+
+def test_the_fence_check_fails_closed_when_redis_fails(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    redis.fail = "get"
+    response = client.post(
+        "/api/v1/trading/start/", json=START, headers=headers(client)
+    )
+    assert response.status_code == 503
+    assert not redis.publications

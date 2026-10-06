@@ -1,0 +1,3399 @@
+{
+  "$comment": "Граничные случаи валидации params, общие для агента, backend и UI (docs/STRATEGY_PRESETS_PLAN.md §6). Раннеры: agent/tests/test_validation_edge_cases.py, backend/tests/test_validation_edge_cases.py; frontend/tests/validation-edge-cases.spec.ts (UI).",
+  "baseline": {
+    "catalog": "frontend/tests/fixtures/strategy-catalog.json",
+    "options": {
+      "quote_asset": [
+        "USDT",
+        "USDC"
+      ],
+      "tide_interval": [
+        "1w",
+        "1d",
+        "12h",
+        "6h",
+        "4h",
+        "2h",
+        "1h",
+        "30m",
+        "15m"
+      ],
+      "wave_interval": [
+        "1d",
+        "12h",
+        "6h",
+        "4h",
+        "2h",
+        "1h",
+        "30m",
+        "15m",
+        "5m"
+      ],
+      "ripple_interval": [
+        "12h",
+        "6h",
+        "4h",
+        "2h",
+        "1h",
+        "30m",
+        "15m",
+        "5m",
+        "1m"
+      ]
+    },
+    "params": {
+      "quote_asset": "USDT",
+      "tide_interval": "4h",
+      "wave_interval": "1h",
+      "ripple_interval": "15m",
+      "ema_tide_periods": [
+        5,
+        13,
+        34
+      ],
+      "stochastic_k_period": 5,
+      "stochastic_d_period": 3,
+      "stochastic_slow_period": 3,
+      "fi_ema_period": 2,
+      "oversold_threshold": "20",
+      "swing_low_wave_n": 2,
+      "trail_ripple_n": 2,
+      "stop_buffer_pct": "0.1",
+      "min_stop_distance_pct": "1",
+      "tp_pct": "10",
+      "trail_cap_pct": "4",
+      "max_hold_hours": "8",
+      "cooldown_minutes": 60,
+      "signal_validity_minutes": 15,
+      "rest_concurrency": 3,
+      "ws_top_n": 30,
+      "kline_window": 1000
+    },
+    "symbols": [
+      "BTCUSDT"
+    ],
+    "network": "testnet"
+  },
+  "error_map": {
+    "agent": {
+      "types": {
+        "greater_than": "bound",
+        "greater_than_equal": "bound",
+        "less_than": "bound",
+        "less_than_equal": "bound",
+        "int_type": "type",
+        "int_parsing": "type",
+        "int_from_float": "type",
+        "decimal_type": "type",
+        "decimal_parsing": "type",
+        "finite_number": "type",
+        "too_short": "type",
+        "too_long": "type",
+        "tuple_type": "type",
+        "literal_error": "unsupported",
+        "missing": "type"
+      },
+      "messages": [
+        {
+          "pattern": "renamed to .* disagree",
+          "category": "legacy_conflict"
+        },
+        {
+          "pattern": "interval .* is not supported",
+          "category": "unsupported"
+        },
+        {
+          "pattern": "EMA periods must|timeframes must|trailing stop cap|kline_window must be at least",
+          "category": "constraint"
+        }
+      ],
+      "envelope": {
+        "agent_command": {
+          "pattern": "dropping malformed command envelope",
+          "category": "invalid_json"
+        },
+        "agent_resume": {
+          "pattern": "ignoring malformed runtime snapshot",
+          "category": "invalid_json"
+        }
+      }
+    },
+    "backend": {
+      "types": {
+        "greater_than": "bound",
+        "greater_than_equal": "bound",
+        "less_than": "bound",
+        "less_than_equal": "bound",
+        "int_type": "type",
+        "int_parsing": "type",
+        "int_from_float": "type",
+        "float_type": "type",
+        "float_parsing": "type",
+        "decimal_type": "type",
+        "decimal_parsing": "type",
+        "finite_number": "type",
+        "too_short": "type",
+        "too_long": "type",
+        "list_type": "type",
+        "json_invalid": "invalid_json",
+        "too_large": "too_large",
+        "unsupported_value": "unsupported",
+        "option_value": "option",
+        "string_type": "type",
+        "bool_type": "type"
+      },
+      "messages": [
+        {
+          "pattern": "^unknown parameter|was renamed to",
+          "category": "unknown_param"
+        },
+        {
+          "pattern": "EMA tide periods must|timeframes must|trailing stop cap|kline_window must be at least",
+          "category": "constraint"
+        }
+      ]
+    },
+    "ui": {
+      "$comment": "Типы ошибок UI (strategySchema.ts, IssueType) → категории; field пустой — правило формы.",
+      "types": {
+        "required": "type",
+        "integer_format": "type",
+        "unsafe_integer": "type",
+        "decimal_format": "type",
+        "item_count": "type",
+        "too_large": "too_large",
+        "bound": "bound",
+        "unsupported": "unsupported",
+        "option": "option",
+        "constraint": "constraint"
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "baseline-default",
+      "note": "Default как есть: все слои принимают",
+      "ui_draft": {},
+      "params_patch": {},
+      "params_raw": null,
+      "expected_sent": {},
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": {
+          "result": "ok"
+        },
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "empty-params",
+      "note": "{} — все поля по дефолтам агента",
+      "ui_draft": null,
+      "params_patch": null,
+      "params_raw": "{}",
+      "expected_sent": null,
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "int-zero",
+      "note": "0 в поле PositiveInt",
+      "ui_draft": {
+        "stochastic_k_period": "0"
+      },
+      "params_patch": {
+        "stochastic_k_period": 0
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stochastic_k_period"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "int-negative",
+      "note": "-1 в поле PositiveInt",
+      "ui_draft": {
+        "fi_ema_period": "-1"
+      },
+      "params_patch": {
+        "fi_ema_period": -1
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "fi_ema_period"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "ema-two-items",
+      "note": "EMA из двух элементов",
+      "ui_draft": {
+        "ema_tide_periods": "5, 13"
+      },
+      "params_patch": {
+        "ema_tide_periods": [
+          5,
+          13
+        ]
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "ema-four-items",
+      "note": "EMA из четырёх элементов",
+      "ui_draft": {
+        "ema_tide_periods": "5, 13, 34, 55"
+      },
+      "params_patch": {
+        "ema_tide_periods": [
+          5,
+          13,
+          34,
+          55
+        ]
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "ema-not-increasing",
+      "note": "EMA [5, 5, 13]: правило a < b < c",
+      "ui_draft": {
+        "ema_tide_periods": "5, 5, 13"
+      },
+      "params_patch": {
+        "ema_tide_periods": [
+          5,
+          5,
+          13
+        ]
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "trail-cap-at-tp",
+      "note": "trail_cap_pct == tp_pct: правило cap < tp",
+      "ui_draft": {
+        "trail_cap_pct": "10"
+      },
+      "params_patch": {
+        "trail_cap_pct": "10"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "kline-window-short",
+      "note": "kline_window ниже требуемой истории",
+      "ui_draft": {
+        "kline_window": "10"
+      },
+      "params_patch": {
+        "kline_window": 10
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "future-param",
+      "note": "Неизвестный ключ",
+      "ui_draft": null,
+      "params_patch": {
+        "future_param": 42
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "extras: the agent ignores unknown keys (a command may carry shared keys), the backend rejects them in a Start"
+    },
+    {
+      "id": "legacy-old-only",
+      "note": "Только старые имена: значения переносятся",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_wave_n": {
+          "$delete": true
+        },
+        "trail_ripple_n": {
+          "$delete": true
+        },
+        "swing_low_h1_n": 7,
+        "trail_m15_n": 9
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "swing_low_wave_n": 7,
+        "trail_ripple_n": 9
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-old-zero",
+      "note": "Только старое имя со значением 0: ошибка, не дефолт",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_wave_n": {
+          "$delete": true
+        },
+        "swing_low_h1_n": 0
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-both-equal",
+      "note": "Оба имени, 7 и 7: берётся новое",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": 7,
+        "swing_low_wave_n": 7
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "swing_low_wave_n": 7
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-both-zero",
+      "note": "Оба имени, 0 и 0: ошибка поля",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": 0,
+        "swing_low_wave_n": 0
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            },
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            },
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            },
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            },
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "swing_low_wave_n"
+            }
+          ]
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-conflict",
+      "note": "Оба имени, 7 и 9: конфликт",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": 7,
+        "swing_low_wave_n": 9
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "legacy-string-equals-int",
+      "note": "Оба имени, \"7\" и 7: равны после валидации",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": "7",
+        "swing_low_wave_n": 7
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "swing_low_wave_n": 7
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "old-js-payload",
+      "note": "Старая вкладка: старые 7/9 из savedParams и новые 2/2",
+      "ui_draft": null,
+      "params_patch": {
+        "swing_low_h1_n": 7,
+        "trail_m15_n": 9,
+        "swing_low_wave_n": 2,
+        "trail_ripple_n": 2
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unknown_param",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "legacy_conflict",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": "legacy keys: the agent translates old names (a runtime snapshot or a queued command may carry them); the backend rejects them in a new Start with a reload hint, and the UI never sends them"
+    },
+    {
+      "id": "invalid-json",
+      "note": "Невалидный JSON: отказ конверта до валидации настроек",
+      "ui_draft": null,
+      "params_patch": null,
+      "params_raw": "{\"swing_low_wave_n\": ",
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": "n/a",
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "invalid_json",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "int-hex-string",
+      "note": "\"0x10\" в целом поле",
+      "ui_draft": {
+        "stochastic_k_period": "0x10"
+      },
+      "params_patch": {
+        "stochastic_k_period": "0x10"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "decimal-infinity-string",
+      "note": "\"Infinity\" в decimal-поле",
+      "ui_draft": {
+        "tp_pct": "Infinity"
+      },
+      "params_patch": {
+        "tp_pct": "Infinity"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "int-float-exponent",
+      "note": "1e3 JSON-числом в целом поле",
+      "ui_draft": {
+        "kline_window": "1e3"
+      },
+      "params_patch": null,
+      "params_raw": "{\"quote_asset\": \"USDT\", \"tide_interval\": \"4h\", \"wave_interval\": \"1h\", \"ripple_interval\": \"15m\", \"ema_tide_periods\": [5, 13, 34], \"stochastic_k_period\": 5, \"stochastic_d_period\": 3, \"stochastic_slow_period\": 3, \"fi_ema_period\": 2, \"oversold_threshold\": \"20\", \"swing_low_wave_n\": 2, \"trail_ripple_n\": 2, \"stop_buffer_pct\": \"0.1\", \"min_stop_distance_pct\": \"1\", \"tp_pct\": \"10\", \"trail_cap_pct\": \"4\", \"max_hold_hours\": \"8\", \"cooldown_minutes\": 60, \"signal_validity_minutes\": 15, \"rest_concurrency\": 3, \"ws_top_n\": 30, \"kline_window\": 1e3}",
+      "expected_sent": null,
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "kline_window"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "kline_window"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "kline_window"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "kline_window"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "kline_window"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "lax types: the agent's internal path accepts what pydantic coerces (bool, numeric strings, whole floats); the backend and UI take only the declared wire type"
+    },
+    {
+      "id": "int-leading-space",
+      "note": "\" 5\" в целом поле",
+      "ui_draft": {
+        "stochastic_k_period": " 5"
+      },
+      "params_patch": {
+        "stochastic_k_period": " 5"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "lax types: the agent's internal path accepts what pydantic coerces (bool, numeric strings, whole floats); the backend and UI take only the declared wire type"
+    },
+    {
+      "id": "int-true",
+      "note": "true в целом поле",
+      "ui_draft": null,
+      "params_patch": {
+        "stochastic_slow_period": true
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "stochastic_slow_period": 1
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_slow_period"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_slow_period"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_slow_period"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_slow_period"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "lax types: the agent's internal path accepts what pydantic coerces (bool, numeric strings, whole floats); the backend and UI take only the declared wire type"
+    },
+    {
+      "id": "int-null",
+      "note": "null в целом поле",
+      "ui_draft": null,
+      "params_patch": {
+        "fi_ema_period": null
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "fi_ema_period"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "fi_ema_period"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "decimal-bool",
+      "note": "true в decimal-поле: все слои — type (агент тоже не принимает bool как Decimal)",
+      "ui_draft": null,
+      "params_patch": {
+        "tp_pct": true
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "decimal-nan-literal",
+      "note": "литерал NaN (json.loads его принимает) в decimal-поле: type на всех слоях, не 500",
+      "ui_draft": null,
+      "params_patch": null,
+      "params_raw": "{\"quote_asset\": \"USDT\", \"tide_interval\": \"4h\", \"wave_interval\": \"1h\", \"ripple_interval\": \"15m\", \"ema_tide_periods\": [5, 13, 34], \"stochastic_k_period\": 5, \"stochastic_d_period\": 3, \"stochastic_slow_period\": 3, \"fi_ema_period\": 2, \"oversold_threshold\": \"20\", \"swing_low_wave_n\": 2, \"trail_ripple_n\": 2, \"stop_buffer_pct\": \"0.1\", \"min_stop_distance_pct\": \"1\", \"tp_pct\": NaN, \"trail_cap_pct\": \"4\", \"max_hold_hours\": \"8\", \"cooldown_minutes\": 60, \"signal_validity_minutes\": 15, \"rest_concurrency\": 3, \"ws_top_n\": 30, \"kline_window\": 1000}",
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "tp_pct"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "int-numeric-string",
+      "note": "\"5\" в целом поле",
+      "ui_draft": null,
+      "params_patch": {
+        "stochastic_slow_period": "5"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "stochastic_slow_period": 5
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_slow_period"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_slow_period"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_slow_period"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_slow_period"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "lax types: the agent's internal path accepts what pydantic coerces (bool, numeric strings, whole floats); the backend and UI take only the declared wire type"
+    },
+    {
+      "id": "ema-item-string",
+      "note": "строка в элементе EMA",
+      "ui_draft": null,
+      "params_patch": {
+        "ema_tide_periods": [
+          5,
+          "13",
+          34
+        ]
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "lax types: the agent's internal path accepts what pydantic coerces (bool, numeric strings, whole floats); the backend and UI take only the declared wire type"
+    },
+    {
+      "id": "ema-item-float",
+      "note": "13.0 в элементе EMA",
+      "ui_draft": null,
+      "params_patch": null,
+      "params_raw": "{\"quote_asset\": \"USDT\", \"tide_interval\": \"4h\", \"wave_interval\": \"1h\", \"ripple_interval\": \"15m\", \"ema_tide_periods\": [5, 13.0, 34], \"stochastic_k_period\": 5, \"stochastic_d_period\": 3, \"stochastic_slow_period\": 3, \"fi_ema_period\": 2, \"oversold_threshold\": \"20\", \"swing_low_wave_n\": 2, \"trail_ripple_n\": 2, \"stop_buffer_pct\": \"0.1\", \"min_stop_distance_pct\": \"1\", \"tp_pct\": \"10\", \"trail_cap_pct\": \"4\", \"max_hold_hours\": \"8\", \"cooldown_minutes\": 60, \"signal_validity_minutes\": 15, \"rest_concurrency\": 3, \"ws_top_n\": 30, \"kline_window\": 1000}",
+      "expected_sent": null,
+      "expected_normalized": {},
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "ema_tide_periods"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "lax types: the agent's internal path accepts what pydantic coerces (bool, numeric strings, whole floats); the backend and UI take only the declared wire type"
+    },
+    {
+      "id": "unsafe-integer",
+      "note": "9007199254740993: точно у агента и backend, UI строже (не safe integer)",
+      "ui_draft": {
+        "kline_window": "9007199254740993"
+      },
+      "params_patch": null,
+      "params_raw": "{\"quote_asset\": \"USDT\", \"tide_interval\": \"4h\", \"wave_interval\": \"1h\", \"ripple_interval\": \"15m\", \"ema_tide_periods\": [5, 13, 34], \"stochastic_k_period\": 5, \"stochastic_d_period\": 3, \"stochastic_slow_period\": 3, \"fi_ema_period\": 2, \"oversold_threshold\": \"20\", \"swing_low_wave_n\": 2, \"trail_ripple_n\": 2, \"stop_buffer_pct\": \"0.1\", \"min_stop_distance_pct\": \"1\", \"tp_pct\": \"10\", \"trail_cap_pct\": \"4\", \"max_hold_hours\": \"8\", \"cooldown_minutes\": 60, \"signal_validity_minutes\": 15, \"rest_concurrency\": 3, \"ws_top_n\": 30, \"kline_window\": 9007199254740993}",
+      "expected_sent": null,
+      "expected_normalized": {
+        "kline_window": 9007199254740993
+      },
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "kline_window"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "decimal-precision-string",
+      "note": "99.999999999999999999 строкой: ge 0, lt 100 — допустимо",
+      "ui_draft": {
+        "stop_buffer_pct": "99.999999999999999999"
+      },
+      "params_patch": {
+        "stop_buffer_pct": "99.999999999999999999"
+      },
+      "params_raw": null,
+      "expected_sent": {
+        "stop_buffer_pct": "99.999999999999999999"
+      },
+      "expected_normalized": {
+        "stop_buffer_pct": "99.999999999999999999"
+      },
+      "outcomes": {
+        "ui": {
+          "result": "ok"
+        },
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "decimal-precision-number",
+      "note": "тот же литерал JSON-числом: json.loads даёт 100.0, это lt 100 — ошибка",
+      "ui_draft": null,
+      "params_patch": null,
+      "params_raw": "{\"quote_asset\": \"USDT\", \"tide_interval\": \"4h\", \"wave_interval\": \"1h\", \"ripple_interval\": \"15m\", \"ema_tide_periods\": [5, 13, 34], \"stochastic_k_period\": 5, \"stochastic_d_period\": 3, \"stochastic_slow_period\": 3, \"fi_ema_period\": 2, \"oversold_threshold\": \"20\", \"swing_low_wave_n\": 2, \"trail_ripple_n\": 2, \"stop_buffer_pct\": 99.999999999999999999, \"min_stop_distance_pct\": \"1\", \"tp_pct\": \"10\", \"trail_cap_pct\": \"4\", \"max_hold_hours\": \"8\", \"cooldown_minutes\": 60, \"signal_validity_minutes\": 15, \"rest_concurrency\": 3, \"ws_top_n\": 30, \"kline_window\": 1000}",
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "interval-unsupported",
+      "note": "ripple_interval=\"1M\": агент такой интервал не обслуживает",
+      "ui_draft": {
+        "ripple_interval": "1M"
+      },
+      "params_patch": {
+        "ripple_interval": "1M"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unsupported",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unsupported",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unsupported",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unsupported",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unsupported",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unsupported",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unsupported",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "unsupported",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": "the agent reports an unsupported interval from its cross-field validator, without a field; the backend reports it on the field"
+    },
+    {
+      "id": "option-ripple-outside-list",
+      "note": "Интервал из S, но не из baseline-списка ripple (T2): отказ по списку, шаг 5",
+      "ui_draft": null,
+      "params_patch": {
+        "ripple_interval": "3m"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "ripple_interval": "3m"
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "option",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "option",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "option",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "option",
+              "field": "ripple_interval"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "option lists live in the backend database (plan §4.3.5 step 5); the agent checks only S"
+    },
+    {
+      "id": "arithmetic-safe-sum",
+      "note": "k + d + slow − 2 = 9007199254740991 > kline_window: float дал бы равенство",
+      "ui_draft": {
+        "stochastic_k_period": "4503599627370495",
+        "stochastic_d_period": "4503599627370495",
+        "stochastic_slow_period": "3",
+        "kline_window": "9007199254740990"
+      },
+      "params_patch": {
+        "stochastic_k_period": 4503599627370495,
+        "stochastic_d_period": 4503599627370495,
+        "stochastic_slow_period": 3,
+        "kline_window": 9007199254740990
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "arithmetic-1e28",
+      "note": "k=10^28, d=1, slow=3, kline_window=10^28: при 28 знаках Decimal округлил бы и пропустил",
+      "ui_draft": {
+        "stochastic_k_period": "10000000000000000000000000000",
+        "stochastic_d_period": "1",
+        "stochastic_slow_period": "3",
+        "kline_window": "10000000000000000000000000000"
+      },
+      "params_patch": {
+        "stochastic_k_period": 10000000000000000000000000000,
+        "stochastic_d_period": 1,
+        "stochastic_slow_period": 3,
+        "kline_window": 10000000000000000000000000000
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "type",
+              "field": "stochastic_k_period"
+            },
+            {
+              "category": "type",
+              "field": "kline_window"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "constraint",
+              "field": null
+            }
+          ]
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "decimal-close-pair",
+      "note": "trail_cap_pct < tp_pct в 18-м знаке",
+      "ui_draft": {
+        "trail_cap_pct": "1.000000000000000001",
+        "tp_pct": "1.000000000000000002"
+      },
+      "params_patch": {
+        "trail_cap_pct": "1.000000000000000001",
+        "tp_pct": "1.000000000000000002"
+      },
+      "params_raw": null,
+      "expected_sent": {
+        "trail_cap_pct": "1.000000000000000001",
+        "tp_pct": "1.000000000000000002"
+      },
+      "expected_normalized": {
+        "tp_pct": "1.000000000000000002",
+        "trail_cap_pct": "1.000000000000000001"
+      },
+      "outcomes": {
+        "ui": {
+          "result": "ok"
+        },
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "domain-65-digits",
+      "note": "65 ненулевых значащих цифр в decimal-поле",
+      "ui_draft": {
+        "tp_pct": "10000000000000000000000000000000000000000000000000000000000000001"
+      },
+      "params_patch": {
+        "tp_pct": "10000000000000000000000000000000000000000000000000000000000000001"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "tp_pct": "10000000000000000000000000000000000000000000000000000000000000001"
+      },
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "numeric domain: a transport limit of the backend/UI contract (plan §4.3.5 step 1); the agent validates its own model only"
+    },
+    {
+      "id": "domain-65-digits-exponent-in",
+      "note": "\"1\"*64+\"5\": 65 значащих цифр, порядок 64 внутри [-64, 64] — ловит нормализацию с округлением (R63)",
+      "ui_draft": {
+        "tp_pct": "11111111111111111111111111111111111111111111111111111111111111115"
+      },
+      "params_patch": {
+        "tp_pct": "11111111111111111111111111111111111111111111111111111111111111115"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "tp_pct": "11111111111111111111111111111111111111111111111111111111111111115"
+      },
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "numeric domain: a transport limit of the backend/UI contract (plan §4.3.5 step 1); the agent validates its own model only"
+    },
+    {
+      "id": "domain-exponent",
+      "note": "1e65 в decimal-поле",
+      "ui_draft": {
+        "tp_pct": "1e65"
+      },
+      "params_patch": {
+        "tp_pct": "1e65"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": {
+        "tp_pct": "1E+65"
+      },
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "tp_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": "numeric domain: a transport limit of the backend/UI contract (plan §4.3.5 step 1); the agent validates its own model only"
+    },
+    {
+      "id": "domain-before-bound",
+      "note": "1e65 нарушает и домен, и lt 100: одна ошибка too_large",
+      "ui_draft": {
+        "stop_buffer_pct": "1e65"
+      },
+      "params_patch": {
+        "stop_buffer_pct": "1e65"
+      },
+      "params_raw": null,
+      "expected_sent": null,
+      "expected_normalized": null,
+      "outcomes": {
+        "ui": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "backend_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "backend_commands_start": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "backend_preset_post": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "backend_preset_put": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "too_large",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "agent_model_validate": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "agent_command": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        },
+        "agent_resume": {
+          "result": "error",
+          "errors": [
+            {
+              "category": "bound",
+              "field": "stop_buffer_pct"
+            }
+          ]
+        }
+      },
+      "intentional_difference": "numeric domain: a transport limit of the backend/UI contract (plan §4.3.5 step 1); the agent validates its own model only"
+    },
+    {
+      "id": "domain-trailing-zeros",
+      "note": "\"1\"+\"0\"*64: одна значащая цифра — в домене",
+      "ui_draft": {
+        "tp_pct": "10000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "params_patch": {
+        "tp_pct": "10000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "params_raw": null,
+      "expected_sent": {
+        "tp_pct": "10000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected_normalized": {
+        "tp_pct": "10000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "outcomes": {
+        "ui": {
+          "result": "ok"
+        },
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "domain-exponent-in",
+      "note": "\"1e64\" — в домене",
+      "ui_draft": {
+        "tp_pct": "1e64"
+      },
+      "params_patch": {
+        "tp_pct": "1e64"
+      },
+      "params_raw": null,
+      "expected_sent": {
+        "tp_pct": "1e64"
+      },
+      "expected_normalized": {
+        "tp_pct": "1E+64"
+      },
+      "outcomes": {
+        "ui": {
+          "result": "ok"
+        },
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "domain-zero",
+      "note": "\"0E-100\": ноль всегда в домене",
+      "ui_draft": {
+        "stop_buffer_pct": "0E-100"
+      },
+      "params_patch": {
+        "stop_buffer_pct": "0E-100"
+      },
+      "params_raw": null,
+      "expected_sent": {
+        "stop_buffer_pct": "0E-100"
+      },
+      "expected_normalized": {
+        "stop_buffer_pct": "0E-100"
+      },
+      "outcomes": {
+        "ui": {
+          "result": "ok"
+        },
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "domain-fraction-zeros",
+      "note": "\"1.\"+\"0\"*70 — это 1, в домене",
+      "ui_draft": {
+        "stop_buffer_pct": "1.0000000000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "params_patch": {
+        "stop_buffer_pct": "1.0000000000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "params_raw": null,
+      "expected_sent": {
+        "stop_buffer_pct": "1.0000000000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected_normalized": {
+        "stop_buffer_pct": "1.0000000000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "outcomes": {
+        "ui": {
+          "result": "ok"
+        },
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    },
+    {
+      "id": "domain-number-1e16",
+      "note": "1e16 JSON-числом в decimal-поле — одна значащая цифра",
+      "ui_draft": null,
+      "params_patch": null,
+      "params_raw": "{\"quote_asset\": \"USDT\", \"tide_interval\": \"4h\", \"wave_interval\": \"1h\", \"ripple_interval\": \"15m\", \"ema_tide_periods\": [5, 13, 34], \"stochastic_k_period\": 5, \"stochastic_d_period\": 3, \"stochastic_slow_period\": 3, \"fi_ema_period\": 2, \"oversold_threshold\": \"20\", \"swing_low_wave_n\": 2, \"trail_ripple_n\": 2, \"stop_buffer_pct\": \"0.1\", \"min_stop_distance_pct\": \"1\", \"tp_pct\": 1e16, \"trail_cap_pct\": \"4\", \"max_hold_hours\": \"8\", \"cooldown_minutes\": 60, \"signal_validity_minutes\": 15, \"rest_concurrency\": 3, \"ws_top_n\": 30, \"kline_window\": 1000}",
+      "expected_sent": null,
+      "expected_normalized": {
+        "tp_pct": "1E+16"
+      },
+      "outcomes": {
+        "ui": "n/a",
+        "backend_start": {
+          "result": "ok"
+        },
+        "backend_commands_start": {
+          "result": "ok"
+        },
+        "backend_preset_post": {
+          "result": "ok"
+        },
+        "backend_preset_put": {
+          "result": "ok"
+        },
+        "agent_model_validate": {
+          "result": "ok"
+        },
+        "agent_command": {
+          "result": "ok"
+        },
+        "agent_resume": {
+          "result": "ok"
+        }
+      },
+      "intentional_difference": null
+    }
+  ],
+  "stages": {
+    "$comment": "Точки входа, чей раннер ещё не существует: кейс их объявляет, раннер показывает skip «deferred» с задачей-владельцем."
+  }
+}

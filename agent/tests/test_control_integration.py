@@ -46,10 +46,17 @@ def trading(monkeypatch: pytest.MonkeyPatch) -> Generator[ModuleType]:
     modules: dict[str, dict[str, Any]] = {
         "app.api.deps": {
             "CurrentUser": Annotated[BaseModel, Depends(unused_dependency)],
+            "SessionDep": Annotated[BaseModel, Depends(unused_dependency)],
             "get_current_active_superuser": unused_dependency,
         },
+        # Option lists (plan §4.3.5 step 5) live in the backend database; this
+        # test drives _apply_command below the validation that reads them.
+        "app.core.field_options": {
+            "option_errors": unused_dependency,
+            "read_options": unused_dependency,
+        },
         "app.core.redis_client": {"get_redis": unused_dependency},
-        "app.models": {"User": BaseModel},
+        "app.models": {"SignalPosition": BaseModel, "User": BaseModel},
     }
     with monkeypatch.context() as imports:
         for name, attributes in modules.items():
@@ -122,19 +129,24 @@ class MemoryRedis:
         script: str,
         numkeys: int,
         key: str,
+        fence: str,
         expected: str,
         snapshot: str,
         stream: str,
         envelope: str,
         maxlen: str,
+        is_start: str,
     ) -> int:
-        assert (command, script, numkeys, key, stream) == (
+        assert (command, script, numkeys, key, fence, stream) == (
             "EVAL",
             self.trading.COMMIT_RUNTIME_LUA,
-            1,
+            2,
             self.trading.REDIS_RUNTIME_KEY,
+            self.trading.REDIS_START_FENCE_KEY,
             self.trading.REDIS_COMMAND_STREAM,
         )
+        if is_start == "1" and fence in self.values:  # the start fence, plan §4.6 G4
+            return -1
         if self.values.get(key, "") != expected:
             return 0
         # No await between compare, write and enqueue.
@@ -196,6 +208,11 @@ def test_start_signal_stop_and_failed_start(
         stream_start, stream_stop = AsyncMock(), AsyncMock()
         monkeypatch.setattr(streams, "start", stream_start, raising=False)
         monkeypatch.setattr(streams, "stop", stream_stop, raising=False)
+        # The engine reaches the streams through StreamHub (EXEC-10), which
+        # releases a leaving subscriber's klines before the last one stops them.
+        monkeypatch.setattr(
+            streams, "unsubscribe_klines_batch", AsyncMock(), raising=False
+        )
         connect = Mock(return_value=rest)
         stream_factory = Mock(return_value=streams)
         monkeypatch.setattr("agent.engine.ExchangeRest.connect", connect)

@@ -12,7 +12,17 @@ from typing import Any
 
 from binance_sdk_spot.websocket_streams.models import KlineResponse
 
-from agent.strategies.base import Signal, Strategy, StrategyServices, transport_value
+from agent.common.intervals import bar_open, interval_ms
+from agent.strategies.base import (
+    EXIT_POLICY_VERSION,
+    ExitPolicy,
+    PositionEvent,
+    PositionsSnapshot,
+    Signal,
+    Strategy,
+    StrategyServices,
+    transport_value,
+)
 from agent.strategies.registry import strategy
 from agent.strategies.tripple_screen.indicators import (
     Candle,
@@ -21,8 +31,12 @@ from agent.strategies.tripple_screen.indicators import (
     sma_of_optional,
     stochastic_k_series,
 )
+from agent.strategies.tripple_screen.presets import BUILTIN_PRESETS
 from agent.strategies.tripple_screen.schema import CONSTRAINTS, LOOKUPS
-from agent.strategies.tripple_screen.settings import TripleScreenSettings, interval_ms
+from agent.strategies.tripple_screen.settings import (
+    LEGACY_KEYS,
+    TripleScreenSettings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +51,8 @@ class TripleScreenStrategy(Strategy):
     settings_model = TripleScreenSettings
     settings_constraints = CONSTRAINTS
     settings_lookups = LOOKUPS
+    settings_legacy_keys = LEGACY_KEYS
+    settings_presets = BUILTIN_PRESETS
 
     def __init__(self, params: dict[str, Any]) -> None:
         super().__init__(params)
@@ -295,7 +311,9 @@ class TripleScreenStrategy(Strategy):
             key=lambda item: item[1],
             reverse=True,
         )
-        keep_for_position = {s for s in self._active_symbols if s in self._positions}
+        # Positions stay streamed outside the cap — including at a cold start,
+        # before anything is active, and for symbols outside the universe.
+        keep_for_position = set(self._positions)
         budget = max(0, settings.ws_top_n - len(keep_for_position))
         admitted_new = [
             symbol for symbol, _ in qualifiers if symbol not in keep_for_position
@@ -354,7 +372,8 @@ class TripleScreenStrategy(Strategy):
         self._last_price.pop(symbol, None)
         self._pending.pop(symbol, None)
         self._evaluated.pop(symbol, None)
-        self._cooldown_until.pop(symbol, None)
+        # Cooldown is not per-stream state: it belongs to the symbol and must
+        # survive the symbol dropping out of the active set and coming back.
         prefix = f"{symbol}:"
         self._consumed_epochs.difference_update(
             {epoch for epoch in self._consumed_epochs if epoch.startswith(prefix)}
@@ -365,8 +384,8 @@ class TripleScreenStrategy(Strategy):
     def _next_rescreen_ms(self, now_ms: int) -> int:
         """First instant after ``now_ms`` at which the next tide bar has
         closed, plus a small buffer for the exchange's own bar to settle."""
-        step = interval_ms(self.settings.tide_interval)
-        return (now_ms // step + 1) * step + _RESCREEN_BUFFER_MS
+        tide = self.settings.tide_interval
+        return bar_open(now_ms, tide) + interval_ms(tide) + _RESCREEN_BUFFER_MS
 
     async def _rescreen_loop(self) -> None:
         """Re-run stage 1 over the full universe at every tide-interval close.
@@ -402,7 +421,8 @@ class TripleScreenStrategy(Strategy):
         prevents it from taking a slot in the configured closed-bar window.
         """
         step = interval_ms(interval)
-        end = (cutoff + 1) // step * step - 1
+        # +1 keeps the bar that closes exactly at ``cutoff``.
+        end = bar_open(cutoff + 1, interval) - 1
         start = end + 1 - self.settings.kline_window * step
         cursor = max(0, start)
         found: dict[int, Candle] = {}
@@ -470,12 +490,40 @@ class TripleScreenStrategy(Strategy):
     def mark_position_open(self, symbol: str) -> None:
         self._positions.add(symbol.upper())
 
-    def mark_position_closed(self, symbol: str, at: datetime | None = None) -> None:
+    def mark_position_closed(
+        self,
+        symbol: str,
+        at: datetime | None = None,
+        *,
+        cooldown_until: datetime | None = None,
+    ) -> None:
+        """Forget the position and start (or keep) the symbol's cooldown.
+
+        ``cooldown_until`` is the absolute end computed by execution; without
+        it the cooldown runs from ``at`` with the current settings. An end
+        already known is never shortened nor extended by a repeated close.
+        """
         symbol = symbol.upper()
         self._positions.discard(symbol)
-        self._cooldown_until[symbol] = (at or datetime.now(UTC)) + timedelta(
+        until = cooldown_until or (at or datetime.now(UTC)) + timedelta(
             minutes=self.settings.cooldown_minutes
         )
+        known = self._cooldown_until.get(symbol)
+        self._cooldown_until[symbol] = until if known is None else max(known, until)
+
+    async def on_position_opened(self, event: PositionEvent) -> None:
+        self.mark_position_open(event.symbol)
+
+    async def on_position_closed(self, event: PositionEvent) -> None:
+        self.mark_position_closed(
+            event.symbol, event.at, cooldown_until=event.cooldown_until
+        )
+
+    async def restore_positions(self, snapshot: PositionsSnapshot) -> None:
+        self._positions = {symbol.upper() for symbol in snapshot.open_symbols}
+        self._cooldown_until = {
+            symbol.upper(): until for symbol, until in snapshot.cooldown_until.items()
+        }
 
     async def _on_kline(self, symbol: str, interval: str, data: KlineResponse) -> None:
         if data.k is None:
@@ -510,7 +558,8 @@ class TripleScreenStrategy(Strategy):
         self, candles: list[Candle], interval: str, cutoff: int
     ) -> list[Candle] | None:
         step = interval_ms(interval)
-        end = (cutoff + 1) // step * step - 1
+        # +1 keeps the bar that closes exactly at ``cutoff``.
+        end = bar_open(cutoff + 1, interval) - 1
         start = end + 1 - self.settings.kline_window * step
         selected = [
             c
@@ -691,7 +740,7 @@ class TripleScreenStrategy(Strategy):
         epoch = f"{symbol}:{trigger.open_time}"
         cooldown = self._cooldown_until.get(symbol)
         cooling = cooldown is not None and now < cooldown
-        swing = min(c.low for c in wave_candles[-settings.swing_low_h1_n :]) * (
+        swing = min(c.low for c in wave_candles[-settings.swing_low_wave_n :]) * (
             1 - settings.stop_buffer_pct / 100
         )
         provenance = transport_value(
@@ -752,6 +801,22 @@ class TripleScreenStrategy(Strategy):
             provenance["ripple"],
             provenance["state"],
         )
+        exit_policy = None
+        if reason is None:
+            distance = settings.min_stop_distance_pct / 100
+            exit_policy = ExitPolicy(
+                version=EXIT_POLICY_VERSION,
+                stop_ref=min(swing, trigger.close * (1 - distance)),
+                swing_low_ref=swing,
+                min_stop_distance_pct=settings.min_stop_distance_pct,
+                stop_buffer_pct=settings.stop_buffer_pct,
+                tp_pct=settings.tp_pct,
+                trail_interval=settings.ripple_interval,
+                trail_n=settings.trail_ripple_n,
+                trail_cap_pct=settings.trail_cap_pct,
+                max_hold_hours=settings.max_hold_hours,
+                cooldown_minutes=settings.cooldown_minutes,
+            )
         return Signal(
             type="HOLD" if reason else "ENTRY",
             symbol=symbol,
@@ -761,6 +826,7 @@ class TripleScreenStrategy(Strategy):
             entry_ref=None if reason else trigger.close,
             swing_low_ref=None if reason else swing,
             tp_rule=None if reason else f"fill x {1 + settings.tp_pct / 100}",
+            exit_policy=exit_policy,
             valid_until=None
             if reason
             else now + timedelta(minutes=settings.signal_validity_minutes),

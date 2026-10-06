@@ -3,7 +3,9 @@ name: Playwright Tests
 on:
   push:
     branches:
-    - master
+    - development
+    - stage
+    - production
   pull_request:
   workflow_dispatch:
     inputs:
@@ -19,6 +21,9 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read  # paths-filter lists PR files via the API
     # Set job outputs to values from filter step
     outputs:
       changed: ${{ steps.filter.outputs.changed }}
@@ -35,7 +40,7 @@ jobs:
           changed:
             - backend/**
             - frontend/**
-            - .env
+            - .env.example
             - compose*.yml
             - .github/workflows/playwright.yml
 
@@ -79,6 +84,8 @@ jobs:
     - name: Check frontend types
       run: bun run typecheck
       working-directory: frontend
+    # .env is not tracked; client generation and Compose read the example defaults.
+    - run: cp .env.example .env
     - run: bash scripts/generate-client.sh
     - run: docker compose build
     - run: docker compose down -v --remove-orphans

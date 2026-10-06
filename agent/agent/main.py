@@ -32,8 +32,12 @@ from agent.engine import (
     REDIS_COMMAND_STREAM,
     Engine,
 )
+from agent.exchange.rest import ExchangeRest
+from agent.execution.runtime import ExecutionRuntime
+from agent.execution.service import build_execution
 from agent.monitoring import MONITORING_REFRESH_SECONDS, refresh_monitoring
 from agent.protocol import publish_catalog
+from agent.signal_tracker import SignalTracker
 from agent.symbols import latest_universe, publish_universe
 
 logger = logging.getLogger(__name__)
@@ -165,7 +169,14 @@ async def _handle_independent(
 
 #: Command types that read the outside world and change nothing about the
 #: running intent. They must not queue behind (or in front of) Start/Stop.
-_INDEPENDENT_COMMANDS = ("balance", "prices")
+_INDEPENDENT_COMMANDS = (
+    "balance",
+    "prices",
+    "execution_pause",
+    "execution_resume",
+    "close_position",
+    "release_entry",
+)
 
 
 async def _route(
@@ -345,24 +356,63 @@ async def run() -> None:
     redis: Redis = Redis.from_url(str(settings.REDIS_URL), decode_responses=True)
     engine = Engine(redis)
 
-    # The agent owns its own database (working symbols now, trades later). It is
-    # optional at boot, so a missing or unreachable one is reported and the
-    # daemon carries on: trading must not depend on it.
+    # The agent owns its own database (working symbols, and everything real
+    # execution records). A missing or unreachable one is reported and the
+    # daemon carries on for signals, but execution stays closed: it must never
+    # run on a schema that did not migrate cleanly (plan §8.1).
+    schema_ready = False
     try:
         if await db.ensure_settings_database():
-            await db.init_settings_schema()
+            schema_ready = await db.init_settings_schema() is not None
     except Exception:  # noqa: BLE001 - never let settings storage block boot
-        logger.exception("cannot prepare the agent settings database")
+        logger.exception(
+            "cannot prepare the agent database; real execution stays closed"
+        )
+    engine.schema_ready = schema_ready
+    runtime = ExecutionRuntime(
+        db=db.settings_engine(),
+        db_url=str(settings.AGENT_DB_URL) if settings.AGENT_DB_URL else None,
+        schema_ready=schema_ready,
+    )
+    engine.execution = runtime
+    runtime.feedback = engine.position_feedback
+    execution = build_execution(runtime, engine.hub)
+    # Independent of Start/Stop and of the saved running flag: unfinished
+    # positions are followed from boot, even when the strategy stays off.
+    await runtime.boot()
+    execution.admission.start()
+    execution.start()
+
+    # Signal-level outcomes: every ENTRY to its first stop/take crossing.
+    public: dict[str, ExchangeRest] = {}
+
+    def market(network: str) -> ExchangeRest:
+        if network not in public:
+            public[network] = ExchangeRest.connect_public(
+                "live" if network == "live" else "testnet"
+            )
+        return public[network]
+
+    tracker = SignalTracker(
+        db.settings_engine() if schema_ready else None, market, engine.publish_exit
+    )
+    engine.tracker = tracker
+    tracker.on_closed = engine.virtual_closed
+    tracker.on_opened = engine.virtual_opened
 
     try:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(_listen(redis, engine, stop))
+            tg.create_task(tracker.run(stop))
             tg.create_task(_heartbeat_loop(engine, stop))
             tg.create_task(_catalog_loop(redis, stop))
             tg.create_task(_symbols_loop(redis, stop))
             tg.create_task(_monitoring_loop(redis, stop))
     finally:
         await engine.shutdown()
+        await execution.stop()
+        await execution.admission.stop()
+        await runtime.shutdown()
         await redis.aclose()
         await db.dispose_engines()
         logger.info("agent stopped")

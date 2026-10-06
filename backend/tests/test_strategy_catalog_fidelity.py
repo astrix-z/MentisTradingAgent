@@ -22,6 +22,7 @@ import pytest
 agent_protocol = pytest.importorskip("agent.protocol")
 agent_strategies = pytest.importorskip("agent.strategies")
 agent_settings = pytest.importorskip("agent.strategies.tripple_screen.settings")
+agent_presets = pytest.importorskip("agent.strategies.tripple_screen.presets")
 catalog_module = pytest.importorskip("app.core.strategy_catalog")
 
 TripleScreenSettings = agent_settings.TripleScreenSettings
@@ -67,7 +68,15 @@ def test_backend_accepts_every_declared_default() -> None:
         {"kline_window": 35},
         {"ema_tide_periods": [5, 13, 34]},
         {"tide_interval": "8h", "wave_interval": "2h", "ripple_interval": "30m"},
+        # Only the order is required (D1): non-multiple and day/week scales.
+        {"tide_interval": "1h", "wave_interval": "15m", "ripple_interval": "5m"},
+        {"tide_interval": "12h", "wave_interval": "6h", "ripple_interval": "4h"},
+        {"tide_interval": "1w", "wave_interval": "1d", "ripple_interval": "4h"},
+        {"wave_interval": "2h"},
         {"rest_concurrency": 5, "cooldown_minutes": 0},
+        {"trail_cap_pct": 0},
+        {"trail_cap_pct": "3", "tp_pct": "3.5"},
+        {"max_hold_hours": "0.25"},
     ],
 )
 def test_backend_and_agent_accept_the_same_parameters(params: dict[str, Any]) -> None:
@@ -89,10 +98,18 @@ def test_backend_and_agent_accept_the_same_parameters(params: dict[str, Any]) ->
         {"ema_tide_periods": [0, 13, 34]},
         # Cross-field rules, from the published constraints.
         {"ema_tide_periods": [34, 13, 5]},
-        {"wave_interval": "2h"},
-        {"ripple_interval": "5m"},
+        {"wave_interval": "4h"},  # tide == wave
+        {"tide_interval": "30m"},  # tide < wave
+        {"ripple_interval": "1h"},  # wave == ripple
         {"kline_window": 34},
         {"stochastic_k_period": 1000},
+        # The trailing cap must stay below the take-profit (spec §7.4).
+        {"trail_cap_pct": 10},
+        {"trail_cap_pct": 11},
+        {"trail_cap_pct": -1},
+        {"tp_pct": 2},
+        {"max_hold_hours": 0},
+        {"max_hold_hours": -1},
     ],
 )
 def test_backend_and_agent_reject_the_same_parameters(params: dict[str, Any]) -> None:
@@ -115,6 +132,35 @@ def test_backend_is_stricter_about_undeclared_parameters() -> None:
     assert "unknown parameter" in errors[0]["msg"]
 
 
+def test_backend_carries_the_agents_legacy_keys() -> None:
+    """The UI reads old names from saved params through this map."""
+    assert STRATEGY.legacy_keys == agent_settings.LEGACY_KEYS
+    assert STRATEGY.legacy_keys
+
+
+def test_an_old_ui_payload_is_refused_with_a_reload_hint() -> None:
+    """Old JS merges old names from ``desired`` into a Start (plan G2)."""
+    params = {
+        "swing_low_h1_n": 7,
+        "trail_m15_n": 9,
+        "swing_low_wave_n": 2,
+        "trail_ripple_n": 2,
+    }
+    assert sorted(error["msg"] for error in STRATEGY.validate(params)) == [
+        "parameter 'swing_low_h1_n' was renamed to 'swing_low_wave_n'; reload the page",
+        "parameter 'trail_m15_n' was renamed to 'trail_ripple_n'; reload the page",
+    ]
+
+
+def test_backend_accepts_the_agents_builtin_presets() -> None:
+    """PRESET-04: Default and Fast arrive whole and pass the backend pipeline."""
+    presets = agent_presets.BUILTIN_PRESETS
+    parsed = STRATEGY.parse_presets()
+    assert parsed.form == "list"
+    assert not parsed.has_errors
+    assert {r.name: r.params for r in parsed.accepted} == presets
+
+
 def test_backend_reports_the_agents_own_message() -> None:
     """The UI shows rule text, so the two services must agree on it verbatim."""
     messages = {
@@ -127,10 +173,10 @@ def test_backend_reports_the_agents_own_message() -> None:
 
 
 def test_a_repeated_rule_message_is_reported_once() -> None:
-    """The ratio chain is two comparisons sharing one message; say it once."""
-    errors = STRATEGY.validate({"wave_interval": "2h"})
+    """The order chain is two comparisons sharing one message; say it once."""
+    errors = STRATEGY.validate({"tide_interval": "15m", "ripple_interval": "4h"})
     assert [error["msg"] for error in errors] == [
-        "timeframes must have tide:wave:ripple ratio 16:4:1"
+        "timeframes must satisfy tide > wave > ripple"
     ]
 
 
@@ -188,3 +234,54 @@ def test_the_published_bytes_are_what_the_backend_compiles() -> None:
         assert json.loads(raw)["published_at"] == compiled.published_at
 
     asyncio.run(scenario())
+
+
+agent_execution = pytest.importorskip("agent.execution.settings")
+EXECUTION = COMPILED.execution
+
+
+def agent_rejects_execution(values: dict[str, Any]) -> bool:
+    try:
+        agent_execution.ExecutionSettings.from_payload(values)
+    except ValueError:
+        return True
+    return False
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {},
+        {"enabled": True},
+        {"enabled": True, "max_slippage_pct": "0.5", "max_symbols": 2},
+        {"slot_quote": "10", "position_share": "0.8"},
+    ],
+)
+def test_execution_settings_accepted_by_both(values: dict[str, Any]) -> None:
+    assert EXECUTION is not None
+    assert agent_rejects_execution(values) is False
+    assert EXECUTION.validate(values) == []
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"max_slippage_pct": 0},
+        {"max_slippage_pct": 6},
+        {"position_share": "1.5"},
+        {"unprotected_deadline_s": 1},
+        {"max_symbols": 0},
+        {"enabled": "maybe"},
+        {"unknown_setting": 1},
+    ],
+)
+def test_execution_settings_rejected_by_both(values: dict[str, Any]) -> None:
+    assert EXECUTION is not None
+    assert agent_rejects_execution(values) is True
+    assert EXECUTION.validate(values)
+
+
+def test_execution_defaults_keep_real_execution_off() -> None:
+    assert EXECUTION is not None
+    props = EXECUTION.settings_schema["properties"]  # type: ignore[index]
+    assert props["enabled"]["default"] is False

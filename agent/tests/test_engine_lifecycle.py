@@ -21,6 +21,7 @@ def setup_engine(monkeypatch: pytest.MonkeyPatch) -> tuple[Engine, Any, Any, Any
     strategy = Mock(
         on_start=AsyncMock(),
         on_stop=AsyncMock(),
+        restore_positions=AsyncMock(),
         active_symbols=None,
         health_warning=None,
     )
@@ -365,5 +366,54 @@ def test_streams_close_partial_sdk_connection() -> None:
         await streams.stop()
         streams._client.close_connection.assert_awaited_once_with(close_session=True)
         assert not streams._kline_callbacks
+
+    asyncio.run(scenario())
+
+
+def test_a_published_entry_is_followed_and_a_tracker_exit_is_published() -> None:
+    # ClickUp 869f6m7vn: the tracker learns of every ENTRY before it goes
+    # out; without an inbox a failed watch fails the emit (review R2), and
+    # nothing is published; its EXIT goes to the backend's channel.
+    async def scenario() -> None:
+        redis = Mock(publish=AsyncMock(return_value=None))
+        engine = Engine(redis)
+        engine.tracker = Mock(
+            watch=AsyncMock(side_effect=[None, RuntimeError("database down")]),
+            forget=AsyncMock(),
+            is_open=AsyncMock(return_value=True),
+        )
+        now = datetime.now(UTC)
+        entry = Signal(
+            type="ENTRY",
+            symbol="SENTUSDT",
+            emitted_at=now,
+            epoch_id="epoch",
+            entry_ref=Decimal("0.023"),
+            swing_low_ref=Decimal("0.02198799"),
+            tp_rule="fill x 1.1",
+        )
+        await engine._on_signal(entry)
+        with pytest.raises(RuntimeError):
+            await engine._on_signal(entry)  # the watch fails: so does the emit
+        assert engine.tracker.watch.await_count == 2
+        assert engine.tracker.watch.await_args.args[0] is entry
+        assert redis.publish.await_count == 1
+        hold = Signal(type="HOLD", symbol="SENTUSDT", emitted_at=now)
+        await engine._on_signal(hold)
+        assert engine.tracker.watch.await_count == 2
+
+        exit_ = Signal(
+            type="EXIT",
+            symbol="SENTUSDT",
+            emitted_at=now,
+            exit_reason="stop",
+            entry_signal_id=entry.signal_id,
+            exit_price=Decimal("0.02198799"),
+        )
+        await engine.publish_exit(exit_)
+        payload = json.loads(redis.publish.call_args.args[1])
+        assert payload == {"kind": "signal", **exit_.transport()}
+        assert payload["entry_signal_id"] == entry.signal_id
+        assert payload["exit_price"] == "0.02198799"
 
     asyncio.run(scenario())

@@ -156,6 +156,37 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-09-24] Реальное исполнение ордеров: этапы 1–2 плана v2.2 (EXEC-01…15)
+- План: `docs/ORDER_EXECUTION_PLAN.md` v2.2 (§12.1 — DAG задач), ClickUp 869f6m8kj
+  и задачи EXEC-01…15 с подзадачами 08a–c, 09a–c, 11a–b (все в `need review`).
+  Одна задача — один коммит, `fb7d7cc`…`b5a5e73`.
+- Код: `agent/agent/execution/` — `models.py` (таблицы §8.1), `runtime.py`
+  (контекст uid+network, advisory lock, admission-блоки, heartbeat),
+  `settings.py` (секция `execution` каталога), `admission.py` (inbox и резервы),
+  `sizing.py`/`filters.py`/`quotes.py` (правила биржи, размер, опорная цена),
+  `attempts.py` (журнал попыток, UNKNOWN), `orders.py` (вход FOK),
+  `protection.py` (OCO, дедлайн 30 с, рыночные выходы), `worker.py` (протокол
+  cancel → барьер → replace/exit), `trailing.py`, `exits.py` (time, guard,
+  close_position), `monitor.py` + `exchange/hub.py` (StreamHub),
+  `reconcile.py`, `ledger.py` (единственный писатель позиций и закрытий),
+  `service.py` (сборка при boot). Миграции Alembic — `agent/agent/migrations/`.
+  Торговый клиент — `agent/agent/exchange/trade.py`, бюджет — `budget.py`.
+- Backend: секция `execution` каталога проверяется тем же `CompiledStrategy`;
+  Start и снапшот несут `execution`; команды `execution_pause`,
+  `execution_resume`, `close_position`. Клиент фронта перегенерирован.
+- Проверки: агент — 484 теста (PostgreSQL на `AGENT_TEST_DB_URL`, fake-биржа
+  `agent/tests/fake_exchange.py`, crash-матрица `test_crash_matrix.py`), mypy
+  strict и ruff чистые; backend fidelity/contract — с `--noconftest` (конфтест
+  backend чистит пользователей в БД, на которую указывает).
+- Хвосты: `tests/test_control_integration.py` падает на импорте backend при
+  запуске из `agent/` — было и до этой работы. UI Positions, outbox → backend,
+  UDS, dry-run/testnet — этапы 3–6 плана. Исполнение выключено по умолчанию
+  (`execution.enabled=false`), реальные ордера появятся только после явного
+  включения в Start.
+- Локальная БД compose слушает 5433, а `.env` указывает 5432: для тестов
+  `AGENT_TEST_DB_URL=postgresql+psycopg://…@localhost:5433/postgres`.
+
+
 ### [2026-09-17] Решения владельца: memecoins и 12 `<TICKER>B`
 - Владелец подтвердил оба пункта из ClickUp: memecoins остаются только меткой и не
   исключаются; все 12 найденных `suspected_tokenized_equity` должны остаться

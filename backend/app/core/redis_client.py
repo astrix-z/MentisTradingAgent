@@ -8,8 +8,11 @@ service reads or writes another service's database.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 
+import redis
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
 
@@ -17,26 +20,80 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_client: aioredis.Redis | None = None
+#: One async client per event loop: its connections belong to the loop that
+#: opened them and may only be closed there. A worker has one loop; two apps
+#: alive at once (a TestClient inside another, ClickUp 869fc707e) have two,
+#: and the inner one's shutdown must not close the outer one's connections.
+_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, aioredis.Redis] = (
+    weakref.WeakKeyDictionary()
+)
+_sync_client: redis.Redis | None = None
+
+#: Every call of the blocking client gives up after this long. It is used
+#: where a read happens under a database lock (the built-in preset sync,
+#: plan §4.3.2): a hung Redis must not hold the lock.
+SYNC_REDIS_TIMEOUT_S = 2.0
 
 
 def get_redis() -> aioredis.Redis:
-    """Return the shared async Redis client, creating it lazily on first use."""
-    global _client
-    if _client is None:
-        _client = aioredis.from_url(  # type: ignore[no-untyped-call]
+    """Return the running loop's async Redis client, creating it on first use."""
+    loop = asyncio.get_running_loop()
+    client = _clients.get(loop)
+    if client is None:
+        client = aioredis.from_url(  # type: ignore[no-untyped-call]
             str(settings.REDIS_URL), encoding="utf-8", decode_responses=True
         )
-    return _client
+        _clients[loop] = client
+    return client
+
+
+def get_sync_redis() -> redis.Redis:
+    """Return the shared blocking Redis client, for code run in a worker thread.
+
+    A sync route (FastAPI runs it in its threadpool) must not await the
+    event loop's client; this one blocks only its own thread. Connecting and
+    every read are bounded by ``SYNC_REDIS_TIMEOUT_S``.
+    """
+    global _sync_client
+    if _sync_client is None:
+        _sync_client = make_sync_redis(str(settings.REDIS_URL), SYNC_REDIS_TIMEOUT_S)
+    return _sync_client
+
+
+def make_sync_redis(url: str, timeout: float) -> redis.Redis:
+    """A blocking client whose connect and every read give up after ``timeout``.
+
+    The one place the blocking client is built, so a test of its behaviour
+    (a hung server, R95) runs the production configuration.
+    """
+    return redis.Redis.from_url(
+        url,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_timeout=timeout,
+        socket_connect_timeout=timeout,
+    )
 
 
 async def close_redis() -> None:
-    """Close the shared Redis client. Safe to call even if never opened."""
-    global _client
-    if _client is not None:
+    """Close this loop's async client, and the blocking one with the last loop.
+
+    Safe to call even if never opened. Called by the app's lifespan, in the
+    loop that served it.
+    """
+    global _sync_client
+    client = _clients.pop(asyncio.get_running_loop(), None)
+    if client is not None:
         try:
-            await _client.aclose()
+            await client.aclose()
         except RedisError:  # pragma: no cover - best effort on shutdown
             logger.warning("failed to close Redis client cleanly")
+    if _clients:
+        return  # another app still runs and shares the blocking client
+    if _sync_client is not None:
+        try:
+            _sync_client.close()
+        except RedisError:  # pragma: no cover - best effort on shutdown
+            logger.warning("failed to close the blocking Redis client cleanly")
         finally:
-            _client = None
+            _sync_client = None

@@ -69,7 +69,7 @@ Frontend docs: [frontend/README.md](./frontend/README.md).
 
 ## Deployment
 
-FastAPI Cloud deployment: [deployment.md](./deployment.md).
+Production host 192.168.55.40 (branch `production`): [docs/DEPLOY.md](./docs/DEPLOY.md).
 
 Self-hosted deployment with Docker Compose: [deployment-docker-compose.md](./deployment-docker-compose.md).
 

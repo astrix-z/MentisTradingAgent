@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from agent.core.config import settings
-from agent.models import Base
+from agent.core.migrate import MigrationResult, migrate
 
 logger = logging.getLogger(__name__)
 
@@ -107,13 +107,17 @@ async def ensure_settings_database() -> bool:
     return True
 
 
-async def init_settings_schema() -> None:
-    """Create the agent's tables if they are missing (idempotent)."""
+async def init_settings_schema() -> MigrationResult | None:
+    """Migrate the agent's database to the current schema.
+
+    Returns ``None`` when no database is configured. Raises on anything that is
+    not a clean upgrade (see :mod:`agent.core.migrate`); the caller keeps
+    execution closed in that case.
+    """
     engine = settings_engine()
     if engine is None:
-        return
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+        return None
+    return await migrate(engine)
 
 
 @asynccontextmanager
