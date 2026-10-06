@@ -35,7 +35,10 @@ jobs:
       - name: Check types
         run: uv run --directory backend mypy app
       # .env is not tracked; Compose and the backend settings read the example defaults.
-      - run: cp .env.example .env
+      # Tests run on the host, and compose.override.yml publishes the db on 5433.
+      - run: |
+          cp .env.example .env
+          sed -i 's#@localhost:5432/#@localhost:5433/#' .env
       - run: docker compose down -v --remove-orphans
       - run: docker compose up -d --wait db mailpit
       - name: Migrate DB
