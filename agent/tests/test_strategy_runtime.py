@@ -899,6 +899,11 @@ def test_screening_admits_by_cap_and_trend_strength() -> None:
         try:
             assert strategy._active_symbols == {"STRONG"}
             assert ("STRONG", "4h") in streams.subscribed
+            skipped = strategy.indicator_snapshot()["screening"]["skipped"]  # type: ignore[index]
+            assert skipped == [
+                {"symbol": "DOWN", "reason": "tide EMA 3 / EMA 4 not both rising"},
+                {"symbol": "WEAK", "reason": "trend weaker than the top 1 (ws_top_n)"},
+            ]
             assert not any(sym == "WEAK" for sym, _ in streams.subscribed)
             assert not any(sym == "DOWN" for sym, _ in streams.subscribed)
         finally:
@@ -925,6 +930,18 @@ def test_screening_skips_listing_younger_than_kline_window() -> None:
             # YOUNG rises harder but cannot be evaluated: not admitted.
             assert strategy._active_symbols == {"BTCUSDT"}
             assert not any(sym == "YOUNG" for sym, _ in streams.subscribed)
+            # The Indicators Monitor is told why YOUNG stayed out.
+            screening = strategy.indicator_snapshot()["screening"]  # type: ignore[index]
+            assert screening["universe"] == 2
+            assert screening["selected"] == 1
+            window = PARAMS["kline_window"]
+            assert screening["skipped"] == [
+                {
+                    "symbol": "YOUNG",
+                    "reason": f"not enough 4h history: {window - 1} of "
+                    f"{window} closed bars",
+                }
+            ]
         finally:
             await strategy.on_stop()
 

@@ -353,6 +353,9 @@ class Strategy(abc.ABC):
                           "bar_open_time": ISO-8601 UTC | None,
                           "values": {<indicator key>: {"current", "previous"}},
                         }}}],
+              # optional: why the universe narrowed to ``rows``
+              "screening": {"at": ISO-8601 UTC, "universe", "selected",
+                            "skipped": [{"symbol", "reason"}]},
             }
 
         Declaring the groups here keeps the UI generic: it renders whatever
