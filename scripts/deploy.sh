@@ -15,13 +15,19 @@
 #   DEPLOY_COMPOSE="docker compose"   # команда compose на сервере
 #   DEPLOY_SSH                        # команда доступа к серверу вместо ssh (для тестов)
 #   DEPLOY_REMOTE=origin DEPLOY_BRANCH=production
-#                                     # выкладывается только история этой ветки
-#                                     # remote; DEPLOY_BRANCH="" — без проверки (тесты)
+#                                     # выкладывается только история этой ветки:
+#                                     # здесь — в DEPLOY_REMOTE, на сервере — в
+#                                     # origin его клона (GitHub)
+#   DEPLOY_FETCH_TIMEOUT_S=300        # предел fetch и распаковки ревизии на сервере
 #
 # Как устроено (docs/STRATEGY_PRESETS_PLAN.md §4.6 G4, docs/DEPLOY.md):
-#   Здесь — только проверки без записи и файлы СВОЕЙ попытки: артефакт ревизии
-#   в неизменяемый releases/stage-<ATTEMPT>/ и копия scripts/deploy-fence.sh
-#   (из текущего дерева) в releases/deploy-fence-<ATTEMPT>.sh. Всё остальное —
+#   Код на сервер с этой машины не копируется: сервер подтягивает DEPLOY_BRANCH
+#   из GitHub в свой клон ~/apps/mentis-trading-agent.git (deploy key только на
+#   чтение, docs/DEPLOY.md §3) и распаковывает ревизию оттуда. Fetch меняет
+#   только этот клон, не стек. Кроме него здесь — только проверки без записи и
+#   файлы СВОЕЙ попытки: артефакт ревизии в неизменяемый releases/stage-<ATTEMPT>/
+#   и копия scripts/deploy-fence.sh (из текущего дерева: это часть инструмента
+#   выкладки, как сам deploy.sh) в releases/deploy-fence-<ATTEMPT>.sh. Всё остальное —
 #   снапшот БД, установка в APP_DIR, сборка, флаг trading:start_fence, замена
 #   агента, ожидание его каталога, releases/current|history, ротация — делает
 #   скрипт ограды на сервере в юните mentis-deploy (systemd --user, нужен
@@ -42,18 +48,20 @@ SSH_TARGET="${SERVER_USER}@${SERVER}"
 # часть путей из [0-9a-z./-]. Такие пути подставляются БЕЗ внешних кавычек.
 # shellcheck disable=SC2016
 R_RELEASES='"$HOME"/apps/releases'
+# shellcheck disable=SC2016
+R_REPO='"$HOME"/apps/mentis-trading-agent.git'
 UNIT="mentis-deploy"
 #: С этого коммита агент публикует agent:strategies (шаг (5) его ждёт).
 CATALOG_SINCE="608cfa1"
 WAIT_TIMEOUT_S="${DEPLOY_WAIT_TIMEOUT_S:-3600}"
 READ_RETRY_S="${DEPLOY_READ_RETRY_S:-30}"
 DEPLOY_REMOTE="${DEPLOY_REMOTE:-origin}"
-DEPLOY_BRANCH="${DEPLOY_BRANCH-production}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-production}"
 POLL_S="${DEPLOY_POLL_S:-3}"
 READ_PAUSE_S="${DEPLOY_READ_PAUSE_S:-2}"
-#: Предел одного удалённого вызова и загрузки артефакта (R126).
+#: Предел одного удалённого вызова и получения ревизии сервером (R126).
 CALL_TIMEOUT_S="${DEPLOY_CALL_TIMEOUT_S:-30}"
-UPLOAD_TIMEOUT_S="${DEPLOY_UPLOAD_TIMEOUT_S:-300}"
+FETCH_TIMEOUT_S="${DEPLOY_FETCH_TIMEOUT_S:-300}"
 
 REV_ARG="HEAD"
 ALLOW_DIRTY=0
@@ -93,8 +101,12 @@ if ! run_remote true 2>/dev/null; then
   die "нет SSH-доступа к ${SSH_TARGET}. Проверьте ключи и сеть."
 fi
 
-REVISION="$(git rev-parse --short=7 "${REV_ARG}^{commit}" 2>/dev/null)" \
+# Имя ветки уходит в команду на сервере.
+[[ "$DEPLOY_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || die "плохое имя ветки DEPLOY_BRANCH: $DEPLOY_BRANCH"
+COMMIT="$(git rev-parse "${REV_ARG}^{commit}" 2>/dev/null)" \
   || die "нет такой ревизии: $REV_ARG"
+[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "неожиданный формат ревизии: $COMMIT"
+REVISION="$(git rev-parse --short=7 "$COMMIT")"
 [[ "$REVISION" =~ ^[0-9a-f]{7,40}$ ]] || die "неожиданный формат ревизии: $REVISION"
 if [[ "$REV_ARG" == HEAD && -n "$(git status --porcelain)" && "$ALLOW_DIRTY" -ne 1 ]]; then
   echo "ОШИБКА: в рабочей копии есть незакоммиченные изменения."
@@ -105,13 +117,12 @@ fi
 git merge-base --is-ancestor "$CATALOG_SINCE" "$REVISION" 2>/dev/null \
   || die "ревизия $REVISION старше $CATALOG_SINCE: её агент не публикует agent:strategies, G4 не пройдёт"
 # На сервере работает ветка production: цель — её вершина или предок (откат),
-# по состоянию remote, а не локальной ветки, которую никто не пушил.
-if [[ -n "$DEPLOY_BRANCH" ]]; then
-  git fetch -q "$DEPLOY_REMOTE" "$DEPLOY_BRANCH" \
-    || die "не удалось получить ${DEPLOY_BRANCH} из ${DEPLOY_REMOTE}"
-  git merge-base --is-ancestor "$REVISION" FETCH_HEAD \
-    || die "ревизия $REVISION не в ветке ${DEPLOY_BRANCH} (${DEPLOY_REMOTE}): сначала влейте её в ${DEPLOY_BRANCH} и запушьте"
-fi
+# по состоянию remote, а не локальной ветки, которую никто не пушил. Сервер
+# проверит то же по своему fetch; здесь — чтобы отказать до SSH-записей.
+git fetch -q "$DEPLOY_REMOTE" "$DEPLOY_BRANCH" \
+  || die "не удалось получить ${DEPLOY_BRANCH} из ${DEPLOY_REMOTE}"
+git merge-base --is-ancestor "$COMMIT" FETCH_HEAD \
+  || die "ревизия $REVISION не в ветке ${DEPLOY_BRANCH} (${DEPLOY_REMOTE}): сначала влейте её в ${DEPLOY_BRANCH} и запушьте"
 if [[ -n "$T0_REVISION" ]]; then
   T0_REVISION="$(git rev-parse --short=7 "${T0_REVISION}^{commit}" 2>/dev/null)" \
     || die "нет такой ревизии T0"
@@ -126,6 +137,17 @@ if [[ "$linger" != yes ]]; then
   exit 1
 fi
 
+# --- Ревизия — из GitHub, в клон на сервере ----------------------------------------
+
+[[ "$(run_remote "git -C $R_REPO rev-parse --is-bare-repository" 2>/dev/null)" == true ]] \
+  || die "на сервере нет клона ~/apps/mentis-trading-agent.git (docs/DEPLOY.md §3)"
+echo "==> Сервер получает ${DEPLOY_BRANCH} из GitHub"
+run_remote "git -C $R_REPO fetch -q --no-tags origin +refs/heads/$DEPLOY_BRANCH:refs/remotes/origin/$DEPLOY_BRANCH" \
+  "$FETCH_TIMEOUT_S" \
+  || die "сервер не получил ${DEPLOY_BRANCH} из origin своего клона: deploy key, known_hosts, сеть (docs/DEPLOY.md §3)"
+run_remote "git -C $R_REPO merge-base --is-ancestor $COMMIT refs/remotes/origin/$DEPLOY_BRANCH" \
+  || die "ревизии $REVISION нет в ${DEPLOY_BRANCH}, которую сервер получил из GitHub: запушьте её"
+
 # --- Файлы своей попытки -------------------------------------------------------------
 
 # MY_ATTEMPT — всё, что создаёт и может удалить этот запуск; WATCH_ATTEMPT —
@@ -139,8 +161,8 @@ echo "==> Выкладка ${REVISION} на ${SSH_TARGET}, попытка ${MY_A
 run_remote "mkdir -p $R_RELEASES && mkdir $MY_STAGE && mkdir $MY_STAGE/tree" \
   || die "не удалось создать $MY_STAGE"
 remove_mine() { run_remote "rm -rf -- $MY_STAGE $MY_SCRIPT" || true; }
-git archive "$REVISION" | run_remote "tar -x -C $MY_STAGE/tree" "$UPLOAD_TIMEOUT_S" \
-  || { remove_mine; die "не удалось загрузить артефакт"; }
+run_remote "set -o pipefail; git -C $R_REPO archive $COMMIT | tar -x -C $MY_STAGE/tree" "$FETCH_TIMEOUT_S" \
+  || { remove_mine; die "не удалось распаковать ревизию из клона на сервере"; }
 # set -C: копия скрипта никогда не перезаписывается (bash читает скрипт по ходу).
 run_remote "set -C; cat > $MY_SCRIPT" <scripts/deploy-fence.sh \
   || { remove_mine; die "не удалось загрузить скрипт ограды"; }
