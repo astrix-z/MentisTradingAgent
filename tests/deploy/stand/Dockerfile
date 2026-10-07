@@ -1,11 +1,12 @@
 # A stand-in for the deployment server (PRESET-09a acceptance, run-matrix.py):
 # systemd as PID 1 (user units, linger), sshd, its own Docker engine, rsync,
-# python3 — what scripts/deploy.sh and deploy-fence.sh use on 192.168.55.40.
+# python3, git (the server's clone) — what scripts/deploy.sh and
+# deploy-fence.sh use on 192.168.55.40.
 # Run privileged, with /var/lib/docker and /var/lib/containerd on volumes
 # (overlay on overlay does not mount).
 FROM fedora:42
 RUN dnf -y install systemd openssh-server dnf-plugins-core python3 curl tar gzip \
-        procps-ng findutils rsync \
+        procps-ng findutils rsync git-core \
  && dnf config-manager addrepo --from-repofile=https://download.docker.com/linux/fedora/docker-ce.repo \
  && dnf -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
         docker-compose-plugin \
