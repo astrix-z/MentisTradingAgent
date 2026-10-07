@@ -8,6 +8,12 @@ here) — and writes a journal: for every scenario the revision, deploy.sh's
 exit code, the fence, the images and states of backend and agent,
 releases/current, what was expected and whether it held.
 
+The code reaches the stand the way it reaches the server: from "GitHub", a
+bare repository in the stand that the server's clone fetches from. main()
+publishes into it what scenarios deploy (production = HEAD, plus the branch
+of throwaway targets); deploy.sh checks the same branches against a copy of
+it here (DEPLOY_REMOTE).
+
 Faults come from the stand itself: ~/bin/compose-fault is the fence's
 DEPLOY_COMPOSE (a failing build, flag, catalog delete or `up`, a paused new
 agent, a slow `up`), ~/bin/systemd-run answers deploy.sh's launch wrongly,
@@ -107,6 +113,8 @@ class Stand:
         self.work = work
         self.key = work / "stand_key"
         self.ssh = work / "ssh.sh"
+        #: This machine's copy of the stand's "GitHub": deploy.sh's DEPLOY_REMOTE.
+        self.github = work / "github.git"
 
     def build(self) -> None:
         run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.key)])
@@ -178,6 +186,11 @@ class Stand:
         path = self.sh("command -v systemd-run")
         assert path.endswith("/home/jb/bin/systemd-run"), path
         self.sh("mkdir -p ~/stand-hooks ~/stand-state && chmod 777 ~/stand-state")
+        # The server's clone (docs/DEPLOY.md §3), its origin the stand's "GitHub".
+        self.sh(
+            "git init -q --bare ~/github.git && git init -q --bare ~/apps/mentis-trading-agent.git"
+            " && git -C ~/apps/mentis-trading-agent.git remote add origin ~/github.git"
+        )
         for name in ("sitecustomize.py", "stand-hooks.yml"):
             self.sh(
                 f"cat > ~/stand-hooks/{name}",
@@ -207,6 +220,60 @@ class Stand:
 
     def root(self, command: str) -> str:
         return run(["docker", "exec", NAME, "sh", "-c", command]).stdout.strip()
+
+    def publish(self, branches: dict[str, str]) -> None:
+        """Put the branches into "GitHub": the stand's and this machine's copy."""
+        if not self.github.exists():
+            run(["git", "init", "-q", "--bare", str(self.github)])
+            objects = run(
+                [
+                    "git",
+                    "-C",
+                    str(REPO),
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ]
+            ).stdout.strip()
+            (self.github / "objects/info/alternates").write_text(f"{objects}/objects\n")
+        for branch, rev in branches.items():
+            commit = run(
+                ["git", "-C", str(REPO), "rev-parse", f"{rev}^{{commit}}"]
+            ).stdout
+            run(
+                [
+                    "git",
+                    "-C",
+                    str(self.github),
+                    "update-ref",
+                    f"refs/heads/{branch}",
+                    commit.strip(),
+                ]
+            )
+        bundle = self.work / "github.bundle"
+        run(
+            [
+                "git",
+                "-C",
+                str(self.github),
+                "bundle",
+                "create",
+                "-q",
+                str(bundle),
+                "--all",
+            ]
+        )
+        with bundle.open("rb") as data:
+            subprocess.run(
+                [str(self.ssh), "cat > ~/github.bundle"],
+                stdin=data,
+                check=True,
+                timeout=600,
+            )
+        self.sh(
+            "git -C ~/github.git fetch -q ~/github.bundle '+refs/heads/*:refs/heads/*'"
+            " && rm ~/github.bundle"
+        )
 
     def compose(self, args: str, *, check: bool = True) -> str:
         return self.sh(f"cd {APP} && {COMPOSE} {args}", check=check)
@@ -268,7 +335,8 @@ def deploy_env(stand: Stand, gate: Path | None = None, **extra: str) -> dict[str
     env = dict(os.environ)
     env.update(
         DEPLOY_SSH=str(stand.gated if gate is not None else stand.ssh),
-        DEPLOY_BRANCH="",
+        DEPLOY_REMOTE=str(stand.github),
+        DEPLOY_BRANCH="production",
         STAND_GATE=str(gate or ""),
         DEPLOY_SERVER="stand",
         DEPLOY_COMPOSE=FAULT_COMPOSE,
@@ -1363,7 +1431,7 @@ def contract_scenarios(
     stand: Stand, journal: Journal, no_agent: str, other_image: str
 ) -> None:
     """Targets that break the contract (throwaway commits made by main())."""
-    result = deploy(stand, "--revision", no_agent)
+    result = deploy(stand, "--revision", no_agent, DEPLOY_BRANCH=THROWAWAY)
     journal.add(
         "21b",
         "Цель без сервиса `agent` в compose-файлах",
@@ -1379,7 +1447,7 @@ def contract_scenarios(
         },
         "одноразовый коммит: в compose.yml сервис agent переименован",
     )
-    result = deploy(stand, "--revision", other_image)
+    result = deploy(stand, "--revision", other_image, DEPLOY_BRANCH=THROWAWAY)
     journal.add(
         "21c",
         "Образ агента цели не `mentis-agent:latest`",
@@ -1850,6 +1918,7 @@ def main() -> int:
     try:
         stand.remove()
         stand.build()
+        stand.publish({"production": "HEAD", THROWAWAY: THROWAWAY})
         setup_production_copy(stand)
         t0_scenarios(stand, journal, sequence[0])
         eleven_deploys(stand, journal, [*sequence[1:], a])

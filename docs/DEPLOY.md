@@ -11,13 +11,17 @@
 ## 1. Архитектура
 
 ```
+                          GitHub astrix-z/MentisTradingAgent
+                                           ▲ git fetch production
+                                           │ (deploy key, только чтение)
 машина разработки                        сервер 192.168.55.40 «docker-host» (jb, группа docker)
 ┌──────────────────────────┐    ssh     ┌────────────────────────────────────────────────┐
 │  git (репозиторий)       │ ─────────► │  стек docker compose «mentis»:                 │
-│  ./scripts/deploy.sh     │            │    db       postgres:18 (volume, без порта)     │
-│  .env  (секреты dev)     │            │    redis    redis:7 (без порта)                 │
+│  ./scripts/deploy.sh     │  команды,  │    db       postgres:18 (volume, без порта)     │
+│  .env  (секреты dev)     │  не код    │    redis    redis:7 (без порта)                 │
 └──────────────────────────┘            │    backend  FastAPI+SPA :8000 → 0.0.0.0:8010    │
                                         │    agent    без портов, торгует через Binance API│
+                                        │  ~/apps/mentis-trading-agent.git  клон (bare)    │
                                         │  ~/apps/mentis-trading-agent   код (.env.prod)   │
                                         │  ~/backups/mentis-trading-agent/  дампы БД       │
                                         │  рядом (чужое, не трогать): plan-oplat, n8n,     │
@@ -91,9 +95,15 @@ push: `./scripts/deploy.sh --revision <предыдущая ревизия produ
 
 Скрипт (по умолчанию `DEPLOY_SERVER=192.168.55.40`, `DEPLOY_USER=jb`) локально
 только проверяет (SSH, ревизия не старше `608cfa1`, ревизия — вершина или предок
-`production` в `origin` (`DEPLOY_REMOTE`/`DEPLOY_BRANCH`), linger — §3) и загружает файлы
-**своей попытки**: артефакт ревизии в `~/apps/releases/stage-<попытка>/` и копию
-`scripts/deploy-fence.sh` из текущего дерева. Всё остальное делает **скрипт ограды на
+`production` в `origin` (`DEPLOY_REMOTE`/`DEPLOY_BRANCH`), linger — §3). **Код с машины
+разработки на сервер не копируется**: сервер сам делает `git fetch` ветки `production`
+из GitHub в свой клон `~/apps/mentis-trading-agent.git` (deploy key только на чтение,
+§3), ещё раз проверяет, что ревизия есть в полученной ветке, и распаковывает её
+(`git archive`) в файлы **своей попытки** — `~/apps/releases/stage-<попытка>/`. Поэтому
+выложить можно только то, что запушено в `production` на GitHub. С машины разработки
+приходит лишь копия `scripts/deploy-fence.sh` из текущего дерева — серверная половина
+самого инструмента выкладки (откат запускается текущим скриптом, §6). Fetch меняет
+только клон, не стек и не `releases/`. Всё остальное делает **скрипт ограды на
 сервере** в юните пользователя `mentis-deploy` (`systemctl --user status mentis-deploy`),
 поэтому обрыв SSH (сон ноутбука, VPN) выкладку не прерывает:
 
@@ -172,6 +182,31 @@ ssh jb@192.168.55.40 'chmod 600 ~/apps/mentis-trading-agent/.env.prod'
 `.env.prod.example` в git документирует все нужные переменные (порт/бинд,
 секреты, Binance-ключи). Реальный `.env.prod` на сервере в git не попадает
 (`.gitignore`) и `deploy.sh` его не трогает.
+
+**Клон репозитория и deploy key (один раз).** Сервер берёт код из GitHub сам, поэтому
+ему нужен свой ключ с доступом **только на чтение** и только к этому репозиторию
+(deploy key), а не ключ разработчика. На сервере:
+
+```sh
+ssh-keygen -t ed25519 -N '' -C 'mentis-deploy@docker-host' -f ~/.ssh/mentis_deploy
+# ключи хоста github.com — из API GitHub по HTTPS, а не «первому ответу» ssh
+curl -fsS https://api.github.com/meta \
+  | python3 -c 'import json,sys; [print("github.com", k) for k in json.load(sys.stdin)["ssh_keys"]]' \
+  >> ~/.ssh/known_hosts
+git init -q --bare ~/apps/mentis-trading-agent.git
+git -C ~/apps/mentis-trading-agent.git remote add origin git@github.com:astrix-z/MentisTradingAgent.git
+git -C ~/apps/mentis-trading-agent.git config core.sshCommand \
+  'ssh -i ~/.ssh/mentis_deploy -o IdentitiesOnly=yes'
+cat ~/.ssh/mentis_deploy.pub
+```
+
+Публичный ключ добавить в репозиторий (Settings → Deploy keys, **без** «Allow write
+access») или с машины разработки:
+`gh api repos/astrix-z/MentisTradingAgent/keys -f title=mentis-deploy@docker-host -f key="<ключ>" -F read_only=true`.
+Проверка на сервере:
+`git -C ~/apps/mentis-trading-agent.git fetch origin production && git -C ~/apps/mentis-trading-agent.git log -1 --oneline origin/production`.
+Без клона `deploy.sh` отказывает до записей на сервере («нет клона»), без доступа —
+«сервер не получил production». Ключ отзывается удалением его в Deploy keys.
 
 **Linger (один раз).** Скрипт ограды — юнит пользователя; без linger он умирает
 вместе с SSH-сессией, поэтому `deploy.sh` без него отказывает:
@@ -334,7 +369,8 @@ ratio 16:4:1"`, `Default` → `202`, команда `succeeded`. Повторн�
 2. **Секреты** — только в `.env` (машина разработки) и
    `~/apps/mentis-trading-agent/.env.prod` (сервер, права 600). В git не
    попадают.
-3. **Деплоится только закоммиченное** (`--revision` — только ревизии из git). Ручные правки внутри контейнеров не
+3. **Деплоится только запушенное в `production` на GitHub** (`--revision` — только
+   ревизии из её истории; сервер берёт код сам, §2). Ручные правки внутри контейнеров не
    переживут пересоздание — постоянное только через репозиторий (код) или
    volume (данные БД, `agent-signal-log`).
 4. **Известная проблема ре-скрининга** (`_rescreen_loop` может умереть
@@ -361,3 +397,11 @@ ratio 16:4:1"`, `Default` → `202`, команда `succeeded`. Повторн�
   `WEB_BIND` сменён с `127.0.0.1` на `0.0.0.0`, в firewalld добавлено rich
   rule (`public` zone, источник `192.168.55.0/24`, порт `8010/tcp`).
   Проверено с машины разработки: `http://192.168.55.40:8010` → 200.
+- **2026-10-07.** Сервер берёт код из GitHub сам (§2, §3): создан клон
+  `~/apps/mentis-trading-agent.git`, ключ `~/.ssh/mentis_deploy` добавлен в
+  репозиторий как deploy key `mentis-deploy@docker-host` только на чтение
+  (запись им отклоняется — проверено), ключи хоста `github.com` взяты из
+  `api.github.com/meta` и совпали с опубликованными. Проверочный fetch получил
+  `production` = `567f4f8`. Стек и `~/apps/mentis-trading-agent` при этом не
+  трогались; `deploy.sh` с этой схемой на сервере ещё не запускался (первый
+  запуск — с `--t0-revision`, §3).

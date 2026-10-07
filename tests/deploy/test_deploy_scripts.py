@@ -1,7 +1,9 @@
 """scripts/deploy.sh and scripts/deploy-fence.sh against stubbed tools (PRESET-09a).
 
 The "server" is this machine: ``DEPLOY_SSH="bash -c"`` with a temporary
-``HOME``, so every remote command runs locally. ``systemctl``,
+``HOME``, so every remote command runs locally. "GitHub" is a bare repository
+whose ``production`` is HEAD; the server's clone fetches from it. Both borrow
+this checkout's objects, so nothing is copied. ``systemctl``,
 ``systemd-run``, ``loginctl``, ``docker`` and ``curl`` are stubs on ``PATH``
 whose state lives in files and whose calls are logged, so the tests can put
 the unit, Redis, images and containers into any state and check the order of
@@ -18,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -58,8 +61,12 @@ CATALOG_FIXTURE = ROOT / "frontend/tests/fixtures/strategy-catalog.json"
 
 
 def git(*args: str) -> str:
+    return git_in(ROOT, *args)
+
+
+def git_in(repo: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", *args], cwd=ROOT, check=True, capture_output=True, text=True
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
     ).stdout.strip()
 
 
@@ -68,6 +75,26 @@ REVISION = git("rev-parse", "--short=7", "HEAD")
 NO_LOCK = git("rev-parse", "--short=7", "c26ff56")
 T0 = git("rev-parse", "--short=7", "4029132")
 BEFORE_CATALOG = git("rev-parse", "--short=7", "608cfa1^")
+#: Objects of this checkout, borrowed by "GitHub" and the server's clone.
+OBJECTS = (
+    Path(git("rev-parse", "--path-format=absolute", "--git-common-dir")) / "objects"
+)
+
+
+def bare_repo(path: Path) -> Path:
+    """A bare repository that reads this checkout's objects."""
+    subprocess.run(["git", "init", "-q", "--bare", str(path)], check=True)
+    (path / "objects/info/alternates").write_text(f"{OBJECTS}\n")
+    return path
+
+
+def set_branch(repo: Path, branch: str, rev: str) -> None:
+    commit = git("rev-parse", f"{rev}^{{commit}}")
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", f"refs/heads/{branch}", commit],
+        check=True,
+    )
+
 
 STUBS: dict[str, str] = {
     "loginctl": """
@@ -254,6 +281,11 @@ class Server:
     home: Path
     state: Path
     env: dict[str, str]
+    github: Path
+
+    @property
+    def clone(self) -> Path:
+        return self.home / "apps/mentis-trading-agent.git"
 
     @property
     def releases(self) -> Path:
@@ -309,13 +341,20 @@ def server(tmp_path: Path, request: pytest.FixtureRequest) -> Server:
         stub = bin_dir / name
         stub.write_text("#!/usr/bin/env bash\n" + textwrap.dedent(body))
         stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+    github = bare_repo(tmp_path / "github.git")
+    set_branch(github, "production", "HEAD")
+    clone = bare_repo(home / "apps/mentis-trading-agent.git")
+    subprocess.run(
+        ["git", "-C", str(clone), "remote", "add", "origin", str(github)], check=True
+    )
     env = {
         **os.environ,
         "HOME": str(home),
         "STATE": str(state),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "DEPLOY_SSH": "bash -c",
-        "DEPLOY_BRANCH": "",
+        "DEPLOY_REMOTE": str(github),
+        "DEPLOY_BRANCH": "production",
         "DEPLOY_POLL_S": "0.1",
         "DEPLOY_READ_RETRY_S": "1",
         "DEPLOY_READ_PAUSE_S": "0.1",
@@ -326,7 +365,7 @@ def server(tmp_path: Path, request: pytest.FixtureRequest) -> Server:
         "DEPLOY_CALL_TIMEOUT_S": "10",
         "BACKEND_PYTHON": sys.executable,
     }
-    server = Server(home=home, state=state, env=env)
+    server = Server(home=home, state=state, env=env, github=github)
     # A running stack that already went through 09a once: current = T0.
     server.releases.mkdir(parents=True)
     (server.releases / "current").write_text(f"{T0}\n")
@@ -730,19 +769,8 @@ def test_a_revision_older_than_the_catalog_key_is_refused(server: Server) -> Non
     assert "608cfa1" in result.stdout
 
 
-def production_remote(server: Server, tmp_path: Path, tip: str) -> None:
-    """A remote whose ``production`` branch stops at ``tip``."""
-    remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
-    git("push", "-q", str(remote), f"{tip}:refs/heads/production")
-    server.env["DEPLOY_REMOTE"] = str(remote)
-    server.env["DEPLOY_BRANCH"] = "production"
-
-
-def test_a_revision_outside_the_production_branch_is_refused(
-    server: Server, tmp_path: Path
-) -> None:
-    production_remote(server, tmp_path, f"{REVISION}^")
+def test_a_revision_outside_the_production_branch_is_refused(server: Server) -> None:
+    set_branch(server.github, "production", f"{REVISION}^")
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 1
     assert "не в ветке production" in result.stdout
@@ -750,12 +778,59 @@ def test_a_revision_outside_the_production_branch_is_refused(
     assert not any("systemd-run" in call for call in server.calls())
 
 
-def test_the_production_tip_passes_the_branch_check(
-    server: Server, tmp_path: Path
-) -> None:
-    production_remote(server, tmp_path, REVISION)
+def test_the_production_tip_passes_the_branch_check(server: Server) -> None:
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+# --- The code comes from GitHub through the server's clone --------------------------------
+
+
+def test_the_server_fetches_the_branch_and_unpacks_the_revision_from_its_clone(
+    server: Server,
+) -> None:
+    result = server.deploy("--revision", T0)
+    assert result.returncode == 0, result.stdout + result.stderr
+    fetched = git_in(server.clone, "rev-parse", "refs/remotes/origin/production")
+    assert fetched == git("rev-parse", "HEAD")
+    # APP_DIR holds the tree of T0 as the clone has it, not this checkout's.
+    app_dir = server.home / "apps/mentis-trading-agent"
+    assert (app_dir / "compose.yml").read_text() == git_in(
+        server.clone, "show", f"{T0}:compose.yml"
+    ) + "\n"
+
+
+def test_a_server_without_its_clone_writes_nothing(server: Server) -> None:
+    shutil.rmtree(server.clone)
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "нет клона" in result.stdout
+    assert not list(server.releases.glob("stage-*"))
+    assert not any("systemd-run" in call for call in server.calls())
+
+
+def test_a_failed_server_fetch_writes_nothing(server: Server) -> None:
+    git_in(server.clone, "remote", "set-url", "origin", str(server.github) + "-gone")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "сервер не получил production" in result.stdout
+    assert not list(server.releases.glob("stage-*"))
+    assert not any("systemd-run" in call for call in server.calls())
+
+
+def test_a_revision_the_server_did_not_get_from_github_is_refused(
+    server: Server, tmp_path: Path
+) -> None:
+    """The local check passes against another remote; the server's GitHub lags."""
+    ahead = bare_repo(tmp_path / "ahead.git")
+    set_branch(ahead, "production", REVISION)
+    set_branch(server.github, "production", f"{REVISION}^")
+    server.env["DEPLOY_REMOTE"] = str(ahead)
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "которую сервер получил из GitHub" in result.stdout
+    assert not list(server.releases.glob("stage-*"))
+    assert not any("systemd-run" in call for call in server.calls())
 
 
 def test_a_running_deploy_of_the_same_revision_is_joined(server: Server) -> None:
