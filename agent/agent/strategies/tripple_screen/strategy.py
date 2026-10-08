@@ -79,6 +79,8 @@ class TripleScreenStrategy(Strategy):
         self._rescreen_failures = 0
         self._rescreen_failing_since: datetime | None = None
         self._rescreen_error = ""
+        #: Outcome of the last stage-1 screen, for the Indicators Monitor.
+        self._screening: dict[str, Any] | None = None
 
     @property
     def settings(self) -> TripleScreenSettings:
@@ -178,7 +180,17 @@ class TripleScreenStrategy(Strategy):
                     },
                 }
             )
-        return {"groups": groups, "rows": transport_value(rows)}
+        snapshot: dict[str, Any] = {"groups": groups, "rows": transport_value(rows)}
+        if self._screening is not None:
+            # The screen is published before its selection is wired, so a
+            # failed wiring/bootstrap leaves "selected" ahead of the symbols
+            # actually at work; report both and the failure until recovery.
+            snapshot["screening"] = {
+                **self._screening,
+                "active": len(self._active_symbols),
+                "error": self._rescreen_error if self._rescreen_failures else None,
+            }
+        return snapshot
 
     def _intervals(self) -> tuple[str, str, str]:
         return (
@@ -258,6 +270,8 @@ class TripleScreenStrategy(Strategy):
         _, mid_period, slow_period = settings.ema_tide_periods
         semaphore = asyncio.Semaphore(settings.rest_concurrency)
         cutoff = int(datetime.now(UTC).timestamp() * 1000) - 1
+        # Why each symbol stayed out, for the Indicators Monitor.
+        skipped: dict[str, str] = {}
 
         async def screen_one(symbol: str) -> tuple[str, Decimal] | None:
             # A REST failure here propagates (via gather) exactly like a
@@ -278,6 +292,10 @@ class TripleScreenStrategy(Strategy):
                     len(candles),
                     settings.kline_window,
                 )
+                skipped[symbol] = (
+                    f"not enough {settings.tide_interval} history: "
+                    f"{len(candles)} of {settings.kline_window} closed bars"
+                )
                 return None
             closes = [c.close for c in window]
             ema_mid = ema_series(closes, mid_period)
@@ -290,6 +308,7 @@ class TripleScreenStrategy(Strategy):
                 or slow_prev is None
                 or slow_now is None
             ):
+                skipped[symbol] = "tide EMAs cannot be computed yet"
                 return None
             rising = mid_now > mid_prev and slow_now > slow_prev
             logger.debug(
@@ -300,6 +319,9 @@ class TripleScreenStrategy(Strategy):
                 {"previous": slow_prev, "current": slow_now},
             )
             if not rising or slow_now == 0:
+                skipped[symbol] = (
+                    f"tide EMA {mid_period} / EMA {slow_period} not both rising"
+                )
                 return None
             return symbol, (mid_now - slow_now) / slow_now
 
@@ -319,6 +341,18 @@ class TripleScreenStrategy(Strategy):
             symbol for symbol, _ in qualifiers if symbol not in keep_for_position
         ][:budget]
         selected = keep_for_position | set(admitted_new)
+        for symbol, _ in qualifiers:
+            if symbol not in selected:
+                skipped[symbol] = f"trend weaker than the top {budget} (ws_top_n)"
+        self._screening = {
+            "at": datetime.now(UTC).isoformat(),
+            "universe": len(self._universe),
+            "selected": len(selected),
+            "skipped": [
+                {"symbol": symbol, "reason": skipped[symbol]}
+                for symbol in sorted(skipped)
+            ],
+        }
         logger.debug(
             "tripple_screen screening cycle universe=%s qualifiers=%s "
             "kept_for_position=%s admitted=%s selected=%s",
