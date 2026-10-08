@@ -1230,6 +1230,100 @@ test("indicators monitor explains a failed read instead of an empty table", asyn
   await expect(page.getByRole("table")).toHaveCount(0)
 })
 
+test("indicators monitor explains an empty table with the last screening", async ({
+  page,
+}) => {
+  // Stage 2026-10-07: testnet was reset, every symbol lacked tide history and
+  // the page only said that nothing was selected.
+  const api = await mock(page)
+  await page.goto("/indicators")
+  await page.clock.install()
+  await page.getByRole("button", { name: "Refresh", exact: true }).click()
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "indicators",
+    ok: true,
+    at,
+    data: {
+      strategy: "tripple_screen",
+      network: "testnet",
+      computed_at: "2026-10-07T19:23:53+00:00",
+      groups: [],
+      rows: [],
+      screening: {
+        at: "2026-10-07T19:00:05+00:00",
+        universe: 3,
+        selected: 0,
+        skipped: [
+          {
+            symbol: "ADAUSDT",
+            reason: "not enough 1h history: 9 of 40 closed bars",
+          },
+          {
+            symbol: "BTCUSDT",
+            reason: "not enough 1h history: 9 of 40 closed bars",
+          },
+          { symbol: "ETHUSDT", reason: "tide EMA 13 / EMA 34 not both rising" },
+        ],
+      },
+    },
+  })
+  await page.clock.runFor(2000)
+  const screening = page.getByTestId("screening")
+  await expect(screening).toContainText(
+    "0 of 3 symbols selected for work at the last screening (2026-10-07 19:00 UTC)",
+  )
+  await expect(screening).toContainText(
+    "ADAUSDT, BTCUSDT: not enough 1h history: 9 of 40 closed bars",
+  )
+  await expect(screening).toContainText(
+    "ETHUSDT: tide EMA 13 / EMA 34 not both rising",
+  )
+  await expect(page.getByText("No symbols are selected")).toHaveCount(0)
+  await expect(page.getByRole("table")).toHaveCount(0)
+})
+
+test("indicators monitor explains a selection that failed to activate", async ({
+  page,
+}) => {
+  // Review of 869fdwr13: a symbol passed screening but subscribing it failed,
+  // so the table stayed empty under "1 of 1 symbols selected".
+  const api = await mock(page)
+  await page.goto("/indicators")
+  await page.clock.install()
+  await page.getByRole("button", { name: "Refresh", exact: true }).click()
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "indicators",
+    ok: true,
+    at,
+    data: {
+      strategy: "tripple_screen",
+      network: "testnet",
+      computed_at: "2026-10-08T05:00:10+00:00",
+      groups: [],
+      rows: [],
+      screening: {
+        at: "2026-10-08T05:00:05+00:00",
+        universe: 1,
+        selected: 1,
+        skipped: [],
+        active: 0,
+        error: "ValueError: No WebSocket connections available.",
+      },
+    },
+  })
+  await page.clock.runFor(2000)
+  const screening = page.getByTestId("screening")
+  await expect(screening).toContainText("1 of 1 symbols selected for work")
+  await expect(screening).toContainText(
+    "Only 0 of them are active: the selection could not be applied.",
+  )
+  await expect(screening.getByRole("alert")).toHaveText(
+    "The last screening cycle failed: ValueError: No WebSocket connections available.",
+  )
+})
+
 // --- Option list editor (PRESET-08, plan §4.4, §4.5.7) ---
 
 test("the list editor normalizes entries, keeps unsupported ones (D3) and saves regardless of the form", async ({

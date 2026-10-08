@@ -899,6 +899,11 @@ def test_screening_admits_by_cap_and_trend_strength() -> None:
         try:
             assert strategy._active_symbols == {"STRONG"}
             assert ("STRONG", "4h") in streams.subscribed
+            skipped = strategy.indicator_snapshot()["screening"]["skipped"]  # type: ignore[index]
+            assert skipped == [
+                {"symbol": "DOWN", "reason": "tide EMA 3 / EMA 4 not both rising"},
+                {"symbol": "WEAK", "reason": "trend weaker than the top 1 (ws_top_n)"},
+            ]
             assert not any(sym == "WEAK" for sym, _ in streams.subscribed)
             assert not any(sym == "DOWN" for sym, _ in streams.subscribed)
         finally:
@@ -925,6 +930,18 @@ def test_screening_skips_listing_younger_than_kline_window() -> None:
             # YOUNG rises harder but cannot be evaluated: not admitted.
             assert strategy._active_symbols == {"BTCUSDT"}
             assert not any(sym == "YOUNG" for sym, _ in streams.subscribed)
+            # The Indicators Monitor is told why YOUNG stayed out.
+            screening = strategy.indicator_snapshot()["screening"]  # type: ignore[index]
+            assert screening["universe"] == 2
+            assert screening["selected"] == 1
+            window = PARAMS["kline_window"]
+            assert screening["skipped"] == [
+                {
+                    "symbol": "YOUNG",
+                    "reason": f"not enough 4h history: {window - 1} of "
+                    f"{window} closed bars",
+                }
+            ]
         finally:
             await strategy.on_stop()
 
@@ -1170,6 +1187,81 @@ def test_rescreen_loop_recovers_from_failed_cycle() -> None:
             # The loop's own task is still tracked/alive, not dropped by
             # `_task_done` the way an unhandled exception used to drop it.
             assert len(strategy._tasks) == 2
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
+def test_screening_reports_a_selection_that_failed_to_activate() -> None:
+    """Screening publishes its outcome before the selection is wired. When the
+    wiring then fails, the Indicators Monitor must not show "1 of 1 selected"
+    over an empty table with no reason: the snapshot carries how many symbols
+    are actually active and the failure, until a later cycle recovers."""
+
+    class FlakyStreams(MultiStreams):
+        fail_next = False
+
+        async def subscribe_klines_batch(
+            self,
+            subscriptions: list[tuple[str, str, Callable[[KlineResponse], None]]],
+        ) -> None:
+            if self.fail_next:
+                self.fail_next = False
+                raise ValueError("No WebSocket connections available.")
+            await super().subscribe_klines_batch(subscriptions)
+
+    async def run() -> None:
+        full = fixture()
+        # One closed tide bar: BTCUSDT cannot qualify, nothing is active.
+        rest = MultiRest({"BTCUSDT": {**full, "4h": full["4h"][-1:]}})
+        streams, sink = FlakyStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        await strategy.on_start(multi_services(rest, streams, sink, ["BTCUSDT"]))
+        try:
+            screening = strategy.indicator_snapshot()["screening"]  # type: ignore[index]
+            assert (screening["selected"], screening["active"]) == (0, 0)
+            assert screening["error"] is None
+
+            boundaries = iter([0, 0])
+            strategy._next_rescreen_ms = (  # type: ignore[method-assign]
+                lambda now_ms: now_ms + next(boundaries, 10**9)
+            )
+            # The history fills in, but wiring the newly admitted symbol fails.
+            rest.windows["BTCUSDT"] = full
+            streams.fail_next = True
+
+            for _ in range(200):
+                if strategy.health_warning:
+                    break
+                await asyncio.sleep(0)
+            snapshot = strategy.indicator_snapshot()
+            assert snapshot is not None
+            assert snapshot["rows"] == []
+            screening = snapshot["screening"]
+            assert (screening["selected"], screening["active"]) == (1, 0)
+            assert screening["skipped"] == []
+            assert screening["error"] == (
+                "ValueError: No WebSocket connections available."
+            )
+
+            # The next cycle wires it: the failure is no longer reported.
+            for _ in range(200):
+                if strategy._active_symbols == {"BTCUSDT"}:
+                    break
+                await asyncio.sleep(0)
+            else:
+                pytest.fail("rescreen loop did not activate BTCUSDT")
+            for _ in range(200):
+                if strategy.health_warning is None:
+                    break
+                await asyncio.sleep(0)
+            snapshot = strategy.indicator_snapshot()
+            assert snapshot is not None
+            assert [row["symbol"] for row in snapshot["rows"]] == ["BTCUSDT"]
+            screening = snapshot["screening"]
+            assert (screening["selected"], screening["active"]) == (1, 1)
+            assert screening["error"] is None
         finally:
             await strategy.on_stop()
 

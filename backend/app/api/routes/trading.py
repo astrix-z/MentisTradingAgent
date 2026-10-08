@@ -449,6 +449,27 @@ class IndicatorRow(BaseModel):
     groups: dict[str, IndicatorGroupValues]
 
 
+class ScreeningSkip(BaseModel):
+    symbol: str
+    reason: str
+
+
+class ScreeningSummary(BaseModel):
+    """Outcome of the strategy's last screen of its universe: how many symbols
+    it kept for work and, in the strategy's own words, why the others stayed
+    out — so an empty table is explained rather than blank."""
+
+    at: datetime
+    universe: int
+    selected: int
+    skipped: list[ScreeningSkip]
+    #: Symbols actually at work; below ``selected`` when applying the screen
+    #: failed. Absent from agents that predate it.
+    active: int | None = None
+    #: Why the last screening cycle failed, until a later cycle succeeds.
+    error: str | None = None
+
+
 class IndicatorSnapshot(BaseModel):
     """Documented shape of ``CommandResult.data`` for a succeeded
     ``indicators`` command, as produced by ``Strategy.indicator_snapshot`` in
@@ -463,6 +484,8 @@ class IndicatorSnapshot(BaseModel):
     computed_at: datetime
     groups: list[IndicatorGroupDeclaration]
     rows: list[IndicatorRow]
+    #: Absent when the strategy does not screen its universe.
+    screening: ScreeningSummary | None = None
 
 
 class SignalPositionPublic(BaseModel):

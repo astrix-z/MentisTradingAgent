@@ -1313,6 +1313,50 @@ def test_indicator_snapshot_documents_the_agent_result_shape() -> None:
         }
     )
     assert snapshot.rows[0].groups["tide"].values["ema_fast"].current == "64210.5"
+    assert snapshot.screening is None
+
+
+def test_indicator_snapshot_documents_the_screening_summary() -> None:
+    snapshot = trading.IndicatorSnapshot.model_validate(
+        {
+            "strategy": "tripple_screen",
+            "network": "testnet",
+            "computed_at": "2026-10-07T19:30:00+00:00",
+            "groups": [],
+            "rows": [],
+            "screening": {
+                "at": "2026-10-07T19:00:05+00:00",
+                "universe": 1,
+                "selected": 0,
+                "skipped": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "reason": "not enough 1h history: 9 of 40 closed bars",
+                    }
+                ],
+            },
+        }
+    )
+    assert snapshot.screening is not None
+    assert snapshot.screening.skipped[0].symbol == "BTCUSDT"
+    # An agent predating the activation fields still validates.
+    assert snapshot.screening.active is None
+    assert snapshot.screening.error is None
+
+
+def test_indicator_snapshot_carries_a_failed_activation() -> None:
+    screening = trading.ScreeningSummary.model_validate(
+        {
+            "at": "2026-10-07T19:00:05+00:00",
+            "universe": 1,
+            "selected": 1,
+            "skipped": [],
+            "active": 0,
+            "error": "ValueError: No WebSocket connections available.",
+        }
+    )
+    assert (screening.selected, screening.active) == (1, 0)
+    assert screening.error == "ValueError: No WebSocket connections available."
 
 
 def test_start_carries_validated_execution_settings(
