@@ -355,7 +355,10 @@ class Strategy(abc.ABC):
                         }}}],
               # optional: why the universe narrowed to ``rows``
               "screening": {"at": ISO-8601 UTC, "universe", "selected",
-                            "skipped": [{"symbol", "reason"}]},
+                            "skipped": [{"symbol", "reason"}],
+                            # symbols actually wired; below "selected" when
+                            # applying the screen failed with "error"
+                            "active", "error": str | None},
             }
 
         Declaring the groups here keeps the UI generic: it renders whatever

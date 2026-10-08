@@ -1283,6 +1283,47 @@ test("indicators monitor explains an empty table with the last screening", async
   await expect(page.getByRole("table")).toHaveCount(0)
 })
 
+test("indicators monitor explains a selection that failed to activate", async ({
+  page,
+}) => {
+  // Review of 869fdwr13: a symbol passed screening but subscribing it failed,
+  // so the table stayed empty under "1 of 1 symbols selected".
+  const api = await mock(page)
+  await page.goto("/indicators")
+  await page.clock.install()
+  await page.getByRole("button", { name: "Refresh", exact: true }).click()
+  api.results.set(firstId, {
+    command_id: firstId,
+    type: "indicators",
+    ok: true,
+    at,
+    data: {
+      strategy: "tripple_screen",
+      network: "testnet",
+      computed_at: "2026-10-08T05:00:10+00:00",
+      groups: [],
+      rows: [],
+      screening: {
+        at: "2026-10-08T05:00:05+00:00",
+        universe: 1,
+        selected: 1,
+        skipped: [],
+        active: 0,
+        error: "ValueError: No WebSocket connections available.",
+      },
+    },
+  })
+  await page.clock.runFor(2000)
+  const screening = page.getByTestId("screening")
+  await expect(screening).toContainText("1 of 1 symbols selected for work")
+  await expect(screening).toContainText(
+    "Only 0 of them are active: the selection could not be applied.",
+  )
+  await expect(screening.getByRole("alert")).toHaveText(
+    "The last screening cycle failed: ValueError: No WebSocket connections available.",
+  )
+})
+
 // --- Option list editor (PRESET-08, plan §4.4, §4.5.7) ---
 
 test("the list editor normalizes entries, keeps unsupported ones (D3) and saves regardless of the form", async ({

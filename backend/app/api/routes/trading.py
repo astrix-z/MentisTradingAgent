@@ -463,6 +463,11 @@ class ScreeningSummary(BaseModel):
     universe: int
     selected: int
     skipped: list[ScreeningSkip]
+    #: Symbols actually at work; below ``selected`` when applying the screen
+    #: failed. Absent from agents that predate it.
+    active: int | None = None
+    #: Why the last screening cycle failed, until a later cycle succeeds.
+    error: str | None = None
 
 
 class IndicatorSnapshot(BaseModel):

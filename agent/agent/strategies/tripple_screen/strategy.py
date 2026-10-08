@@ -182,7 +182,14 @@ class TripleScreenStrategy(Strategy):
             )
         snapshot: dict[str, Any] = {"groups": groups, "rows": transport_value(rows)}
         if self._screening is not None:
-            snapshot["screening"] = self._screening
+            # The screen is published before its selection is wired, so a
+            # failed wiring/bootstrap leaves "selected" ahead of the symbols
+            # actually at work; report both and the failure until recovery.
+            snapshot["screening"] = {
+                **self._screening,
+                "active": len(self._active_symbols),
+                "error": self._rescreen_error if self._rescreen_failures else None,
+            }
         return snapshot
 
     def _intervals(self) -> tuple[str, str, str]:

@@ -1339,6 +1339,24 @@ def test_indicator_snapshot_documents_the_screening_summary() -> None:
     )
     assert snapshot.screening is not None
     assert snapshot.screening.skipped[0].symbol == "BTCUSDT"
+    # An agent predating the activation fields still validates.
+    assert snapshot.screening.active is None
+    assert snapshot.screening.error is None
+
+
+def test_indicator_snapshot_carries_a_failed_activation() -> None:
+    screening = trading.ScreeningSummary.model_validate(
+        {
+            "at": "2026-10-07T19:00:05+00:00",
+            "universe": 1,
+            "selected": 1,
+            "skipped": [],
+            "active": 0,
+            "error": "ValueError: No WebSocket connections available.",
+        }
+    )
+    assert (screening.selected, screening.active) == (1, 0)
+    assert screening.error == "ValueError: No WebSocket connections available."
 
 
 def test_start_carries_validated_execution_settings(

@@ -56,6 +56,10 @@ type IndicatorSnapshot = {
     universe: number
     selected: number
     skipped: { symbol: string; reason: string }[]
+    // Symbols actually at work: below `selected` when applying the screen
+    // failed with `error`. Absent from agents that predate them.
+    active?: number | null
+    error?: string | null
   } | null
 }
 
@@ -220,6 +224,17 @@ function ScreeningSummary({
         {screening.selected} of {screening.universe} symbols selected for work
         at the last screening ({formatBarTime(screening.at)}).
       </p>
+      {screening.active != null && screening.active < screening.selected && (
+        <p>
+          Only {screening.active} of them are active: the selection could not be
+          applied.
+        </p>
+      )}
+      {screening.error && (
+        <p role="alert" className="text-destructive">
+          The last screening cycle failed: {screening.error}
+        </p>
+      )}
       {screening.skipped.length > 0 && (
         <ul className="list-disc pl-5 text-muted-foreground">
           {groupSkipped(screening.skipped).map(({ reason, symbols }) => (
