@@ -48,10 +48,12 @@ export function TradingStatusView({
       {actual?.message && (
         // One entry per line, and a bounded box: dozens of execution
         // divergences must scroll here, not stretch the page over screens.
+        // wrap-anywhere, unlike break-words, also shrinks the min-content
+        // width, so an unbroken id or URL cannot widen the grid on a phone.
         <p
           role="alert"
           data-testid="agent-message"
-          className="max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-md border p-2 font-mono text-xs"
+          className="max-h-48 overflow-y-auto whitespace-pre-wrap wrap-anywhere rounded-md border p-2 font-mono text-xs"
         >
           {actual.message.split("; ").join("\n")}
         </p>

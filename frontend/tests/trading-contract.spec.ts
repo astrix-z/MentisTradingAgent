@@ -748,6 +748,45 @@ test("a long agent message scrolls inside its box instead of stretching the page
   expect(fits).toBe(true)
 })
 
+test("an unbroken agent message wraps inside its box on a phone instead of widening the page", async ({
+  page,
+}) => {
+  // Review of 869fe049h: on 375 px a 256-character token widened the Status
+  // card and the page to ~1900 px.
+  await page.setViewportSize({ width: 375, height: 800 })
+  const status = snapshot()
+  status.actual!.message = `execution: ${"x".repeat(256)}`
+  await mock(page, status)
+  await page.goto("/strategy")
+  const box = page.getByTestId("agent-message")
+  await expect(box).toContainText("xxxx")
+  const { boxWidth, pageWidth, viewport } = await box.evaluate((el) => ({
+    boxWidth: el.getBoundingClientRect().width,
+    pageWidth: document.documentElement.scrollWidth,
+    viewport: window.innerWidth,
+  }))
+  expect(pageWidth).toBeLessThanOrEqual(viewport)
+  expect(boxWidth).toBeLessThan(viewport)
+
+  // The long-list case still scrolls vertically at this width.
+  status.actual!.message = `execution: ${Array.from(
+    { length: 60 },
+    (_, i) => `divergence:balance:COIN${i}USDT: 1.0 COIN${i} held`,
+  ).join("; ")}`
+  await mock(page, status)
+  await page.goto("/strategy")
+  const list = page.getByTestId("agent-message")
+  await expect(list).toContainText("COIN59USDT")
+  const { clientHeight, scrollHeight, width } = await list.evaluate((el) => ({
+    clientHeight: el.clientHeight,
+    scrollHeight: el.scrollHeight,
+    width: document.documentElement.scrollWidth,
+  }))
+  expect(clientHeight).toBeLessThanOrEqual(192)
+  expect(scrollHeight).toBeGreaterThan(clientHeight)
+  expect(width).toBeLessThanOrEqual(375)
+})
+
 test("desired/actual confirmed-running and stopped states render distinct control copy", async ({
   page,
 }) => {
