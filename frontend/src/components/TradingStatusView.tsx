@@ -45,7 +45,19 @@ export function TradingStatusView({
       <p>Actual network: {actual?.network?.toUpperCase() ?? "unknown"}</p>
       <p>Actual strategy: {actual?.strategy ?? "unknown"}</p>
       {actual && <p>Heartbeat: {actual.updated_at}</p>}
-      {actual?.message && <p role="alert">{actual.message}</p>}
+      {actual?.message && (
+        // One entry per line, and a bounded box: dozens of execution
+        // divergences must scroll here, not stretch the page over screens.
+        // wrap-anywhere, unlike break-words, also shrinks the min-content
+        // width, so an unbroken id or URL cannot widen the grid on a phone.
+        <p
+          role="alert"
+          data-testid="agent-message"
+          className="max-h-48 overflow-y-auto whitespace-pre-wrap wrap-anywhere rounded-md border p-2 font-mono text-xs"
+        >
+          {actual.message.split("; ").join("\n")}
+        </p>
+      )}
       <h2 className="font-semibold">
         Desired configuration (not execution confirmation)
       </h2>
