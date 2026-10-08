@@ -710,6 +710,44 @@ test("Stop sends an empty payload and never carries strategy settings", async ({
   expect(api.posts[0].body).toBeFalsy()
 })
 
+test("a long agent message scrolls inside its box instead of stretching the page", async ({
+  page,
+}) => {
+  // Stage: dozens of "divergence:balance" entries made the Strategy page
+  // about five screens long.
+  const status = snapshot()
+  const entries = Array.from(
+    { length: 60 },
+    (_, i) =>
+      `divergence:balance:COIN${i}USDT: 18446.00000000 COIN${i} held without a position`,
+  )
+  status.actual!.message = `execution: ${entries.join("; ")}`
+  await mock(page, status)
+  await page.goto("/strategy")
+  const box = page.getByTestId("agent-message")
+  await expect(box).toHaveAttribute("role", "alert")
+  await expect(box).toContainText("COIN59USDT")
+  // Each entry starts its own line.
+  expect(await box.innerText()).toContain(
+    "held without a position\ndivergence:balance:COIN1USDT",
+  )
+  const { clientHeight, scrollHeight } = await box.evaluate((el) => ({
+    clientHeight: el.clientHeight,
+    scrollHeight: el.scrollHeight,
+  }))
+  expect(clientHeight).toBeLessThanOrEqual(192)
+  expect(scrollHeight).toBeGreaterThan(clientHeight)
+
+  // A short message keeps its natural height: no empty scroll box.
+  status.actual!.message = "rescreen failing since 2026-10-08"
+  await mock(page, status)
+  await page.goto("/strategy")
+  const short = page.getByTestId("agent-message")
+  await expect(short).toHaveText("rescreen failing since 2026-10-08")
+  const fits = await short.evaluate((el) => el.scrollHeight <= el.clientHeight)
+  expect(fits).toBe(true)
+})
+
 test("desired/actual confirmed-running and stopped states render distinct control copy", async ({
   page,
 }) => {
