@@ -15,13 +15,16 @@
 #   DEPLOY_T0_CONFIRM=1    решение человека снять отказ сверки T0
 #   DEPLOY_COMPOSE         команда compose (по умолчанию "docker compose")
 #
-# Порядок: .current → [T0: проверка и закрепление] → снапшот и его ротация →
+# Порядок: .current → [T0: проверка и закрепление] → что умеет работающая
+# ревизия (флаг, исполнитель) → снапшот и его ротация →
 # проверки контракта цели и сборка :<revision> из stage → установка stage в
 # APP_DIR (всё до флага: сбой здесь не оставляет ни флага, ни остановленного
 # агента, а до установки и APP_DIR работающей ревизии) →
-# G4: (1) флаг, (2) stop agent, (3) DEL каталога, (4) retag :latest и up,
-# (5) ожидание каталога до 2 мин, healthcheck backend, (6) снятие флага →
-# releases/current, history, ротация образов и файлов попыток. Код выхода — в .exit попытки.
+# G4: [(0) stop backend, который не знает флага] (1) флаг, (2) stop agent,
+# [(2a) барьер исполнения при откате на ревизию без исполнителя] (3) DEL каталога,
+# (4) retag :latest и up, (5) ожидание каталога до 2 мин, healthcheck backend,
+# (6) снятие флага → releases/current, history, ротация образов и файлов попыток.
+# Код выхода — в .exit попытки.
 
 set -Eeuo pipefail
 
@@ -32,6 +35,7 @@ ATTEMPT="${2:?attempt}"
 
 APPS="$HOME/apps"
 APP_DIR="$APPS/mentis-trading-agent"
+CLONE="$APPS/mentis-trading-agent.git"
 RELEASES="$APPS/releases"
 BACKUP_DIR="$HOME/backups/mentis-trading-agent"
 STAGE="$RELEASES/stage-$ATTEMPT"
@@ -51,12 +55,23 @@ KEEP_REVISIONS=10
 #: Файлы (.log, .exit, копия скрипта ограды) стольких последних завершённых попыток.
 KEEP_ATTEMPTS=20
 SERVICES=(backend agent)
+#: С этой ревизии backend отвечает 503 на Start под флагом (PRESET-09a). Более
+#: ранний backend (T0 567f4f8) флага не знает — его закрывает только остановка
+#: (ревью релиза 869fgbyar).
+FENCE_SINCE=c26ff5679de3dd20863396cf6fdc00067530fc56
+#: С этой ревизии агент сопровождает реальные позиции с момента запуска (EXEC-11b).
+#: Ревизия раньше неё бросила бы позиции, UNKNOWN-входы и операции работающего
+#: исполнителя (ревью релиза 869fgbyaf).
+EXECUTOR_SINCE=e1333130fcd0472ecfaaaebb51eac498478931dd
+#: Остановлен ли backend, который не знает флага (шаг 0).
+BACKEND_QUIESCED=0
 
 exec >>"$LOG" 2>&1
 printf '%s %s\n' "$REVISION" "$ATTEMPT" >"$RELEASES/deploy.current"
 echo "==> $(date -Is) попытка $ATTEMPT, ревизия $REVISION, скрипт ограды $(sha256sum "$0" | cut -c1-12)"
 
-# PHASE говорит trap, что восстанавливать: before (ничего не тронуто), fenced
+# PHASE говорит trap, что восстанавливать: before (ничего не тронуто), quiesced
+# (backend, не знающий флага, остановлен, флага ещё нет), fenced
 # (флаг стоит, агент работает), stopped (агент остановлен, up не начат), up
 # (внутри up), waiting (агент цели запущен), lifted (флаг снят).
 PHASE=before
@@ -143,6 +158,11 @@ running_images() {
 how_to_lift() {
   echo "    Образы сейчас:"
   running_images
+  if (( BACKEND_QUIESCED )); then
+    echo "    backend ${PREVIOUS:-?} остановлен на шаге (0) и оставлен остановленным: флага он не"
+    echo "    знает, поднятый — сразу принимает Start. Поднимать — повторный deploy.sh или"
+    echo "    осознанно: compose start backend (Start открыт, пока работает этот backend)."
+  fi
   echo "    Флаг $FENCE_KEY остаётся (Start закрыт). Снять — только после проверки, по runbook"
   echo "    (docs/DEPLOY.md §6): повторный deploy.sh или redis-cli DEL $FENCE_KEY."
 }
@@ -183,7 +203,7 @@ on_exit() {
         echo "    Backend мог быть пересоздан и применить миграции: при «новый backend +"
         echo "    прежний агент» флаг снимается только повторным deploy.sh или решением человека."
         how_to_lift ;;
-      fenced|waiting)
+      quiesced|fenced|waiting)
         how_to_lift ;;
       lifted)
         # Сбой после снятия флага (current/history, ротация): fail closed —
@@ -206,6 +226,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 fail() { echo "ОШИБКА: $*"; exit 1; }
+# contains <commit> <revision>: есть ли <commit> в истории <revision> (по клону
+# сервера). Ревизии нет в клоне или git не ответил — сбой, а не «нет»: от ответа
+# зависит, закрыт ли Start и проверено ли исполнение.
+contains() {
+  git -C "$CLONE" cat-file -e "$2^{commit}" 2>/dev/null || fail "в клоне $CLONE нет ревизии $2"
+  local rc=0
+  git -C "$CLONE" merge-base --is-ancestor "$1" "$2" 2>/dev/null || rc=$?
+  (( rc <= 1 )) || fail "git не ответил, есть ли ${1:0:7} в истории $2"
+  return "$rc"
+}
 
 # Чужие stage не удаляются: по возрасту не отличить проигравшую попытку от
 # подготовленной, но ещё не запущенной (R108). Только отчёт для ручной уборки.
@@ -276,6 +306,19 @@ if [[ ! -s "$RELEASES/current" ]]; then
   echo "$(date -Is) $T0 t0" >>"$RELEASES/history"
   echo "    T0 = $T0: образы помечены, закреплён в releases/pinned"
 fi
+
+# --- Что умеет работающая ревизия -----------------------------------------------
+# До снапшота и сборки: сбой ответа git ничего не оставляет.
+PREVIOUS="$(cat "$RELEASES/current" 2>/dev/null || true)"
+[[ "$PREVIOUS" =~ ^[0-9a-f]{7,40}$ ]] || fail "releases/current не ревизия: '$PREVIOUS'"
+LEGACY_BACKEND=0
+contains "$FENCE_SINCE" "$PREVIOUS" || LEGACY_BACKEND=1
+EXECUTION_BARRIER=0
+if contains "$EXECUTOR_SINCE" "$PREVIOUS" && ! contains "$EXECUTOR_SINCE" "$REVISION"; then
+  EXECUTION_BARRIER=1
+fi
+echo "==> Работает $PREVIOUS: backend $( (( LEGACY_BACKEND )) && echo 'не знает флага — будет остановлен до него (шаг 0)' || echo 'знает флаг')"
+(( EXECUTION_BARRIER )) && echo "    цель $REVISION без исполнителя, у $PREVIOUS он есть — барьер исполнения (шаг 2a)"
 
 # --- Снапшот БД и его ротация ------------------------------------------------
 if [[ "${DEPLOY_NO_BACKUP:-0}" != 1 ]]; then
@@ -354,6 +397,16 @@ mkdir -p "$APP_DIR"
 rsync -a --delete --exclude=/.env.prod "$STAGE/tree/" "$APP_DIR/"
 
 # --- G4 --------------------------------------------------------------------------
+if (( LEGACY_BACKEND )); then
+  # Флаг такой backend не читает: Start закрывает только его остановка. docker
+  # stop ждёт запросов в работе — Start, проверенный раньше, записывается до
+  # конца остановки или не записывается вовсе (запись — один Lua-скрипт).
+  echo "==> (0) остановка backend $PREVIOUS: он не знает флага"
+  PHASE=quiesced
+  BACKEND_QUIESCED=1
+  compose stop backend
+  [[ -z "$(compose ps -q backend)" ]] || fail "backend $PREVIOUS не остановился — Start не закрыт"
+fi
 echo "==> (1) флаг $FENCE_KEY"
 reply="$(redis_cli SET "$FENCE_KEY" "deploy $REVISION $ATTEMPT $(date -Is)")" \
   || fail "флаг $FENCE_KEY не поставлен: ${reply:-нет ответа}"
@@ -362,6 +415,13 @@ PHASE=fenced
 echo "==> (2) остановка агента"
 PHASE=stopped
 compose stop agent
+if (( EXECUTION_BARRIER )); then
+  # Агент остановлен: исполнение больше ничего не пишет, ответ окончательный.
+  # Спрашивает агент работающей ревизии — :latest ещё его образ (шаг 4 впереди).
+  echo "==> (2a) барьер исполнения: незавершённая работа во всех контекстах"
+  compose run --rm --no-deps -T --entrypoint python agent -m agent.execution.barrier \
+    || fail "откат на $REVISION запрещён: исполнение $PREVIOUS не завершено или не проверено (docs/DEPLOY.md §6)"
+fi
 echo "==> (3) удаление $CATALOG_KEY"
 redis_cli DEL "$CATALOG_KEY" >/dev/null
 echo "==> (4) :latest → :$REVISION и up"
