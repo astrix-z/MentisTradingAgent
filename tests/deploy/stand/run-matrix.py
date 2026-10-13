@@ -577,10 +577,19 @@ class Journal:
         self.rows.append(row)
         log(f"{sid} {'OK' if ok else 'FAIL'} {title} {failed or ''}")
 
-    def write(self, path: Path, *, head: str, started: datetime) -> None:
+    def write(
+        self,
+        path: Path,
+        *,
+        head: str,
+        started: datetime,
+        title: str = "PRESET-09a: приёмка выкладки на реальном стеке",
+        card: str = "PRESET-09a",
+        coverage: list[tuple[str, list[str]]] | None = None,
+    ) -> None:
         passed = sum(row.ok for row in self.rows)
         lines = [
-            "# PRESET-09a: приёмка выкладки на реальном стеке",
+            f"# {title}",
             "",
             (
                 f"Прогон {started:%Y-%m-%d %H:%M} – {datetime.now(UTC):%H:%M} UTC, "
@@ -629,7 +638,7 @@ class Journal:
         verdict = {row.sid: row.ok for row in self.rows}
         lines += [
             "",
-            "## Соответствие приёмке карточки PRESET-09a",
+            f"## Соответствие приёмке карточки {card}",
             "",
             (
                 "Каждый пункт раздела «Приёмка (локальный стек)» карточки и сценарии этого "
@@ -640,7 +649,7 @@ class Journal:
             "| Пункт приёмки | Сценарии | Итог |",
             "|---|---|---|",
         ]
-        for item, ids in COVERAGE:
+        for item, ids in COVERAGE if coverage is None else coverage:
             held = all(verdict.get(i, False) for i in ids)
             lines.append(f"| {item} | {', '.join(ids)} | {'✅' if held else '❌'} |")
         lines += ["", "## Подробности", ""]
@@ -654,7 +663,9 @@ class Journal:
                 lines += ["", "```", tail, "```"]
             lines.append("")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines))
+        # Deploy logs carry trailing spaces; the repo's hooks strip them.
+        text = "\n".join(line.rstrip() for line in "\n".join(lines).splitlines())
+        path.write_text(text.rstrip("\n") + "\n")
 
 
 # --- scenarios ---------------------------------------------------------------------------------
@@ -1852,6 +1863,413 @@ def rollback_to_t0(stand: Stand, journal: Journal) -> None:
 THROWAWAY = "stand/throwaway-targets"
 
 
+# --- release review 869fg9avr: the first deploy from T0 and a rollback to it --------------
+
+#: The acceptance of the review's subtasks and the scenarios that answer them.
+REVIEW_COVERAGE: list[tuple[str, list[str]]] = [
+    (
+        (
+            "869fgbyar: первый переход с backend T0 — барьер записи Start до остановки "
+            "агента; Start сразу после флага и Start, удержанный перед записью, не меняют "
+            "поток и desired"
+        ),
+        ["R1"],
+    ),
+    (
+        (
+            "869fgbyaf: при незавершённом исполнении откат на T0 запрещён (агент поднят "
+            "снова, флаг стоит); при завершённом — проходит"
+        ),
+        ["R2", "R3"],
+    ),
+    (
+        (
+            "869fgdkgu: откат на T0 падает после up (до и после запуска backend T0) — "
+            "Start закрыт, диагностика верна; повтор при работающем backend T0 и "
+            "current = кандидат останавливает его до флага; оба Start и удержанный "
+            "Start не меняют поток и desired; current/history верны"
+        ),
+        ["R4a", "R4b", "R4c"],
+    ),
+]
+
+
+def wait_health(stand: Stand) -> None:
+    for _ in range(90):
+        if stand.sh(
+            "curl -fsS http://127.0.0.1:8010/api/v1/utils/health-check/", check=False
+        ):
+            return
+        time.sleep(2)
+    raise RuntimeError("backend unhealthy")
+
+
+def try_api(method: str, path: str, body: Any = None) -> str:
+    """The answer's code, or why there was none (a stopped backend)."""
+    try:
+        code, _ = api(method, path, body)
+    except (urllib.error.URLError, OSError) as exc:
+        return f"нет ответа ({type(exc).__name__})"
+    return str(code)
+
+
+def desired(stand: Stand) -> tuple[Any, Any]:
+    raw = stand.compose("exec -T redis redis-cli GET agent:runtime", check=False)
+    try:
+        snapshot = json.loads(raw)
+    except ValueError:
+        return raw, None
+    return snapshot.get("running"), snapshot.get("revision")
+
+
+def remote_flag(stand: Stand, path: str, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if stand.sh(f"test -e {path} && echo y", check=False) == "y":
+            return True
+        time.sleep(0.3)
+    return False
+
+
+HOOKS = "-f compose.yml -f compose.prod.yml -f ~/stand-hooks/stand-hooks.yml"
+START = {
+    "network": "testnet",
+    "strategy": "tripple_screen",
+    "symbols": ["BTCUSDT"],
+}
+
+
+def start_body() -> dict[str, Any]:
+    """Read while a backend answers: the attempts below may find none."""
+    return {**START, "params": default_params()}
+
+
+def both_starts(body: dict[str, Any]) -> dict[str, str]:
+    return {
+        "start": try_api("POST", "/trading/start/", body),
+        "commands": try_api(
+            "POST", "/trading/commands/", {"type": "start", "payload": body}
+        ),
+    }
+
+
+def legacy_backend_with_hooks(stand: Stand) -> None:
+    """The backend :latest names (T0's) runs with the stand's Start hook."""
+    stand.sh(f"cd {APP} && docker compose --env-file .env.prod {HOOKS} up -d backend")
+    wait_health(stand)
+
+
+def held_start_through_fence(
+    stand: Stand, *args: str
+) -> tuple[Deploy, dict[str, bool], list[str]]:
+    """A deploy past a T0 backend: a Start held before its write, both Start
+    routes right after the flag; neither may reach the stream or desired."""
+    body = start_body()
+    stand.sh(
+        "mkdir -p ~/faults && rm -f ~/stand-state/start-held ~/faults/hold.waiting"
+        " && touch ~/stand-state/pause-start ~/faults/hold"
+    )
+    stream_before = stand.compose("exec -T redis redis-cli XLEN agent:commands:stream")
+    desired_before = desired(stand)
+    answer: dict[str, str] = {}
+    request = threading.Thread(
+        target=lambda: answer.update(held=try_api("POST", "/trading/start/", body)),
+        daemon=True,
+    )
+    request.start()
+    held = remote_flag(stand, "~/stand-state/start-held", 30)
+    stand.fault("flag-hold")
+    background = Background(stand, *args)
+    at_flag = remote_flag(stand, "~/faults/hold.waiting", 1500)
+    after_flag = both_starts(body)
+    backend_at_flag = stand.container("backend")
+    stand.sh("rm -f ~/faults/hold ~/stand-state/pause-start")
+    result = background.result()
+    request.join(30)
+    wait_health(stand)
+    stream_after = stand.compose("exec -T redis redis-cli XLEN agent:commands:stream")
+    desired_after = desired(stand)
+    out = result.out
+    quiesce, flag = out.find("(0) остановка backend"), out.find("(1) флаг")
+    checks = {
+        "Start удержан перед записью (хук стенда)": held,
+        "фенс дошёл до флага": at_flag,
+        "шаг (0) раньше флага": 0 <= quiesce < flag,
+        "backend T0 остановлен при флаге": backend_at_flag.endswith("exited"),
+        "/trading/start/ после флага не принят": not after_flag["start"].startswith(
+            "2"
+        ),
+        "/trading/commands/ после флага не принят": not after_flag[
+            "commands"
+        ].startswith("2"),
+        "поток команд не вырос": stream_before == stream_after,
+        "desired не изменился": desired_before == desired_after,
+    }
+    notes = [
+        (
+            f"удержанный Start: {answer.get('held', 'нет ответа')}; после флага: "
+            f"/trading/start/ {after_flag['start']}, /trading/commands/ "
+            f"{after_flag['commands']}; backend при флаге: {backend_at_flag}"
+        ),
+        (
+            f"XLEN agent:commands:stream {stream_before} → {stream_after}; desired "
+            f"(running, revision) {desired_before} → {desired_after}"
+        ),
+    ]
+    return result, checks, notes
+
+
+def first_deploy_from_t0(stand: Stand, journal: Journal, candidate: str) -> None:
+    """869fgbyar: T0's backend ignores the flag; the fence must stop it first."""
+    legacy_backend_with_hooks(stand)
+    result, checks, notes = held_start_through_fence(
+        stand, "--revision", candidate, "--t0-revision", T0
+    )
+    journal.add(
+        "R1",
+        "Первая выкладка с T0 `567f4f8`: Start удержан перед записью в backend T0, "
+        "Start по обоим маршрутам сразу после флага",
+        "backend T0 остановлен до флага; ни удержанный Start, ни Start после флага не "
+        "записаны; выкладка проходит",
+        candidate,
+        result,
+        stand.state(),
+        {
+            **checks,
+            "код 0": result.code == 0,
+            "current = кандидат": stand.current() == candidate,
+            "флаг снят": stand.fence() == "—",
+        },
+        *notes,
+    )
+
+
+def history(stand: Stand) -> list[str]:
+    lines = stand.sh(f"cat {RELEASES}/history", check=False).splitlines()
+    return [line.split()[1] for line in lines if len(line.split()) > 1]
+
+
+def failed_rollback_then_retry(stand: Stand, journal: Journal, candidate: str) -> None:
+    """869fgdkgu: a rollback to T0 fails after up; the retry must stop the T0
+    backend that really runs, though releases/current names the candidate."""
+    stand.fault(None)
+    probes = "docker ps -aq --filter name=mentis-deploy-probe | wc -l"
+    body = start_body()
+
+    # R4a: the runbook's downgrade skipped — T0's backend cannot start.
+    stream_before = stand.compose("exec -T redis redis-cli XLEN agent:commands:stream")
+    desired_before = desired(stand)
+    result = deploy(stand, "--revision", T0)
+    starts = both_starts(body)
+    journal.add(
+        "R4a",
+        "Откат кандидат → T0 без downgrade из runbook: backend T0 не проходит приёмку",
+        "сбой до запуска backend T0 (изолированный экземпляр без портов); backend "
+        "кандидата под флагом; Start закрыт; current — кандидат",
+        T0,
+        result,
+        stand.state(),
+        {
+            "код 1": result.code == 1,
+            "сбой в фазе waiting": has(result, "сбой в фазе waiting"),
+            "приёмка в изолированном экземпляре": has(
+                result, "изолированном экземпляре"
+            ),
+            "backend T0 не запускался": not has(result, "(6) запуск backend цели"),
+            "backend кандидата работает": stand.container("backend").startswith(
+                candidate
+            )
+            and stand.container("backend").endswith("running"),
+            "диагностика: Start закрыт": has(result, "Start закрыт"),
+            "/trading/start/ не принят": not starts["start"].startswith("2"),
+            "/trading/commands/ не принят": not starts["commands"].startswith("2"),
+            "поток команд не вырос": stand.compose(
+                "exec -T redis redis-cli XLEN agent:commands:stream"
+            )
+            == stream_before,
+            "desired не изменился": desired(stand) == desired_before,
+            "экземпляр приёмки удалён": stand.sh(probes) == "0",
+            "флаг стоит": stand.fence() != "—",
+            "current = кандидат": stand.current() == candidate,
+        },
+        f"Start после сбоя: /trading/start/ {starts['start']}, /trading/commands/ "
+        f"{starts['commands']}",
+    )
+
+    # R4b: by the runbook, and `up` of T0's backend reports a failure after it
+    # started — the backend that ignores the flag runs.
+    stand.compose("stop backend")
+    stand.compose("run --rm backend alembic downgrade b3f7a1c9d2e4")
+    stand.compose("stop agent")
+    stand.compose("exec -T redis redis-cli DEL agent:strategies")
+    stand.fault("backend-up")
+    result = deploy(stand, "--revision", T0)
+    starts = both_starts(body)
+    journal.add(
+        "R4b",
+        "Откат по runbook, `up` backend T0 сообщает сбой после запуска",
+        "приёмка пройдена до запуска; сбой в фазе opening; trap останавливает backend "
+        "T0; Start закрыт; current и history — кандидат",
+        T0,
+        result,
+        stand.state(),
+        {
+            "код 1": result.code == 1,
+            "приёмка до запуска": 0
+            <= result.out.find("Каталог проверяет backend цели")
+            < result.out.find("(6) запуск backend цели"),
+            "сбой в фазе opening": has(result, "сбой в фазе opening"),
+            "trap остановил backend T0": has(
+                result, "работающий backend не знает флага"
+            )
+            and stand.container("backend").startswith(T0)
+            and stand.container("backend").endswith("exited"),
+            "диагностика: Start закрыт": has(
+                result, "backend не работает — Start закрыт"
+            ),
+            "/trading/start/ не принят": not starts["start"].startswith("2"),
+            "/trading/commands/ не принят": not starts["commands"].startswith("2"),
+            "флаг стоит": stand.fence() != "—",
+            "current = кандидат": stand.current() == candidate,
+            "T0 не в history": history(stand)[-1] == candidate,
+        },
+        f"Start после сбоя: /trading/start/ {starts['start']}, /trading/commands/ "
+        f"{starts['commands']}",
+    )
+
+    # R4c: the state the review reached — T0's backend runs (here started by
+    # hand, with the Start hook), current names the candidate. The retry.
+    legacy_backend_with_hooks(stand)
+    running = stand.container("backend")
+    result, checks, notes = held_start_through_fence(stand, "--revision", candidate)
+    journal.add(
+        "R4c",
+        "Повторная выкладка кандидата, когда работает backend T0, а current — кандидат",
+        "backend остановлен до флага по его образу, а не по current; удержанный Start "
+        "и Start после флага не записаны; выкладка проходит",
+        candidate,
+        result,
+        stand.state(),
+        {
+            "до повтора работает backend T0": running.startswith(T0)
+            and running.endswith("running"),
+            "решение по образу": has(result, f"Работает backend {T0}: флаг — no"),
+            **checks,
+            "код 0": result.code == 0,
+            "current = кандидат": stand.current() == candidate,
+            "history: кандидат, T0 не добавлен": history(stand)[-1] == candidate
+            and history(stand).count(T0) == 1,
+            "флаг снят": stand.fence() == "—",
+        },
+        *notes,
+    )
+
+
+#: A real position as the executor leaves it after Stop: protected, not closed.
+OPEN_POSITION = (
+    "INSERT INTO position (id, account, network, symbol, strategy, signal_id, status, "
+    "exit_policy, quantity, bought_qty, sold_qty, base_commission, bought_quote, "
+    "sold_quote, commission_quote, op_version, aggregate_seq, created_at, updated_at) "
+    "VALUES (gen_random_uuid(), 'stand', 'testnet', 'BTCUSDT', 'tripple_screen', "
+    "gen_random_uuid(), 'protected', '{}', 0.001, 0.001, 0, 0, 10, 0, 0, 0, 0, now(), "
+    "now())"
+)
+
+
+def agent_sql(stand: Stand, sql: str) -> str:
+    return stand.sh(
+        f'docker exec mentis-db-1 psql -U postgres -d agent -tAc "{sql}"', check=False
+    )
+
+
+def manual_barrier(stand: Stand) -> tuple[str, str]:
+    """Runbook §6 step 2a, by hand: the barrier in the running agent."""
+    out = stand.sh(
+        f"cd {APP} && {COMPOSE} exec -T agent python -m agent.execution.barrier;"
+        " echo code=$?",
+        check=False,
+    )
+    lines = out.splitlines()
+    code = lines[-1].removeprefix("code=") if lines else "?"
+    return code, " / ".join(lines[:-1])
+
+
+def rollback_to_t0_with_execution(
+    stand: Stand, journal: Journal, candidate: str
+) -> None:
+    """869fgbyaf: Stop and idle hold with a protected position; T0 would drop it."""
+    agent_sql(stand, OPEN_POSITION)
+    stand.fault(None)
+    # Runbook §6 steps 1, 2 and 2a.
+    stand.compose('exec -T redis redis-cli SET trading:start_fence "rollback stand"')
+    api("POST", "/trading/stop/")
+    time.sleep(10)
+    _, status = api("GET", "/trading/status/")
+    manual_code, manual_out = manual_barrier(stand)
+    # An operator who skips 2a: the fence asks again after stopping the agent.
+    result = deploy(stand, "--revision", T0)
+    journal.add(
+        "R2",
+        "Откат на T0 при защищённой позиции в БД агента после Stop (исполнитель её ведёт, "
+        "T0 — нет); шаг 2a runbook пропущен",
+        "барьер runbook: код 1; ограда отказывает на шаге (2a); агент кандидата поднят "
+        "снова; флаг стоит; current — кандидат",
+        T0,
+        result,
+        stand.state(),
+        {
+            "после Stop actual = idle": status["actual"]["state"] == "idle",
+            "барьер runbook: код 1": manual_code == "1",
+            "барьер runbook нашёл позицию": "positions=1" in manual_out,
+            "код 1": result.code == 1,
+            "ограда нашла позицию": has(result, "positions=1"),
+            "откат запрещён": has(result, "запрещён"),
+            "агент кандидата работает": stand.container("agent").startswith(candidate)
+            and stand.container("agent").endswith("running"),
+            "флаг стоит": stand.fence() != "—",
+            "current = кандидат": stand.current() == candidate,
+        },
+        f"барьер runbook: код {manual_code}: {manual_out}",
+    )
+    agent_sql(stand, "UPDATE position SET status = 'closed', closed_at = now()")
+    # Runbook §6 again, now to the end.
+    manual_code, manual_out = manual_barrier(stand)
+    stand.compose("stop backend")
+    stand.compose("run --rm backend alembic downgrade b3f7a1c9d2e4")
+    stand.compose("stop agent")
+    stand.compose("exec -T redis redis-cli DEL agent:strategies")
+    result = deploy(stand, "--revision", T0)
+    current = stand.compose("exec -T backend alembic current", check=False)
+    journal.add(
+        "R3",
+        "Тот же откат по runbook §6, когда позиция закрыта",
+        "барьер runbook: код 0; ограда пропускает; T0 на закреплённых образах; флаг снят",
+        T0,
+        result,
+        stand.state(),
+        {
+            "барьер runbook: код 0": manual_code == "0",
+            "код 0": result.code == 0,
+            "барьер ограды пуст": has(result, "no unfinished execution in any context"),
+            "без сборки": has(result, f"Образы :{T0} уже есть — без сборки"),
+            "alembic current = b3f7a1c9d2e4": "b3f7a1c9d2e4" in current,
+            "current = T0": stand.current() == T0,
+            "флаг снят": stand.fence() == "—",
+        },
+        f"барьер runbook: код {manual_code}: {manual_out}",
+    )
+
+
+def release_review(stand: Stand, journal: Journal, candidate: str) -> None:
+    stand.remove()
+    stand.build()
+    stand.publish({"production": "HEAD"})
+    setup_production_copy(stand)
+    first_deploy_from_t0(stand, journal, candidate)
+    failed_rollback_then_retry(stand, journal, candidate)
+    rollback_to_t0_with_execution(stand, journal, candidate)
+
+
 def throwaway_targets(work: Path) -> tuple[str, str]:
     """Two commits on a throwaway branch that break the target contract."""
     tree = work / "throwaway"
@@ -1890,6 +2308,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument(
+        "--only",
+        choices=["release-review"],
+        help="release-review: only the first deploy from T0 and the rollback to it "
+        "(release review 869fg9avr)",
+    )
     options = parser.parse_args()
     head = short("HEAD")
     started = datetime.now(UTC)
@@ -1914,6 +2338,35 @@ def main() -> int:
     sequence = list(dict.fromkeys(short(r) for r in picks))
     a, b = short(chain[-3]), short(chain[-2])
     sequence = [r for r in sequence if r not in (a, b)][:11]
+    if options.only == "release-review":
+        try:
+            release_review(stand, journal, head)
+        except Exception as exc:
+            journal.add(
+                "!",
+                "Прогон прерван",
+                "—",
+                "—",
+                None,
+                {},
+                {"без исключения": False},
+                textwrap.shorten(str(exc), 900),
+            )
+            raise
+        finally:
+            journal.write(
+                options.out,
+                head=head,
+                started=started,
+                title="Релиз 869fg9avr: первая выкладка с T0 и откат к нему на стенде",
+                card="869fg9avr (подзадачи 869fgbyar, 869fgbyaf, 869fgdkgu)",
+                coverage=REVIEW_COVERAGE,
+            )
+            log(f"journal: {options.out}")
+            if not options.keep:
+                stand.remove()
+            shutil.rmtree(work, ignore_errors=True)
+        return 0 if all(row.ok for row in journal.rows) else 1
     broken = throwaway_targets(work)
     try:
         stand.remove()
