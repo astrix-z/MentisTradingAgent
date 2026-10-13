@@ -1938,14 +1938,15 @@ START = {
 
 
 def start_body() -> dict[str, Any]:
+    """Read while a backend answers: the attempts below may find none."""
     return {**START, "params": default_params()}
 
 
-def both_starts() -> dict[str, str]:
+def both_starts(body: dict[str, Any]) -> dict[str, str]:
     return {
-        "start": try_api("POST", "/trading/start/", start_body()),
+        "start": try_api("POST", "/trading/start/", body),
         "commands": try_api(
-            "POST", "/trading/commands/", {"type": "start", "payload": start_body()}
+            "POST", "/trading/commands/", {"type": "start", "payload": body}
         ),
     }
 
@@ -1961,6 +1962,7 @@ def held_start_through_fence(
 ) -> tuple[Deploy, dict[str, bool], list[str]]:
     """A deploy past a T0 backend: a Start held before its write, both Start
     routes right after the flag; neither may reach the stream or desired."""
+    body = start_body()
     stand.sh(
         "mkdir -p ~/faults && rm -f ~/stand-state/start-held ~/faults/hold.waiting"
         " && touch ~/stand-state/pause-start ~/faults/hold"
@@ -1969,9 +1971,7 @@ def held_start_through_fence(
     desired_before = desired(stand)
     answer: dict[str, str] = {}
     request = threading.Thread(
-        target=lambda: answer.update(
-            held=try_api("POST", "/trading/start/", start_body())
-        ),
+        target=lambda: answer.update(held=try_api("POST", "/trading/start/", body)),
         daemon=True,
     )
     request.start()
@@ -1979,7 +1979,7 @@ def held_start_through_fence(
     stand.fault("flag-hold")
     background = Background(stand, *args)
     at_flag = remote_flag(stand, "~/faults/hold.waiting", 1500)
-    after_flag = both_starts()
+    after_flag = both_starts(body)
     backend_at_flag = stand.container("backend")
     stand.sh("rm -f ~/faults/hold ~/stand-state/pause-start")
     result = background.result()
@@ -2052,12 +2052,13 @@ def failed_rollback_then_retry(stand: Stand, journal: Journal, candidate: str) -
     backend that really runs, though releases/current names the candidate."""
     stand.fault(None)
     probes = "docker ps -aq --filter name=mentis-deploy-probe | wc -l"
+    body = start_body()
 
     # R4a: the runbook's downgrade skipped — T0's backend cannot start.
     stream_before = stand.compose("exec -T redis redis-cli XLEN agent:commands:stream")
     desired_before = desired(stand)
     result = deploy(stand, "--revision", T0)
-    starts = both_starts()
+    starts = both_starts(body)
     journal.add(
         "R4a",
         "Откат кандидат → T0 без downgrade из runbook: backend T0 не проходит приёмку",
@@ -2101,7 +2102,7 @@ def failed_rollback_then_retry(stand: Stand, journal: Journal, candidate: str) -
     stand.compose("exec -T redis redis-cli DEL agent:strategies")
     stand.fault("backend-up")
     result = deploy(stand, "--revision", T0)
-    starts = both_starts()
+    starts = both_starts(body)
     journal.add(
         "R4b",
         "Откат по runbook, `up` backend T0 сообщает сбой после запуска",
@@ -2356,7 +2357,7 @@ def main() -> int:
                 head=head,
                 started=started,
                 title="Релиз 869fg9avr: первая выкладка с T0 и откат к нему на стенде",
-                card="869fg9avr (подзадачи 869fgbyar, 869fgbyaf)",
+                card="869fg9avr (подзадачи 869fgbyar, 869fgbyaf, 869fgdkgu)",
                 coverage=REVIEW_COVERAGE,
             )
             log(f"journal: {options.out}")
