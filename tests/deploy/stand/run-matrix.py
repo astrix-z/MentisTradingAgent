@@ -663,7 +663,9 @@ class Journal:
                 lines += ["", "```", tail, "```"]
             lines.append("")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines))
+        # Deploy logs carry trailing spaces; the repo's hooks strip them.
+        text = "\n".join(line.rstrip() for line in "\n".join(lines).splitlines())
+        path.write_text(text.rstrip("\n") + "\n")
 
 
 # --- scenarios ---------------------------------------------------------------------------------
