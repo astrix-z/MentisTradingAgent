@@ -213,9 +213,12 @@ def test_boot_restores_the_stored_switch_fail_closed(
         engine, *_ = setup_engine(monkeypatch)
         runtime = fake_runtime()
         engine.execution = runtime
-        redis = Mock(get=AsyncMock(return_value=stored), set=AsyncMock())
+        redis = Mock(
+            get=AsyncMock(side_effect={REDIS_EXECUTION_KEY: stored}.get),
+            set=AsyncMock(),
+        )
         await commands.load_execution_settings(engine, redis)
-        redis.get.assert_awaited_once_with(REDIS_EXECUTION_KEY)
+        assert redis.get.await_args_list[0].args == (REDIS_EXECUTION_KEY,)
         assert runtime.settings.enabled is enabled
         if alert is None:
             assert "settings" not in runtime.alerts
@@ -235,5 +238,31 @@ def test_boot_without_redis_keeps_trading_off(monkeypatch: pytest.MonkeyPatch) -
         await commands.load_execution_settings(engine, redis)
         assert not runtime.settings.enabled
         assert "Redis unavailable" in runtime.alerts["settings"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("quote", "enabled"), [("USDC", False), ("USDT", True), (None, True)]
+)
+def test_a_stored_switch_the_resumed_strategy_cannot_trade_stays_off(
+    monkeypatch: pytest.MonkeyPatch, quote: str | None, enabled: bool
+) -> None:
+    # Review 869fgqxah, P2-3: applied at boot, a refused ON made the resume
+    # itself fail on "USDT only" — the strategy did not come back.
+    async def scenario() -> None:
+        engine, *_ = setup_engine(monkeypatch)
+        runtime = fake_runtime()
+        engine.execution = runtime
+        params = {} if quote is None else {"quote_asset": quote}
+        stored = {
+            REDIS_EXECUTION_KEY: json.dumps({"settings": {"enabled": True}}),
+            "agent:runtime": json.dumps({"running": True, "params": params}),
+        }
+        redis = Mock(get=AsyncMock(side_effect=stored.get), set=AsyncMock())
+        await commands.load_execution_settings(engine, redis)
+        assert runtime.settings.enabled is enabled
+        if not enabled:
+            assert "USDT only" in runtime.alerts["settings"]
 
     asyncio.run(scenario())

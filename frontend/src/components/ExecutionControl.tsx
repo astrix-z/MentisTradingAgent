@@ -56,6 +56,8 @@ export function executionModeLabel(mode: string | undefined): string {
   if (mode === "enabled") return "on — placing orders"
   const reason = /^paused\((.*)\)$/.exec(mode)?.[1]
   if (reason === "paused_by_owner") return "paused by the owner"
+  if (reason === "no_execution_lock")
+    return "on, taking the lock and reconciling with the exchange (can take minutes)"
   if (reason) return `on, entries held: ${reason}`
   return mode
 }
@@ -129,15 +131,17 @@ export function ExecutionControl({
   const busy = configure.isPending || pauseOrResume.isPending
   const latest = latestTrackedCommand(commands, isExecutionCommand)
 
-  /** The limits in the form, checked; `null` (and the issues shown) if not. */
-  const checkedLimits = (): Record<string, unknown> | null => {
-    const result = validateSettings({
+  const checkLimits = () =>
+    validateSettings({
       fields,
       values,
       lookups: {},
       constraints: section?.constraints ?? [],
       optionLists: {},
     })
+  /** The limits in the form, checked; `null` (and the issues shown) if not. */
+  const checkedLimits = (): Record<string, unknown> | null => {
+    const result = checkLimits()
     if (result.status === "valid") {
       setIssues([])
       return result.params
@@ -152,7 +156,11 @@ export function ExecutionControl({
 
   const onSwitch = (on: boolean) => {
     if (!on) {
-      configure.mutate({ ...desired, [SWITCH_FIELD]: false })
+      // Never blocked by the limits: off with the form's limits when they
+      // pass, else with the agent's defaults (review 869fgqxah, P3-1).
+      const result = checkLimits()
+      const limits = result.status === "valid" ? result.params : {}
+      configure.mutate({ ...limits, [SWITCH_FIELD]: false })
       return
     }
     const limits = checkedLimits()
@@ -160,7 +168,14 @@ export function ExecutionControl({
   }
   const onSaveLimits = () => {
     const limits = checkedLimits()
-    if (limits) configure.mutate({ ...limits, [SWITCH_FIELD]: desiredOn })
+    if (!limits) return
+    // Stored ON but the agent is off (it refused, or has not applied it):
+    // saving would switch real trading on again — confirm that like a switch.
+    if (desiredOn && mode === "off") {
+      setConfirming(limits)
+      return
+    }
+    configure.mutate({ ...limits, [SWITCH_FIELD]: desiredOn })
   }
   const onConfirm = () => {
     if (!confirming) return

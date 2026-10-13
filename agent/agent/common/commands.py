@@ -632,6 +632,20 @@ async def resume_from_runtime(engine: Engine, redis: Redis) -> None:
         logger.exception("resume failed: %s", exc)
 
 
+async def _resumed_quote(redis: Redis) -> str | None:
+    """The quote asset of the strategy the boot will resume, if any."""
+    try:
+        raw = await redis.get(REDIS_RUNTIME_KEY)
+        data = json.loads(raw) if raw else None
+    except RedisError, ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("running") is not True:
+        return None
+    params = data.get("params")
+    quote = params.get("quote_asset") if isinstance(params, dict) else None
+    return str(quote or "USDT")
+
+
 async def load_execution_settings(engine: Engine, redis: Redis) -> None:
     """Apply the stored real-trading settings at boot, before any resume.
 
@@ -657,6 +671,16 @@ async def load_execution_settings(engine: Engine, redis: Redis) -> None:
         if not isinstance(data, dict):
             raise ValueError("not an object")
         settings = ExecutionSettings.from_payload(data.get("settings"))
+        if settings.enabled:
+            quote = await _resumed_quote(redis)
+            if quote not in (None, "USDT"):
+                # Checked here because nothing runs yet: the resume would be
+                # refused and the strategy would not come back (review
+                # 869fgqxah, P2-3). The strategy wins; trading stays off.
+                raise ValueError(
+                    f"real trading supports USDT only; the strategy resumes "
+                    f"with quote_asset={quote}"
+                )
         await engine.configure_execution(settings)
     except ValueError as exc:
         runtime.alerts["settings"] = (

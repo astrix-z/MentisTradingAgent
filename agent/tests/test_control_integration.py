@@ -243,6 +243,8 @@ def test_start_signal_stop_and_failed_start(
             snapshot = json.loads(snapshot_raw)
             assert snapshot == {
                 **payload,
+                # Real trading has its own document (ClickUp 869fgqxah).
+                "execution": {},
                 "running": kind == "start",
                 "last_command": kind,
                 "revision": revision,

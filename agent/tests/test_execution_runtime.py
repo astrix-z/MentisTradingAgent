@@ -548,6 +548,25 @@ def test_with_trading_off_an_unreachable_account_does_not_refuse_the_start() -> 
     run(scenario)
 
 
+def test_a_refused_start_with_trading_on_leaves_execution_on_its_network() -> None:
+    # Review 869fgqxah, P2-2: the target moved before the new network was
+    # entered, so the watchdog led LIVE while the strategy stayed on testnet.
+    async def scenario(state: World) -> None:
+        runtime = state.runtime()
+        runtime.configure(ENABLED)
+        await runtime.prepare_start(network="testnet", params=USDT)
+        assert runtime.context == ExecutionContext("1001", "testnet")
+        state.exchange("live").fault("get_account", "reject")
+        with pytest.raises(TradeCallError):
+            await runtime.prepare_start(network="live", params=USDT)
+        assert runtime.target_network == "testnet"
+        await runtime.tick()
+        assert runtime.context == ExecutionContext("1001", "testnet")
+        assert runtime.may_mutate()
+
+    run(scenario)
+
+
 def test_configuring_changes_the_risk_version() -> None:
     async def scenario(state: World) -> None:
         runtime = state.runtime()

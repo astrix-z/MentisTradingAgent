@@ -733,13 +733,49 @@ def _start_command_payload(parsed: StartPayload) -> dict[str, Any]:
     }
 
 
+def _parse_execution(raw: str | None) -> ExecutionSnapshot:
+    """The stored document; an unreadable one reads as off so it can be
+    overwritten (the agent refuses it at boot the same way)."""
+    if not raw:
+        return ExecutionSnapshot()
+    try:
+        return ExecutionSnapshot.model_validate_json(raw)
+    except ValidationError:
+        logger.error("agent:execution is unreadable; treated as off")
+        return ExecutionSnapshot()
+
+
 async def _get_execution() -> ExecutionSnapshot:
     redis = get_redis()
     try:
         raw = await redis.get(REDIS_EXECUTION_KEY)
     except RedisError as exc:
         raise _redis_unavailable(exc) from exc
-    return ExecutionSnapshot.model_validate_json(raw) if raw else ExecutionSnapshot()
+    return _parse_execution(raw)
+
+
+def _usdt_only(quote: Any, loc: list[Any]) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail=[
+            {
+                "loc": loc,
+                "msg": f"real trading supports USDT only; quote_asset={quote} "
+                "can run with real trading off",
+                "type": "value_error",
+            }
+        ],
+    )
+
+
+def _quote_of(params: dict[str, Any]) -> str:
+    return str(params.get("quote_asset") or "USDT")
+
+
+async def _refuse_quote_while_trading(params: dict[str, Any]) -> None:
+    """A Start the agent would refuse while real trading is on, refused here."""
+    if _quote_of(params) != "USDT" and (await _get_execution()).enabled:
+        raise _usdt_only(_quote_of(params), ["body", "params", "quote_asset"])
 
 
 async def _configure_execution(request: ExecutionRequest) -> CommandEnvelope:
@@ -765,6 +801,12 @@ async def _configure_execution(request: ExecutionRequest) -> CommandEnvelope:
     if errors:
         raise HTTPException(status_code=422, detail=errors)
     settings = dict(request.settings)
+    if settings.get("enabled") is True:
+        # The agent refuses this too; saying it here keeps a refused switch
+        # from being stored ON (review 869fgqxah, P2-3).
+        desired = await _get_snapshot()
+        if desired is not None and _quote_of(desired.params) != "USDT":
+            raise _usdt_only(_quote_of(desired.params), ["body", "settings", "enabled"])
     envelope = CommandEnvelope(
         id=uuid.uuid4(),
         type="execution_configure",
@@ -775,11 +817,7 @@ async def _configure_execution(request: ExecutionRequest) -> CommandEnvelope:
     try:
         while True:
             raw = await redis.get(REDIS_EXECUTION_KEY)
-            current = (
-                ExecutionSnapshot.model_validate_json(raw)
-                if raw is not None
-                else ExecutionSnapshot()
-            )
+            current = _parse_execution(raw)
             document = ExecutionSnapshot(
                 settings=settings,
                 updated_at=envelope.issued_at,
@@ -1130,6 +1168,7 @@ async def issue_command(
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=json_safe_errors(exc)) from exc
         await _enforce_strategy_params(parsed.strategy, parsed.params, session)
+        await _refuse_quote_while_trading(parsed.params)
         return await _apply_command("start", _start_command_payload(parsed))
     if request.type == "balance":
         return await _apply_command("balance", request.payload)
@@ -1197,6 +1236,7 @@ async def start_trading(
     """Convenience alias: start trading on a network with a strategy."""
     await _refuse_start_if_fenced()
     await _enforce_strategy_params(payload.strategy, payload.params, session)
+    await _refuse_quote_while_trading(payload.params)
     return await _apply_command("start", _start_command_payload(payload))
 
 

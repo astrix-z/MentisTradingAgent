@@ -1870,3 +1870,32 @@ test("without a published execution section real trading cannot be switched", as
   ).toBeVisible()
   await expect(page.getByRole("switch")).toHaveCount(0)
 })
+
+test("saving limits while the agent refused ON asks to confirm turning it on", async ({
+  page,
+}) => {
+  // Review 869fgqxah, P3-1: stored ON, agent off — a save must not silently
+  // switch real trading on again.
+  const status = snapshot()
+  status.execution = {
+    settings: { enabled: true, max_symbols: 3 },
+    revision: 2,
+    updated_at: at,
+  }
+  status.actual = {
+    ...status.actual!,
+    execution: { mode: "off", leader: false, open_positions: 0, alerts: {} },
+  }
+  const api = await mock(page, status)
+  await page.goto("/strategy")
+  const card = page.getByRole("region", { name: "Real trading" })
+  await expect(card.getByText(/has not applied the switch yet/)).toBeVisible()
+  await card.getByText("Limits", { exact: true }).click()
+  await card.getByLabel("Max symbols").fill("2")
+  await card.getByRole("button", { name: "Save limits" }).click()
+  await expect(
+    page.getByRole("heading", { name: "Turn real trading on" }),
+  ).toBeVisible()
+  await page.getByRole("button", { name: "Cancel", exact: true }).click()
+  expect(api.posts).toEqual([])
+})

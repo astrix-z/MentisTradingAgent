@@ -1433,6 +1433,61 @@ def test_real_trading_is_set_apart_from_the_running_intent(
     assert status.json()["desired"]["running"] is True
 
 
+def test_real_trading_is_usdt_only_before_anything_is_stored(
+    client: TestClient, redis: MemoryRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 869fgqxah, P2-3: a switch the agent must refuse is not stored."""
+
+    async def any_params(*_: Any) -> None:
+        return None  # the fixture's schema has no quote_asset
+
+    monkeypatch.setattr(trading, "_enforce_strategy_params", any_params)
+    usdc = {**START, "params": {"quote_asset": "USDC"}}
+    redis.values[trading.REDIS_RUNTIME_KEY] = json.dumps(
+        {"running": True, "params": usdc["params"], "updated_at": NOW.isoformat()}
+    )
+    refused = client.post(
+        "/api/v1/trading/execution/",
+        json={"settings": {"enabled": True}},
+        headers=headers(client),
+    )
+    assert refused.status_code == 422
+    assert refused.json()["detail"][0]["loc"] == ["body", "settings", "enabled"]
+    assert trading.REDIS_EXECUTION_KEY not in redis.values
+    # Off is always accepted.
+    off = client.post(
+        "/api/v1/trading/execution/", json={"settings": {}}, headers=headers(client)
+    )
+    assert off.status_code == 202
+    # And with trading on, a Start quoted in USDC is refused before Redis.
+    redis.values[trading.REDIS_EXECUTION_KEY] = json.dumps(
+        {"settings": {"enabled": True}, "revision": 3}
+    )
+    published = len(redis.publications)
+    start = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "params": {"tp_pct": 12, "quote_asset": "USDC"}},
+        headers=headers(client),
+    )
+    assert start.status_code == 422
+    assert start.json()["detail"][0]["loc"] == ["body", "params", "quote_asset"]
+    assert len(redis.publications) == published
+
+
+def test_an_unreadable_switch_reads_off_and_can_be_overwritten(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    redis.values[trading.REDIS_EXECUTION_KEY] = "{not json"
+    status = client.get("/api/v1/trading/status/", headers=headers(client))
+    assert status.status_code == 200
+    assert status.json()["execution"]["settings"] == {}
+    written = client.post(
+        "/api/v1/trading/execution/", json={"settings": {}}, headers=headers(client)
+    )
+    assert written.status_code == 202
+    assert json.loads(redis.values[trading.REDIS_EXECUTION_KEY])["revision"] == 1
+
+
 def test_without_a_stored_switch_real_trading_reads_off(
     client: TestClient, redis: MemoryRedis
 ) -> None:

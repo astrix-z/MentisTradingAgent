@@ -347,7 +347,9 @@ class ExecutionRuntime:
             expected = current.account if busy and current is not None else None
             if self.context is not None and self.context.network != network:
                 await self._leave()
-            self.target_network = network
+            # ``target_network`` moves only with a Start that goes ahead: a
+            # refused one leaves the running strategy on its network, and the
+            # watchdog brings execution back there (review 869fgqxah, P2-2).
             if self.context is None and (self.schema_ready or enabled):
                 try:
                     await self._enter(
@@ -366,6 +368,7 @@ class ExecutionRuntime:
                     logger.warning(self.alerts["context"])
             elif expected is not None and self.trade is not None:
                 await self._verify_account(expected)
+            self.target_network = network
 
     def configure(self, settings: ExecutionSettings) -> None:
         """The owner's real-trading switch and limits, apart from any Start.

@@ -2,8 +2,9 @@
 
 Published in the catalog next to the strategy schemas (``execution`` section,
 see :mod:`agent.protocol`), validated by the backend with the same compiled
-schema before a Start reaches Redis, stored in the ``agent:runtime`` snapshot
-with the Start, and validated again here. ``enabled=false`` is observe-only:
+schema, stored in ``agent:execution`` by ``POST /trading/execution/`` and sent
+with ``execution_configure`` — never with a Start (ClickUp 869fgqxah) — and
+validated again here. ``enabled=false`` is observe-only:
 signals are recorded, nothing is sent.
 """
 
