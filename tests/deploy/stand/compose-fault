@@ -10,6 +10,9 @@
 #   up               `up` runs, then reports a failure (a partial up)
 #   catalog-timeout  `up` succeeds, then the new agent is paused: no catalog
 #   slow-up          `up` waits ~/faults/slow seconds first (default 60)
+#   flag-hold        the flag is set, then the fence waits while ~/faults/hold
+#                    exists (marks ~/faults/hold.waiting): "Start right after
+#                    the flag". Keep it under DEPLOY_CALL_TIMEOUT_S (10 s).
 set -u
 fault="$(cat "$HOME/faults/active" 2>/dev/null || true)"
 args=" $* "
@@ -34,6 +37,14 @@ case "$fault" in
     if [[ "$args" == *" up "* ]]; then
       fired
       sleep "$(cat "$HOME/faults/slow" 2>/dev/null || echo 60)"
+    fi ;;
+  flag-hold)
+    if [[ "$args" == *" SET trading:start_fence "* ]]; then
+      fired
+      docker compose "$@" || exit
+      touch "$HOME/faults/hold.waiting"
+      while [[ -e "$HOME/faults/hold" ]]; do sleep 0.2; done
+      exit 0
     fi ;;
 esac
 exec docker compose "$@"
