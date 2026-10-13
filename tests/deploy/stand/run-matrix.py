@@ -2013,45 +2013,81 @@ def agent_sql(stand: Stand, sql: str) -> str:
     )
 
 
+def manual_barrier(stand: Stand) -> tuple[str, str]:
+    """Runbook §6 step 2a, by hand: the barrier in the running agent."""
+    out = stand.sh(
+        f"cd {APP} && {COMPOSE} exec -T agent python -m agent.execution.barrier;"
+        " echo code=$?",
+        check=False,
+    )
+    lines = out.splitlines()
+    code = lines[-1].removeprefix("code=") if lines else "?"
+    return code, " / ".join(lines[:-1])
+
+
 def rollback_to_t0_with_execution(
     stand: Stand, journal: Journal, candidate: str
 ) -> None:
     """869fgbyaf: Stop and idle hold with a protected position; T0 would drop it."""
     agent_sql(stand, OPEN_POSITION)
     stand.fault(None)
+    # Runbook §6 steps 1, 2 and 2a.
+    stand.compose('exec -T redis redis-cli SET trading:start_fence "rollback stand"')
+    api("POST", "/trading/stop/")
+    time.sleep(10)
+    _, status = api("GET", "/trading/status/")
+    manual_code, manual_out = manual_barrier(stand)
+    # An operator who skips 2a: the fence asks again after stopping the agent.
     result = deploy(stand, "--revision", T0)
     journal.add(
         "R2",
-        "Откат на T0 при защищённой позиции в БД агента (исполнитель её ведёт, T0 — нет)",
-        "отказ на шаге (2a); агент кандидата поднят снова; флаг стоит; current — кандидат",
+        "Откат на T0 при защищённой позиции в БД агента после Stop (исполнитель её ведёт, "
+        "T0 — нет); шаг 2a runbook пропущен",
+        "барьер runbook: код 1; ограда отказывает на шаге (2a); агент кандидата поднят "
+        "снова; флаг стоит; current — кандидат",
         T0,
         result,
         stand.state(),
         {
+            "после Stop actual = idle": status["actual"]["state"] == "idle",
+            "барьер runbook: код 1": manual_code == "1",
+            "барьер runbook нашёл позицию": "positions=1" in manual_out,
             "код 1": result.code == 1,
-            "барьер нашёл позицию": has(result, "positions=1"),
+            "ограда нашла позицию": has(result, "positions=1"),
             "откат запрещён": has(result, "запрещён"),
             "агент кандидата работает": stand.container("agent").startswith(candidate)
             and stand.container("agent").endswith("running"),
             "флаг стоит": stand.fence() != "—",
             "current = кандидат": stand.current() == candidate,
         },
+        f"барьер runbook: код {manual_code}: {manual_out}",
     )
     agent_sql(stand, "UPDATE position SET status = 'closed', closed_at = now()")
+    # Runbook §6 again, now to the end.
+    manual_code, manual_out = manual_barrier(stand)
+    stand.compose("stop backend")
+    stand.compose("run --rm backend alembic downgrade b3f7a1c9d2e4")
+    stand.compose("stop agent")
+    stand.compose("exec -T redis redis-cli DEL agent:strategies")
     result = deploy(stand, "--revision", T0)
+    current = stand.compose("exec -T backend alembic current", check=False)
     journal.add(
         "R3",
-        "Тот же откат, когда позиция закрыта",
-        "барьер пройден, T0 поднят на закреплённых образах, флаг снят",
+        "Тот же откат по runbook §6, когда позиция закрыта",
+        "барьер runbook: код 0; ограда пропускает; T0 на закреплённых образах; флаг снят",
         T0,
         result,
         stand.state(),
         {
+            "барьер runbook: код 0": manual_code == "0",
             "код 0": result.code == 0,
-            "барьер пуст": has(result, "no unfinished execution in any context"),
+            "барьер ограды пуст": has(result, "no unfinished execution in any context"),
+            "без сборки": has(result, f"Образы :{T0} уже есть — без сборки"),
+            "alembic current = b3f7a1c9d2e4": "b3f7a1c9d2e4" in current,
             "current = T0": stand.current() == T0,
             "флаг снят": stand.fence() == "—",
         },
+        f"барьер runbook: код {manual_code}: {manual_out}",
     )
 
 
