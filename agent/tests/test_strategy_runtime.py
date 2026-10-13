@@ -15,11 +15,12 @@ import pytest
 from binance_sdk_spot.websocket_streams.models import KlineResponse, KlineResponseK
 from pydantic import ValidationError
 
+from agent.common.intervals import bar_open, interval_ms
 from agent.exchange.rest import ExchangeRest
 from agent.exchange.streams import MarketDataStreams
 from agent.strategies.base import Signal, StrategyServices
 from agent.strategies.tripple_screen.indicators import Candle
-from agent.strategies.tripple_screen.settings import TripleScreenSettings, interval_ms
+from agent.strategies.tripple_screen.settings import TripleScreenSettings
 from agent.strategies.tripple_screen.strategy import TripleScreenStrategy
 
 SYMBOL = "BTCUSDT"
@@ -318,7 +319,7 @@ def test_gap_swing_dedup_and_backfill() -> None:
     async def run() -> None:
         full = fixture()
         for interval in full:
-            strategy = TripleScreenStrategy({**PARAMS, "swing_low_h1_n": 12})
+            strategy = TripleScreenStrategy({**PARAMS, "swing_low_wave_n": 12})
             sink = RedisSink()
             incomplete = {i: list(bars) for i, bars in full.items()}
             incomplete[interval].pop(-3)
@@ -389,9 +390,12 @@ def test_bootstrap_full_1000_closed_and_paginated(
         {"kline_window": 10},
         {"stochastic_k_period": 0},
         {"fi_ema_period": -1},
-        {"swing_low_h1_n": 0},
+        {"swing_low_wave_n": 0},
+        {"swing_low_h1_n": 0},  # old name: moved, then rejected (not defaulted)
         {"wave_interval": "1M"},
-        {"ripple_interval": "5m"},
+        {"wave_interval": "3d"},
+        {"ripple_interval": "1h"},  # wave == ripple
+        {"tide_interval": "15m"},  # tide < wave
         {"tp_pct": "NaN"},
         {"stop_buffer_pct": 100},
         {"rest_concurrency": 2},
@@ -402,6 +406,13 @@ def test_bootstrap_full_1000_closed_and_paginated(
 def test_invalid_settings(params: dict[str, Any]) -> None:
     with pytest.raises((ValidationError, ValueError)):
         TripleScreenStrategy(params)
+
+
+def test_old_parameter_names_reach_the_strategy() -> None:
+    """A snapshot or queued Start from before the rename keeps its values."""
+    strategy = TripleScreenStrategy({"swing_low_h1_n": 7, "trail_m15_n": 9})
+    assert strategy.settings.swing_low_wave_n == 7
+    assert strategy.settings.trail_ripple_n == 9
 
 
 def test_settings_immutable_and_detached() -> None:
@@ -888,6 +899,11 @@ def test_screening_admits_by_cap_and_trend_strength() -> None:
         try:
             assert strategy._active_symbols == {"STRONG"}
             assert ("STRONG", "4h") in streams.subscribed
+            skipped = strategy.indicator_snapshot()["screening"]["skipped"]  # type: ignore[index]
+            assert skipped == [
+                {"symbol": "DOWN", "reason": "tide EMA 3 / EMA 4 not both rising"},
+                {"symbol": "WEAK", "reason": "trend weaker than the top 1 (ws_top_n)"},
+            ]
             assert not any(sym == "WEAK" for sym, _ in streams.subscribed)
             assert not any(sym == "DOWN" for sym, _ in streams.subscribed)
         finally:
@@ -914,6 +930,18 @@ def test_screening_skips_listing_younger_than_kline_window() -> None:
             # YOUNG rises harder but cannot be evaluated: not admitted.
             assert strategy._active_symbols == {"BTCUSDT"}
             assert not any(sym == "YOUNG" for sym, _ in streams.subscribed)
+            # The Indicators Monitor is told why YOUNG stayed out.
+            screening = strategy.indicator_snapshot()["screening"]  # type: ignore[index]
+            assert screening["universe"] == 2
+            assert screening["selected"] == 1
+            window = PARAMS["kline_window"]
+            assert screening["skipped"] == [
+                {
+                    "symbol": "YOUNG",
+                    "reason": f"not enough 4h history: {window - 1} of "
+                    f"{window} closed bars",
+                }
+            ]
         finally:
             await strategy.on_stop()
 
@@ -1165,6 +1193,81 @@ def test_rescreen_loop_recovers_from_failed_cycle() -> None:
     asyncio.run(run())
 
 
+def test_screening_reports_a_selection_that_failed_to_activate() -> None:
+    """Screening publishes its outcome before the selection is wired. When the
+    wiring then fails, the Indicators Monitor must not show "1 of 1 selected"
+    over an empty table with no reason: the snapshot carries how many symbols
+    are actually active and the failure, until a later cycle recovers."""
+
+    class FlakyStreams(MultiStreams):
+        fail_next = False
+
+        async def subscribe_klines_batch(
+            self,
+            subscriptions: list[tuple[str, str, Callable[[KlineResponse], None]]],
+        ) -> None:
+            if self.fail_next:
+                self.fail_next = False
+                raise ValueError("No WebSocket connections available.")
+            await super().subscribe_klines_batch(subscriptions)
+
+    async def run() -> None:
+        full = fixture()
+        # One closed tide bar: BTCUSDT cannot qualify, nothing is active.
+        rest = MultiRest({"BTCUSDT": {**full, "4h": full["4h"][-1:]}})
+        streams, sink = FlakyStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        await strategy.on_start(multi_services(rest, streams, sink, ["BTCUSDT"]))
+        try:
+            screening = strategy.indicator_snapshot()["screening"]  # type: ignore[index]
+            assert (screening["selected"], screening["active"]) == (0, 0)
+            assert screening["error"] is None
+
+            boundaries = iter([0, 0])
+            strategy._next_rescreen_ms = (  # type: ignore[method-assign]
+                lambda now_ms: now_ms + next(boundaries, 10**9)
+            )
+            # The history fills in, but wiring the newly admitted symbol fails.
+            rest.windows["BTCUSDT"] = full
+            streams.fail_next = True
+
+            for _ in range(200):
+                if strategy.health_warning:
+                    break
+                await asyncio.sleep(0)
+            snapshot = strategy.indicator_snapshot()
+            assert snapshot is not None
+            assert snapshot["rows"] == []
+            screening = snapshot["screening"]
+            assert (screening["selected"], screening["active"]) == (1, 0)
+            assert screening["skipped"] == []
+            assert screening["error"] == (
+                "ValueError: No WebSocket connections available."
+            )
+
+            # The next cycle wires it: the failure is no longer reported.
+            for _ in range(200):
+                if strategy._active_symbols == {"BTCUSDT"}:
+                    break
+                await asyncio.sleep(0)
+            else:
+                pytest.fail("rescreen loop did not activate BTCUSDT")
+            for _ in range(200):
+                if strategy.health_warning is None:
+                    break
+                await asyncio.sleep(0)
+            snapshot = strategy.indicator_snapshot()
+            assert snapshot is not None
+            assert [row["symbol"] for row in snapshot["rows"]] == ["BTCUSDT"]
+            screening = snapshot["screening"]
+            assert (screening["selected"], screening["active"]) == (1, 1)
+            assert screening["error"] is None
+        finally:
+            await strategy.on_stop()
+
+    asyncio.run(run())
+
+
 def test_next_rescreen_ms_is_tide_boundary_plus_buffer() -> None:
     strategy = TripleScreenStrategy(PARAMS)
     step = interval_ms("4h")
@@ -1172,3 +1275,219 @@ def test_next_rescreen_ms_is_tide_boundary_plus_buffer() -> None:
     assert strategy._next_rescreen_ms(now_ms) == step * 11 + 5_000
     # Exactly on a boundary still waits for the *next* one, not this instant.
     assert strategy._next_rescreen_ms(step * 10) == step * 11 + 5_000
+
+
+# 2026-09-21T00:00Z, a Monday: Binance weekly bars open on Mondays.
+MONDAY = 1_789_948_800_000
+DAY = 86_400_000
+
+
+@pytest.mark.parametrize(
+    ("interval", "boundary"),
+    [("1w", MONDAY), ("1d", MONDAY + 4 * DAY)],
+)
+def test_next_rescreen_follows_daily_and_weekly_closes(
+    interval: str, boundary: int
+) -> None:
+    strategy = TripleScreenStrategy({**PARAMS, "tide_interval": interval})
+    step = interval_ms(interval)
+    # The last instant of a bar: the rescreen fires right after it closes.
+    assert strategy._next_rescreen_ms(boundary - 1) == boundary + 5_000
+    # On the boundary itself the bar just opened; wait for its close.
+    assert strategy._next_rescreen_ms(boundary) == boundary + step + 5_000
+
+
+@pytest.mark.parametrize("interval", ["1w", "1d", "4h"])
+def test_slice_includes_the_bar_closing_exactly_at_cutoff(interval: str) -> None:
+    strategy = TripleScreenStrategy(PARAMS)
+    step = interval_ms(interval)
+    # 14 bars: a full 12-bar window plus one older and one closing after cutoff.
+    bars = [bar(MONDAY - (12 - i) * step, interval) for i in range(-1, 13)]
+    last_closed = bars[-2]
+    selected = strategy._slice(bars, interval, last_closed.close_time)
+    assert selected is not None
+    assert selected[-1] == last_closed
+    assert len(selected) == 12
+    # One millisecond earlier that bar has not closed yet: the window shifts.
+    earlier = strategy._slice(bars, interval, last_closed.close_time - 1)
+    assert earlier is not None
+    assert earlier[-1] == bars[-3]
+
+
+def test_weekly_window_is_full_and_continuous() -> None:
+    async def run() -> None:
+        step = interval_ms("1w")
+        weeks = [bar(MONDAY - (20 - i) * step, "1w") for i in range(21)]
+        rest = Rest({"1w": weeks}, page_size=5)
+        strategy = TripleScreenStrategy(PARAMS)
+        strategy._services = services(rest, Streams(), RedisSink())
+        # Friday 2026-09-25: the running week (opened Monday) is not closed.
+        cutoff = MONDAY + 4 * DAY + 12 * 3_600_000
+        window = await strategy._load_window(SYMBOL, "1w", cutoff)
+        assert len(window) == 12
+        assert window[-1].open_time == MONDAY - step
+        assert window[-1].close_time == MONDAY - 1
+        assert all(
+            later.open_time - earlier.open_time == step
+            for earlier, later in zip(window, window[1:], strict=False)
+        )
+        assert strategy._slice(window, "1w", cutoff) == window
+
+    asyncio.run(run())
+
+
+# --- Non-multiple timeframes (D1): which bar each screen reads ---------------
+
+HOUR = 3_600_000
+
+
+def utc(iso: str) -> int:
+    return int(datetime.fromisoformat(iso).replace(tzinfo=UTC).timestamp() * 1000)
+
+
+def series(interval: str, last_open: int, count: int = 30) -> list[Candle]:
+    """``count`` continuous closed bars, the newest opening at ``last_open``."""
+    step = interval_ms(interval)
+    return [bar(last_open - (count - 1 - i) * step, interval) for i in range(count)]
+
+
+class _Stop(Exception):
+    """Ends ``_decide`` once the wave window has been captured."""
+
+
+def _decide_windows(
+    strategy: TripleScreenStrategy, windows: dict[str, list[Candle]]
+) -> dict[str, list[Candle]]:
+    """The tide and wave windows ``_decide`` evaluates, captured at the source."""
+    seen: dict[str, list[Candle]] = {}
+    tide, wave, _ = strategy._intervals()
+
+    def fake_tide(candles: list[Candle]) -> dict[str, Any]:
+        seen[tide] = candles
+        return {"bullish_tide": True, "classification": "", "conditions": {}, "ema": {}}
+
+    def fake_wave(candles: list[Candle]) -> dict[str, Any]:
+        seen[wave] = candles
+        raise _Stop
+
+    strategy._tide = fake_tide  # type: ignore[method-assign]
+    strategy._wave = fake_wave  # type: ignore[method-assign]
+    with pytest.raises(_Stop):
+        strategy._decide(SYMBOL, windows)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("intervals", "trigger_open", "expected"),
+    [
+        # H12/H6/H4 (plan §4.1.4): ripple 04:00–07:59:59.999 reads the wave that
+        # closed 2026-09-24 23:59:59.999, although the wave 00:00–05:59:59.999
+        # has closed by the decision; the tide is the last one closed at 07:59.
+        (
+            ("12h", "6h", "4h"),
+            "2026-09-25T04:00:00",
+            {
+                "12h": "2026-09-24T12:00:00",
+                "6h": "2026-09-24T18:00:00",
+                "4h": "2026-09-25T04:00:00",
+            },
+        ),
+        # H6/H4/H1: the tide bar 00:00–05:59:59.999 closes exactly at the
+        # trigger close and is included; the wave 04:00–07:59 has not closed.
+        (
+            ("6h", "4h", "1h"),
+            "2026-09-25T05:00:00",
+            {
+                "6h": "2026-09-25T00:00:00",
+                "4h": "2026-09-25T00:00:00",
+                "1h": "2026-09-25T05:00:00",
+            },
+        ),
+    ],
+)
+def test_non_multiple_timeframes_select_exact_bars(
+    clock: ManualClock,
+    intervals: tuple[str, str, str],
+    trigger_open: str,
+    expected: dict[str, str],
+) -> None:
+    async def run() -> None:
+        tide, wave, ripple = intervals
+        trigger_at = utc(trigger_open)
+        trigger_close = trigger_at + interval_ms(ripple) - 1
+        clock.now_ms = trigger_close + 1
+        # Every bar that has closed by the decision, including newer waves.
+        windows = {
+            interval: [
+                c
+                for c in series(interval, bar_open(trigger_close, interval))
+                if c.close_time <= trigger_close
+            ]
+            for interval in intervals
+        }
+        strategy = TripleScreenStrategy(
+            {
+                **PARAMS,
+                "tide_interval": tide,
+                "wave_interval": wave,
+                "ripple_interval": ripple,
+            }
+        )
+        strategy._services = services(Rest(windows), Streams(), RedisSink())
+        strategy._candles[SYMBOL] = {i: list(bars) for i, bars in windows.items()}
+        trigger = windows[ripple][-1]
+        assert trigger.open_time == trigger_at
+
+        snapshot = await strategy._snapshot(SYMBOL, trigger)
+        assert snapshot is not None
+        for interval, last_open in expected.items():
+            selected = snapshot[interval]
+            assert len(selected) == 12
+            assert selected[-1].open_time == utc(last_open), interval
+
+        decided = _decide_windows(strategy, windows)
+        assert decided[tide] == snapshot[tide]
+        assert decided[wave] == snapshot[wave]
+
+    asyncio.run(run())
+
+
+def test_displaced_wave_is_reloaded_over_rest(clock: ManualClock) -> None:
+    """H12/H6/H4: once the fresh wave has pushed the needed one's window out of
+    the kline_window memory, ``_snapshot`` loads it back over REST."""
+
+    async def run() -> None:
+        trigger_at = utc("2026-09-25T04:00:00")
+        trigger_close = trigger_at + 4 * HOUR - 1
+        clock.now_ms = trigger_close + 1
+        waves = series("6h", utc("2026-09-25T00:00:00"))
+        history = {
+            "12h": series("12h", utc("2026-09-24T12:00:00")),
+            "6h": waves,
+            "4h": series("4h", trigger_at),
+        }
+        strategy = TripleScreenStrategy(
+            {
+                **PARAMS,
+                "tide_interval": "12h",
+                "wave_interval": "6h",
+                "ripple_interval": "4h",
+            }
+        )
+        rest = Rest(history)
+        strategy._services = services(rest, Streams(), RedisSink())
+        # Memory holds exactly kline_window bars per interval, ending with the
+        # fresh wave 00:00–05:59: the needed window (ending 18:00) lost its
+        # oldest bar.
+        strategy._candles[SYMBOL] = {i: bars[-12:] for i, bars in history.items()}
+        assert strategy._slice(waves[-12:], "6h", trigger_at) is None
+
+        snapshot = await strategy._snapshot(SYMBOL, history["4h"][-1])
+        assert snapshot is not None
+        assert snapshot["6h"][-1].open_time == utc("2026-09-24T18:00:00")
+        assert snapshot["6h"] == waves[-13:-1]
+        assert [call["interval"] for call in rest.calls] == ["6h"]
+        # The range ends with the close of the needed wave, not the fresh one.
+        assert rest.calls[0]["end_time"] == utc("2026-09-25T00:00:00") - 1
+
+    asyncio.run(run())

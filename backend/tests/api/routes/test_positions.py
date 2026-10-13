@@ -1,14 +1,16 @@
 """GET /trading/positions/ and the signal listener that feeds it.
 
-Positions are derived from ENTRY signals only (the strategy never places a
-real order and never emits EXIT today) and closed lazily on read once the
-last known price has crossed the stop/take level.
+Positions are derived from ENTRY signals (the strategy never places a real
+order) and closed by the agent's EXIT at the bar and price of the first
+stop/take crossing; a read that sees the last known price beyond a level is
+the fallback (ClickUp 869f6m7vn).
 """
 
 from __future__ import annotations
 
 import json
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -21,7 +23,7 @@ from sqlmodel import Session, delete, select
 from app.api.routes import trading
 from app.core.config import settings
 from app.core.signal_listener import _record_entry, _record_exit, _take_ref
-from app.models import SignalPosition
+from app.models import SignalExitPending, SignalPosition
 
 
 @pytest.fixture(autouse=True)
@@ -97,7 +99,8 @@ def test_record_exit_closes_the_open_position(db: Session) -> None:
             "symbol": "BTCUSDT",
             "exit_reason": "tp",
             "emitted_at": datetime.now(UTC).isoformat(),
-        }
+        },
+        "live",
     )
     row = db.exec(
         select(SignalPosition).where(SignalPosition.signal_id == "sig-3")
@@ -105,6 +108,31 @@ def test_record_exit_closes_the_open_position(db: Session) -> None:
     assert row is not None
     assert row.status == "hit_take"
     assert row.closed_at is not None
+
+
+def test_a_duplicate_exit_closes_one_position_on_its_network(db: Session) -> None:
+    # Review 2026-09-30: two open positions of one symbol plus a redelivered
+    # EXIT closed both; the query also ignored the network.
+    symbol = f"DUP{uuid.uuid4().hex[:8].upper()}USDT"
+    for signal_id, network in (("a", "live"), ("b", "live"), ("c", "testnet")):
+        _record_entry(
+            entry_payload(signal_id=f"{symbol}-{signal_id}", symbol=symbol), network
+        )
+    exit_payload = {
+        "symbol": symbol,
+        "exit_reason": "stop",
+        "emitted_at": datetime.now(UTC).isoformat(),
+    }
+    _record_exit(exit_payload, "live")
+    _record_exit(exit_payload, "live")  # redelivered
+    rows = {
+        row.signal_id: row.status
+        for row in db.exec(
+            select(SignalPosition).where(SignalPosition.symbol == symbol)
+        ).all()
+    }
+    assert sorted(rows.values()) == ["hit_stop", "open", "open"]
+    assert rows[f"{symbol}-c"] == "open"  # the other network is untouched
 
 
 def _universe_payload(last_price: str) -> str:
@@ -177,3 +205,85 @@ def test_positions_endpoint_closes_lazily_on_price_cross(
     ).first()
     assert row is not None
     assert row.status == expected_status
+    assert row.closed_by == (None if expected_status == "open" else "view")
+
+
+def _tracked_exit(
+    entry_id: str, *, at: datetime, price: str, reason: str = "stop"
+) -> dict[str, Any]:
+    return {
+        "type": "EXIT",
+        "symbol": "SENTUSDT",
+        "emitted_at": at.isoformat(),
+        "exit_reason": reason,
+        "entry_signal_id": entry_id,
+        "exit_price": price,
+    }
+
+
+def test_a_tracked_exit_closes_its_own_entry_at_the_crossing(db: Session) -> None:
+    # Three SENTUSDT positions were open at once; each EXIT names its ENTRY.
+    emitted = datetime(2026, 9, 23, 13, 0, tzinfo=UTC)
+    for k in range(3):
+        _record_entry(
+            entry_payload(
+                signal_id=f"sent-{k}",
+                symbol="SENTUSDT",
+                entry_ref="0.023",
+                swing_low_ref="0.02198799",
+                emitted_at=(emitted + timedelta(minutes=k)).isoformat(),
+            ),
+            "live",
+        )
+    crossed = datetime(2026, 9, 23, 14, 48, tzinfo=UTC)
+    _record_exit(_tracked_exit("sent-0", at=crossed, price="0.02198799"), "live")
+    rows = {
+        row.signal_id: row
+        for row in db.exec(
+            select(SignalPosition).where(SignalPosition.symbol == "SENTUSDT")
+        ).all()
+    }
+    for row in rows.values():
+        db.refresh(row)
+    first = rows["sent-0"]
+    assert (first.status, first.closed_price, first.closed_by) == (
+        "hit_stop",
+        "0.02198799",
+        "exit",
+    )
+    assert first.closed_at == crossed
+    assert rows["sent-1"].status == rows["sent-2"].status == "open"
+
+
+def test_a_tracked_exit_corrects_a_view_and_is_applied_once(db: Session) -> None:
+    _record_entry(entry_payload(signal_id="sent-v", symbol="SENTUSDT"), "live")
+    row = db.exec(
+        select(SignalPosition).where(SignalPosition.signal_id == "sent-v")
+    ).one()
+    row.status, row.closed_price, row.closed_by = "hit_stop", "0.02161", "view"
+    row.closed_at = datetime(2026, 9, 23, 15, 14, 52, tzinfo=UTC)
+    db.add(row)
+    db.commit()
+    crossed = datetime(2026, 9, 23, 14, 48, tzinfo=UTC)
+    _record_exit(_tracked_exit("sent-v", at=crossed, price="0.02198799"), "live")
+    later = crossed + timedelta(hours=1)
+    _record_exit(_tracked_exit("sent-v", at=later, price="1", reason="tp"), "live")
+    db.refresh(row)
+    assert (row.status, row.closed_price, row.closed_by) == (
+        "hit_stop",
+        "0.02198799",
+        "exit",
+    )
+    assert row.closed_at == crossed
+
+
+def test_a_tracked_exit_of_an_unknown_entry_changes_nothing(db: Session) -> None:
+    _record_entry(entry_payload(signal_id="sent-other", symbol="SENTUSDT"), "live")
+    _record_exit(
+        _tracked_exit("lost-entry", at=datetime.now(UTC), price="0.02"), "live"
+    )
+    row = db.exec(
+        select(SignalPosition).where(SignalPosition.signal_id == "sent-other")
+    ).one()
+    assert row.status == "open"
+    assert db.exec(select(SignalExitPending)).all() == []

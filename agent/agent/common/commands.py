@@ -49,6 +49,7 @@ from agent.engine import (
     Engine,
 )
 from agent.exchange import ExchangeError
+from agent.execution.orders import ReleaseRefused
 from agent.selection import save_selected, validate_selection
 from agent.strategies import STRATEGIES
 from agent.symbols import (
@@ -293,6 +294,7 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
     strategy = str(payload.get("strategy") or "")
     symbols = _as_symbols(payload.get("symbols"))
     params = _as_params(payload.get("params"))
+    execution = payload.get("execution")
     logger.info(
         "command start: network=%s strategy=%s symbols=%s params=%s",
         network,
@@ -308,6 +310,7 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
                 strategy=strategy,
                 symbols=symbols,
                 params=params,
+                execution=execution if isinstance(execution, dict) else None,
             ),
             timeout=timeout,
         )
@@ -336,6 +339,78 @@ async def _stop(ctx: CommandContext, _payload: dict[str, Any]) -> None:
     logger.info("command stop")
     await ctx.engine.stop()
     await ctx.report(ok=True, data={"running": False})
+
+
+@command("execution_pause")
+async def _execution_pause(ctx: CommandContext, _payload: dict[str, Any]) -> None:
+    """Stop taking new entries; positions, protection and exits continue."""
+    runtime = ctx.engine.execution
+    if runtime is None:
+        await ctx.report(ok=False, message="execution is not available")
+        return
+    runtime.pause()
+    await ctx.engine.publish_heartbeat()
+    await ctx.report(ok=True, data=runtime.heartbeat())
+
+
+@command("execution_resume")
+async def _execution_resume(ctx: CommandContext, _payload: dict[str, Any]) -> None:
+    runtime = ctx.engine.execution
+    if runtime is None:
+        await ctx.report(ok=False, message="execution is not available")
+        return
+    runtime.resume()
+    await ctx.engine.publish_heartbeat()
+    await ctx.report(ok=True, data=runtime.heartbeat())
+
+
+@command("close_position")
+async def _close_position(ctx: CommandContext, payload: dict[str, Any]) -> None:
+    """Sell one open position at market, through the position protocol."""
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    runtime = ctx.engine.execution
+    if not symbol:
+        await ctx.report(ok=False, message="symbol is required")
+        return
+    if runtime is None or runtime.close_position is None:
+        await ctx.report(ok=False, message="execution is not available")
+        return
+    try:
+        result = await runtime.close_position(symbol)
+    except LookupError as exc:
+        await ctx.report(ok=False, message=str(exc))
+        return
+    await ctx.report(
+        ok=True,
+        data={
+            "symbol": symbol,
+            "step": getattr(getattr(result, "step", None), "value", None),
+            "reason": getattr(result, "reason", None),
+        },
+    )
+
+
+@command("release_entry")
+async def _release_entry(ctx: CommandContext, payload: dict[str, Any]) -> None:
+    """Release an UNKNOWN entry whose order the agent proves was never placed."""
+    client_order_id = str(payload.get("client_order_id") or "").strip()
+    runtime = ctx.engine.execution
+    if not client_order_id:
+        await ctx.report(ok=False, message="client_order_id is required")
+        return
+    if runtime is None or runtime.release_entry is None:
+        await ctx.report(ok=False, message="execution is not available")
+        return
+    try:
+        result = await runtime.release_entry(client_order_id)
+    except ReleaseRefused as exc:
+        await ctx.report(ok=False, message=f"not released: {exc}")
+        return
+    await ctx.engine.publish_heartbeat()  # the reserve and the slot are free
+    await ctx.report(
+        ok=True,
+        data={"client_order_id": client_order_id, "reason": result.reason},
+    )
 
 
 @command("symbols")
@@ -511,8 +586,13 @@ async def resume_from_runtime(engine: Engine, redis: Redis) -> None:
         symbols,
     )
     try:
+        execution = data.get("execution")
         await engine.start_run(
-            network=network, strategy=strategy, symbols=symbols, params=params
+            network=network,
+            strategy=strategy,
+            symbols=symbols,
+            params=params,
+            execution=execution if isinstance(execution, dict) else None,
         )
     except Exception as exc:
         logger.exception("resume failed: %s", exc)

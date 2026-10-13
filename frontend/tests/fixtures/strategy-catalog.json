@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "schema_hash": "89757569c12b2485fed8615ccfced0a21ec1980c7281844ade98294449137580",
-  "published_at": "2026-09-15T13:42:56.416509+00:00",
+  "schema_hash": "8b8027b6133a825cfcf4c877ec5387b1c7740271f088d84b3d666aa3ed85d0f8",
+  "published_at": "2026-09-26T08:52:00.516307+00:00",
   "lookups": {
     "intervals_ms": {
       "1s": 1000,
@@ -15,7 +15,9 @@
       "4h": 14400000,
       "6h": 21600000,
       "8h": 28800000,
-      "12h": 43200000
+      "12h": 43200000,
+      "1d": 86400000,
+      "1w": 604800000
     }
   },
   "strategies": [
@@ -53,7 +55,9 @@
               "4h",
               "6h",
               "8h",
-              "12h"
+              "12h",
+              "1d",
+              "1w"
             ]
           },
           "wave_interval": {
@@ -75,7 +79,9 @@
               "4h",
               "6h",
               "8h",
-              "12h"
+              "12h",
+              "1d",
+              "1w"
             ]
           },
           "ripple_interval": {
@@ -97,7 +103,9 @@
               "4h",
               "6h",
               "8h",
-              "12h"
+              "12h",
+              "1d",
+              "1w"
             ]
           },
           "ema_tide_periods": {
@@ -164,16 +172,16 @@
             "default": "20",
             "title": "Oversold threshold"
           },
-          "swing_low_h1_n": {
+          "swing_low_wave_n": {
             "default": 2,
             "exclusiveMinimum": 0,
-            "title": "Swing low H1 N",
+            "title": "Swing low WAVE N",
             "type": "integer"
           },
-          "trail_m15_n": {
+          "trail_ripple_n": {
             "default": 2,
             "exclusiveMinimum": 0,
-            "title": "Trail M15 N",
+            "title": "Trail RIPPLE N",
             "type": "integer"
           },
           "stop_buffer_pct": {
@@ -220,6 +228,36 @@
             "default": "10",
             "title": "Take profit %"
           },
+          "trail_cap_pct": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "4",
+            "description": "The trailing stop never rises above fill \u00d7 (1 + cap/100); must be below the take-profit %.",
+            "title": "Trailing stop cap %"
+          },
+          "max_hold_hours": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+                "type": "string"
+              }
+            ],
+            "default": "8",
+            "description": "A position still open this long after its fill is sold.",
+            "title": "Max hold (hours)"
+          },
           "cooldown_minutes": {
             "default": 60,
             "minimum": 0,
@@ -240,9 +278,11 @@
             "type": "integer"
           },
           "ws_top_n": {
-            "default": 50,
+            "default": 30,
+            "description": "Stage-2 cap: of the symbols that pass the EMA13/EMA34 screen, at most this many are streamed and fully processed, ranked by trend strength (EMA13-over-EMA34 spread).",
             "exclusiveMinimum": 0,
-            "title": "WS top N symbols",
+            "maximum": 100,
+            "title": "Max active symbols",
             "type": "integer"
           },
           "volume_window": {
@@ -263,6 +303,16 @@
         "additionalProperties": false
       },
       "constraints": [
+        {
+          "cmp": "lt",
+          "lhs": {
+            "field": "trail_cap_pct"
+          },
+          "rhs": {
+            "field": "tp_pct"
+          },
+          "message": "trailing stop cap % must be below take profit %"
+        },
         {
           "cmp": "lt",
           "lhs": {
@@ -296,44 +346,28 @@
           "message": "EMA tide periods must be three strictly increasing positive periods"
         },
         {
-          "cmp": "eq",
+          "cmp": "gt",
           "lhs": {
             "lookup": "intervals_ms",
             "field": "tide_interval"
           },
           "rhs": {
-            "op": "mul",
-            "args": [
-              {
-                "const": 4
-              },
-              {
-                "lookup": "intervals_ms",
-                "field": "wave_interval"
-              }
-            ]
+            "lookup": "intervals_ms",
+            "field": "wave_interval"
           },
-          "message": "timeframes must have tide:wave:ripple ratio 16:4:1"
+          "message": "timeframes must satisfy tide > wave > ripple"
         },
         {
-          "cmp": "eq",
+          "cmp": "gt",
           "lhs": {
             "lookup": "intervals_ms",
             "field": "wave_interval"
           },
           "rhs": {
-            "op": "mul",
-            "args": [
-              {
-                "const": 4
-              },
-              {
-                "lookup": "intervals_ms",
-                "field": "ripple_interval"
-              }
-            ]
+            "lookup": "intervals_ms",
+            "field": "ripple_interval"
           },
-          "message": "timeframes must have tide:wave:ripple ratio 16:4:1"
+          "message": "timeframes must satisfy tide > wave > ripple"
         },
         {
           "cmp": "gte",
@@ -402,10 +436,10 @@
                 ]
               },
               {
-                "field": "swing_low_h1_n"
+                "field": "swing_low_wave_n"
               },
               {
-                "field": "trail_m15_n"
+                "field": "trail_ripple_n"
               },
               {
                 "const": 2
@@ -414,7 +448,223 @@
           },
           "message": "kline_window must be at least {rhs}"
         }
+      ],
+      "legacy_keys": {
+        "swing_low_h1_n": "swing_low_wave_n",
+        "trail_m15_n": "trail_ripple_n"
+      },
+      "presets": [
+        {
+          "name": "Default",
+          "params": {
+            "quote_asset": "USDT",
+            "tide_interval": "4h",
+            "wave_interval": "1h",
+            "ripple_interval": "15m",
+            "ema_tide_periods": [
+              5,
+              13,
+              34
+            ],
+            "stochastic_k_period": 5,
+            "stochastic_d_period": 3,
+            "stochastic_slow_period": 3,
+            "fi_ema_period": 2,
+            "oversold_threshold": "20",
+            "swing_low_wave_n": 2,
+            "trail_ripple_n": 2,
+            "stop_buffer_pct": "0.1",
+            "min_stop_distance_pct": "1",
+            "tp_pct": "10",
+            "trail_cap_pct": "4",
+            "max_hold_hours": "8",
+            "cooldown_minutes": 60,
+            "signal_validity_minutes": 15,
+            "rest_concurrency": 3,
+            "ws_top_n": 30,
+            "kline_window": 1000
+          }
+        },
+        {
+          "name": "Fast",
+          "params": {
+            "quote_asset": "USDT",
+            "tide_interval": "1h",
+            "wave_interval": "15m",
+            "ripple_interval": "5m",
+            "ema_tide_periods": [
+              5,
+              13,
+              34
+            ],
+            "stochastic_k_period": 5,
+            "stochastic_d_period": 3,
+            "stochastic_slow_period": 3,
+            "fi_ema_period": 2,
+            "oversold_threshold": "20",
+            "swing_low_wave_n": 2,
+            "trail_ripple_n": 2,
+            "stop_buffer_pct": "0.1",
+            "min_stop_distance_pct": "1",
+            "tp_pct": "5",
+            "trail_cap_pct": "1",
+            "max_hold_hours": "4",
+            "cooldown_minutes": 60,
+            "signal_validity_minutes": 5,
+            "rest_concurrency": 3,
+            "ws_top_n": 30,
+            "kline_window": 1000
+          }
+        }
       ]
     }
-  ]
+  ],
+  "execution": {
+    "name": "execution",
+    "label": "Execution",
+    "description": "Real order execution settings (plan \u00a74.3, \u00a77).",
+    "settings_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Place real orders on ENTRY. Off: signals are only recorded.",
+          "title": "Real execution",
+          "type": "boolean"
+        },
+        "max_slippage_pct": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "maximum": 5.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "0.3",
+          "title": "Max entry slippage %"
+        },
+        "unprotected_deadline_s": {
+          "default": 30,
+          "maximum": 300,
+          "minimum": 5,
+          "title": "Protection deadline (s)",
+          "type": "integer"
+        },
+        "daily_losing_trades_limit": {
+          "default": 5,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Losing trades per UTC day",
+          "type": "integer"
+        },
+        "max_symbols": {
+          "default": 3,
+          "maximum": 10,
+          "minimum": 1,
+          "title": "Max symbols",
+          "type": "integer"
+        },
+        "slot_quote": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "7",
+          "title": "Minimum per slot (USDT)"
+        },
+        "position_share": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "maximum": 1.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "0.9",
+          "title": "Deposit share in positions"
+        },
+        "stop_limit_gap_pct": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 10.0,
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "0.5",
+          "title": "Stop-limit gap %"
+        },
+        "quote_max_fetch_age_s": {
+          "default": 5,
+          "maximum": 60,
+          "minimum": 1,
+          "title": "Max quote fetch age (s)",
+          "type": "integer"
+        },
+        "quote_max_trade_age_s": {
+          "default": 60,
+          "maximum": 900,
+          "minimum": 1,
+          "title": "Max last-trade age (s)",
+          "type": "integer"
+        },
+        "unknown_escalate_s": {
+          "default": 120,
+          "maximum": 3600,
+          "minimum": 10,
+          "title": "Escalate unresolved UNKNOWN after (s)",
+          "type": "integer"
+        },
+        "reconcile_interval_s": {
+          "default": 60,
+          "maximum": 3600,
+          "minimum": 10,
+          "title": "Reconcile interval (s)",
+          "type": "integer"
+        },
+        "guard_grace_s": {
+          "default": 5,
+          "maximum": 120,
+          "minimum": 1,
+          "title": "Guard grace (s)",
+          "type": "integer"
+        },
+        "bnb_low_threshold": {
+          "anyOf": [
+            {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            }
+          ],
+          "default": "0.001",
+          "title": "BNB low warning below"
+        }
+      },
+      "title": "ExecutionSettings",
+      "type": "object"
+    },
+    "constraints": []
+  }
 }

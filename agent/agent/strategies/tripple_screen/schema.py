@@ -18,10 +18,13 @@ from typing import Any
 
 from binance_sdk_spot.rest_api.models import KlinesIntervalEnum
 
-from agent.strategies.tripple_screen.settings import interval_ms
+from agent.common.intervals import interval_ms
+from agent.strategies.tripple_screen.settings import (
+    TIMEFRAME_MESSAGE,
+    TRAIL_CAP_MESSAGE,
+)
 
 EMA_MESSAGE = "EMA tide periods must be three strictly increasing positive periods"
-RATIO_MESSAGE = "timeframes must have tide:wave:ripple ratio 16:4:1"
 
 
 def _intervals_ms() -> dict[str, int]:
@@ -29,8 +32,8 @@ def _intervals_ms() -> dict[str, int]:
 
     Derived from the SDK enums through the same :func:`interval_ms` the
     strategy uses, so the published list cannot drift from what a run accepts:
-    values the SDK knows but ``interval_ms`` rejects (calendar/week alignment)
-    are simply absent.
+    values the SDK knows but ``interval_ms`` rejects (``1M``, ``3d``: no fixed
+    grid) are simply absent.
     """
     allowed: dict[str, int] = {}
     for member in KlinesIntervalEnum:
@@ -49,6 +52,13 @@ LOOKUPS: dict[str, dict[str, int]] = {"intervals_ms": _intervals_ms()}
 #: Cross-field rules, in the constraint grammar of :mod:`agent.protocol`.
 CONSTRAINTS: list[dict[str, Any]] = [
     {
+        # stop ≤ fill × (1 + cap) < TP must hold for every fill (spec §7.4).
+        "cmp": "lt",
+        "lhs": {"field": "trail_cap_pct"},
+        "rhs": {"field": "tp_pct"},
+        "message": TRAIL_CAP_MESSAGE,
+    },
+    {
         "cmp": "lt",
         "lhs": {"field": ["ema_tide_periods", 0]},
         "rhs": {"field": ["ema_tide_periods", 1]},
@@ -61,28 +71,16 @@ CONSTRAINTS: list[dict[str, Any]] = [
         "message": EMA_MESSAGE,
     },
     {
-        "cmp": "eq",
+        "cmp": "gt",
         "lhs": {"lookup": "intervals_ms", "field": "tide_interval"},
-        "rhs": {
-            "op": "mul",
-            "args": [
-                {"const": 4},
-                {"lookup": "intervals_ms", "field": "wave_interval"},
-            ],
-        },
-        "message": RATIO_MESSAGE,
+        "rhs": {"lookup": "intervals_ms", "field": "wave_interval"},
+        "message": TIMEFRAME_MESSAGE,
     },
     {
-        "cmp": "eq",
+        "cmp": "gt",
         "lhs": {"lookup": "intervals_ms", "field": "wave_interval"},
-        "rhs": {
-            "op": "mul",
-            "args": [
-                {"const": 4},
-                {"lookup": "intervals_ms", "field": "ripple_interval"},
-            ],
-        },
-        "message": RATIO_MESSAGE,
+        "rhs": {"lookup": "intervals_ms", "field": "ripple_interval"},
+        "message": TIMEFRAME_MESSAGE,
     },
     {
         # max(slow + 1, k + d, k + d + slow - 2, fi + 2, swing_low, trail, 2)
@@ -120,8 +118,8 @@ CONSTRAINTS: list[dict[str, Any]] = [
                     "op": "add",
                     "args": [{"field": "fi_ema_period"}, {"const": 2}],
                 },
-                {"field": "swing_low_h1_n"},
-                {"field": "trail_m15_n"},
+                {"field": "swing_low_wave_n"},
+                {"field": "trail_ripple_n"},
                 {"const": 2},
             ],
         },

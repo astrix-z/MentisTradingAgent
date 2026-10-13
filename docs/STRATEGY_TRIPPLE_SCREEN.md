@@ -1,10 +1,10 @@
-# Стратегия «Три Экрана» (Triple Screen) — Strategy Spec v1.1
+# Стратегия «Три Экрана» (Triple Screen) — Strategy Spec v1.2
 
 - **Owner decision:** `OWNER-STRATEGY-02`
 - **Статус:** утверждено владельцем; §1.2/§9/§10 пересмотрены реализацией
   2026-09-17 (см. «Ревизия v1.1» ниже) — требует owner-review при следующем
   формальном пересмотре.
-- **История:** Design Draft v0.1
+- **История:** Design Draft v0.1 → v1.0 → v1.1 (2026-09-17) → v1.2 (2026-09-24)
 - **Продукт:** Binance Spot, **long-only**
 
 ### Ревизия v1.1 (2026-09-17)
@@ -22,7 +22,41 @@ strategies/tripple_screen/strategy.py`, метод `_screen_universe`) была
 - Символ с открытой позицией **исключён из ранжирования и cap**: остаётся в
   WS-set до закрытия позиции, даже если перестал проходить slope-filter.
 
-Секции ниже отражают эту (v1.1) версию.
+### Ревизия v1.2 (2026-09-24, решение владельца)
+
+Правила выхода уточнены при планировании реального исполнения
+(`docs/ORDER_EXECUTION_PLAN.md`, Q12):
+
+- **Потолок трейлинга:** stop поднимается не выше `fill × (1 + trail_cap_pct / 100)`,
+  default 4% (§7.2).
+- **Выход по времени:** позиция, открытая дольше `max_hold_hours` (default 8 ч)
+  от entry fill, закрывается по рынку, `exit_reason = time` (§7.5).
+- **Инвариант выходов** (§7.4): прежнее «`stop < fill < tp` в любой момент»
+  заменено. Трейлинг может поднять stop выше fill; всегда `stop < tp`.
+
+### Ревизия v1.3 (2026-09-25, решение владельца D1)
+
+Таймфреймы (`docs/STRATEGY_PRESETS_PLAN.md` §2 D1, §4.1):
+
+- **Правило 16:4:1 отменено.** Требуется только порядок `tide > wave > ripple`
+  (строго, по длительности бара); кратность не требуется (§2).
+- **Поддерживаются D1 и W1.** Недельный бар Binance открывается в понедельник
+  00:00 UTC; `3d` и `1M` не поддерживаются (§2).
+- **Cutoff при некратных ТФ** зафиксирован явно (§5): волна — последний бар,
+  закрытый к **открытию** триггерной ряби, а не к моменту решения.
+
+### Ревизия v1.4 (2026-09-26, T2a)
+
+Имена параметров (`docs/STRATEGY_PRESETS_PLAN.md` §4.1.1, §4.6):
+
+- `swing_low_h1_n` → **`swing_low_wave_n`**, `trail_m15_n` → **`trail_ripple_n`**:
+  окна считаются по wave- и ripple-ТФ, а не по фиксированным H1/M15.
+- Старые имена агент принимает и переносит (снапшот `desired`, очередь команд).
+  Если заданы оба имени, значения должны совпасть после валидации. Карта
+  `legacy_keys` публикуется в каталоге. Backend отвечает `422` на старое имя в
+  новом Start с подсказкой перезагрузить страницу.
+
+Секции ниже отражают версию v1.4.
 
 Документ описывает точный алгоритм стратегии для исполнителя. Разделы 1–8
 разделы 9–13 —
@@ -100,14 +134,22 @@ flowchart TD
 
 ## 2. Три timeframes
 
-| Экран | Роль | TF | Соотношение |
-|---|---|---|---|
-| 1 — Tide | стратегический тренд, сторона торговли | **H4** | ×4 к wave |
-| 2 — Wave | откат против тренда (дисконт) | **H1** | ×4 к ripple |
-| 3 — Ripple | триггер входа | **M15** | — |
+| Экран | Роль | TF по умолчанию |
+|---|---|---|
+| 1 — Tide | стратегический тренд, сторона торговли | **H4** |
+| 2 — Wave | откат против тренда (дисконт) | **H1** |
+| 3 — Ripple | триггер входа | **M15** |
 
 Комбинация `H4-H1-M15` — конфиг (versioned, задаётся до запуска). Engine не
-хардкодит набор (`D-MARKET`, ADR-012 cl. 6).
+хардкодит набор (`D-MARKET`, ADR-012 cl. 6). Единственное правило для набора —
+`tide > wave > ripple` по длительности бара (v1.3; раньше требовалось 16:4:1).
+Кратность не нужна: допустимы, например, `H1-M15-M5`, `H6-H4-H1`, `H12-H6-H4`,
+`W1-D1-H4`.
+
+Интервалы — коды Binance на фиксированной сетке UTC: `1s`…`12h` и `1d` от эпохи,
+`1w` от понедельника 00:00 UTC (эпоха — четверг, поэтому простое деление на 7 суток
+дало бы неверную границу). `1M` (календарный месяц) и `3d` (сетка сдвинута на сутки
+от эпохи) не поддерживаются. Реализация — `agent/agent/common/intervals.py`.
 
 ---
 
@@ -224,6 +266,14 @@ BUY(symbol) = BullishTide(H4)                              # Экран 1
 | **Position monitoring** (стопы, трейлинг, TP) | **live-цена** (ticker / User Data Stream) + закрытые M15 для пересчёта трейлинга | непрерывно, пока позиция открыта |
 
 - Формирующийся Kline **никогда** не участвует во входной логике.
+- **Cutoff каждого экрана** (при любых, в том числе некратных, ТФ): прилив и рябь —
+  последний бар, закрытый к `close_time` триггерной ряби; волна — последний бар,
+  закрытый к её `open_time`, а не к моменту решения. Бар, закрывающийся ровно в
+  cutoff, входит. Пример `H12-H6-H4`: для ripple `2026-09-25 04:00–07:59:59.999`
+  берётся wave, закрытая `2026-09-24 23:59:59.999`, хотя к решению уже закрылась
+  wave `00:00–05:59:59.999`; tide — бар `2026-09-24 12:00–23:59:59.999`. Это не
+  look-ahead. На некратных парах нужный бар чаще оказывается вне окна в памяти
+  (его вытеснил более свежий), и snapshot дозагружает его через REST.
 - No look-ahead: Э2 и swing-окно используют только бары с `close_time ≤ open_time`
   триггерного M15 (§3.3, §7.1); Э1 — последний закрытый H4 на момент оценки
   (`close_time ≤ close_time` триггерного M15). Оценка выполняется по атомарному
@@ -238,7 +288,7 @@ BUY(symbol) = BullishTide(H4)                              # Экран 1
 
 - **Одна открытая позиция на символ.** Пока позиция открыта — BUY по символу = HOLD.
 - **Единый re-entry cooldown: 60 минут** после любого закрытия позиции
-  (stop / trail / tp), конфиг `cooldown_minutes`, default 60.
+  (stop / trail / tp / time), конфиг `cooldown_minutes`, default 60.
   - Отсчёт — от timestamp exit fill.
   - Scope — per symbol.
   - **Персистентен через рестарт Engine** (Persist/Outbox lane, `STRATEGY-02`).
@@ -255,14 +305,14 @@ Position monitoring — отдельный lane (Engine Spec §10.7), приор
 entry-evaluation, управляется независимо (pause entry не останавливает мониторинг).
 Работает по live-цене.
 
-Выходы: **stop** (initial), **trail** (трейлинг), **tp**. Trend-flip exit удалён.
+Выходы: **stop** (initial), **trail** (трейлинг), **tp**, **time** (§7.5). Trend-flip exit удалён.
 
 ### 7.1 Initial stop
 
 ```
 swing_low_ref = min(low(H1)[i], i = 1..N) × 0.999
     где i пробегает последние N закрытых H1-баров с close_time ≤ open_time
-    триггерного M15; N = swing_low_h1_n (конфиг, default 2)
+    триггерного M15; N = swing_low_wave_n (конфиг, default 2)
 
 stop_price = min(swing_low_ref, fill_price × 0.99)
 ```
@@ -278,9 +328,11 @@ stop_price = min(swing_low_ref, fill_price × 0.99)
 
 - Включается сразу после fill.
 - На каждом закрытии M15: `trail_candidate = min(low(M15)[i], i = 1..N) × 0.999`,
-  `N = trail_m15_n` (конфиг, default 2), буфер 0.1%.
-- Ratchet: `new_stop = max(current_stop, trail_candidate)` — перенос **только вверх**
-  (уменьшение убытка / рост защищённой прибыли).
+  `N = trail_ripple_n` (конфиг, default 2), буфер 0.1%.
+- Ratchet: `new_stop = min(max(current_stop, trail_candidate), fill_price × (1 + trail_cap_pct / 100))`
+  — перенос **только вверх** (уменьшение убытка / рост защищённой прибыли),
+  но не выше потолка `fill × 1.04` (`trail_cap_pct`, default 4%). Достигнув
+  потолка, stop больше не переставляется.
 - Проверка пробоя стопа — по live-цене (защита от гэпа вниз, который может
   «перепрыгнуть» цену стоп-ордера).
 
@@ -297,11 +349,20 @@ tp_price = fill_price × 1.10     # tp_pct (конфиг, default 10%)
 
 ### 7.4 Инварианты выходов
 
-- `stop_price < fill_price < tp_price` — в любой момент жизни позиции.
-- Трейлинг не может подняться выше TP раньше исполнения TP (цена, достигающая
-  уровня трейлинга выше TP, сперва проходит TP → TP исполняется первым). Поэтому
-  таблица precedence выходов не требуется.
-- Exit reason в EXIT-сигнале: `stop` / `trail` / `tp`.
+- На входе: `initial_stop < fill_price < tp_price`.
+- Далее stop монотонно не убывает и всегда
+  `stop ≤ fill_price × (1 + trail_cap_pct / 100) < tp_price`. Трейлинг может поднять
+  stop выше fill (защита прибыли). Прежнее требование «`stop < fill` в любой
+  момент» снято в v1.2.
+- Если новый уровень stop ≥ текущей цены (цена уже ниже), stop не
+  переставляется, а позиция закрывается по рынку (`trail`).
+- Exit reason: `stop` / `trail` / `tp` / `time`.
+
+### 7.5 Выход по времени
+
+- Позиция, открытая `max_hold_hours` (default 8 ч) от entry fill, закрывается
+  по рынку независимо от цены, `exit_reason = time`.
+- Cooldown (§6) начисляется так же, как после любого закрытия.
 
 ---
 
@@ -316,7 +377,7 @@ emitted_at; market window versions; config version          # STRATEGY-03
 
 ENTRY: epoch_id; entry_ref = close триггерного M15;
        swing_low_ref; tp_rule = "fill × 1.10"; valid_until = emitted_at + 15 min
-EXIT:  exit_reason ∈ {stop, trail, tp}
+EXIT:  exit_reason ∈ {stop, trail, tp, time}
 HOLD:  reason ∈ {no_pullback, no_trigger, position_open, cooldown, epoch_consumed}
 
 provenance (все типы):
@@ -357,8 +418,10 @@ evaluation event не создаёт duplicate signal (`STRATEGY-03`).
 | `stochastic` | `%K=5, %D=SMA3, Slow=SMA3` | Slow%D — только provenance |
 | `fi_ema_period` | `2` | по H1 (close × base volume) |
 | `oversold_threshold` | `20` | зона oversold Э2 |
-| `swing_low_h1_n` | `2` | окно initial stop |
-| `trail_m15_n` | `2` | окно трейлинга |
+| `swing_low_wave_n` | `2` | окно initial stop (до v1.4 — `swing_low_h1_n`) |
+| `trail_ripple_n` | `2` | окно трейлинга (до v1.4 — `trail_m15_n`) |
+| `trail_cap_pct` | `4%` | потолок трейлинга: stop ≤ `fill × 1.04` (v1.2) |
+| `max_hold_hours` | `8` | выход по рынку через 8 ч после fill, `exit_reason=time` (v1.2) |
 | `stop_buffer_pct` | `0.1%` | `×0.999` к swing low (initial и trailing) |
 | `min_stop_distance_pct` | `1%` | `fill × 0.99` |
 | `tp_pct` | `10%` | `fill × 1.10` |
@@ -391,8 +454,9 @@ evaluation event не создаёт duplicate signal (`STRATEGY-03`).
    любого закрытия, отсчёт от exit fill; персистентен через рестарт; наблюдаем
    в audit chain.
 7. **Position monitoring:** стопы/трейлинг/TP по live-цене; приоритет ≥
-   entry-evaluation; управляется независимо от entry; инвариант
-   `stop < fill < tp` соблюдается.
+   entry-evaluation; управляется независимо от entry; инварианты §7.4
+   соблюдаются (stop не убывает, `stop ≤ fill × 1.04 < tp`); выход по времени
+   через `max_hold_hours`.
 8. **Audit chain:** цепочка `market state → signal → intent → risk → plan → order →
    outcome` полна для каждого сигнала, включая no-order HOLD.
 9. **Config-driven:** все периоды и пороги — через versioned config; hardcode

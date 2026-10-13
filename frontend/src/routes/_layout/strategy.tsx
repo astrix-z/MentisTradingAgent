@@ -1,15 +1,35 @@
-import { useMutation, useQuery } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { createFileRoute, Link, redirect } from "@tanstack/react-router"
 import { Play, Square } from "lucide-react"
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 
-import { type StartPayload, TradingService, UsersService } from "@/client"
-import { CommandTrackingView } from "@/components/CommandTrackingView"
 import {
+  PresetsService,
+  type StartPayload,
+  TradingService,
+  UsersService,
+} from "@/client"
+import { CommandTrackingView } from "@/components/CommandTrackingView"
+import { ReleaseEntry } from "@/components/ReleaseEntry"
+import { OptionListsEditor } from "@/components/strategy-form/OptionListsEditor"
+import {
+  CURRENT_PARAMS,
+  type PresetEntry,
+  PresetPicker,
+} from "@/components/strategy-form/PresetPicker"
+import { StrategyFieldInput } from "@/components/strategy-form/StrategyFieldInput"
+import {
+  type FieldValue,
   type FieldValues,
   formatParamValue,
+  migrateDraft,
+  type OptionLists,
   parseSettingsSchema,
+  requiredHistory,
+  sameParams,
   seedFormValues,
+  type ValidationIssue,
+  type ValidationResult,
   validateSettings,
 } from "@/components/strategy-form/strategySchema"
 import { TradingStatusView } from "@/components/TradingStatusView"
@@ -29,7 +49,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
   latestTrackedCommand,
@@ -38,7 +57,7 @@ import {
 } from "@/hooks/useCommandTracking"
 import useCustomToast from "@/hooks/useCustomToast"
 import { cn } from "@/lib/utils"
-import { handleError } from "@/utils"
+import { extractErrorMessage, handleError } from "@/utils"
 
 type Network = NonNullable<StartPayload["network"]>
 type ValidatedStart = {
@@ -47,6 +66,14 @@ type ValidatedStart = {
   symbols: string[]
   params: Record<string, unknown>
 }
+/** A live Start waiting for confirmation, with the context it was checked in. */
+type PendingLiveStart = { payload: ValidatedStart; context: string }
+/** The latest check of the draft and the draft + context it was run on. */
+type Checked = { key: string; result: ValidationResult }
+type ValidationState = "pending" | "unavailable" | "valid" | "invalid"
+
+/** Live checks run this long after the last keystroke (§4.5.3). */
+const VALIDATION_DEBOUNCE_MS = 200
 
 const tradingStatusQueryOptions = () => ({
   queryFn: async () => (await TradingService.getStatus()).data,
@@ -54,9 +81,28 @@ const tradingStatusQueryOptions = () => ({
   refetchInterval: 5000,
 })
 
+// Re-read now and then: a redeployed agent publishes a new schema, and an
+// open draft is carried over to it instead of being checked against the old.
 const strategyCatalogQueryOptions = () => ({
   queryFn: async () => (await TradingService.listStrategies()).data,
   queryKey: ["strategy-catalog"],
+  refetchInterval: 60_000,
+})
+
+// Another administrator may edit the lists; the backend re-checks anyway.
+const fieldOptionsQueryOptions = (strategy: string) => ({
+  queryFn: async () =>
+    (await PresetsService.listOptions({ path: { strategy } })).data,
+  queryKey: ["field-options", strategy],
+  refetchInterval: 30_000,
+})
+
+// Reading presets syncs the built-in ones under a row lock, so they are read
+// on page load and after an edit, not polled.
+const presetsQueryOptions = (strategy: string) => ({
+  queryFn: async () =>
+    (await PresetsService.listPresets({ path: { strategy } })).data,
+  queryKey: ["strategy-presets", strategy],
 })
 
 // Which symbols a Start carries is decided on /working-symbols, so this page
@@ -104,6 +150,7 @@ type ControlState =
 
 function Strategy() {
   const { showErrorToast } = useCustomToast()
+  const queryClient = useQueryClient()
   const { commands, track } = useCommandTracking()
   const { data: status, isError } = useQuery(tradingStatusQueryOptions())
   const { data: catalog, isError: isCatalogError } = useQuery(
@@ -115,14 +162,15 @@ function Strategy() {
 
   const [network, setNetwork] = useState<Network>("testnet")
   const [values, setValues] = useState<FieldValues>({})
-  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
-  const [formErrors, setFormErrors] = useState<string[]>([])
+  const [checked, setChecked] = useState<Checked | null>(null)
   const [pendingLiveStart, setPendingLiveStart] =
-    useState<ValidatedStart | null>(null)
+    useState<PendingLiveStart | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [schemaChanged, setSchemaChanged] = useState(false)
+  const [selectedPreset, setSelectedPreset] = useState(CURRENT_PARAMS)
 
   const [dirty, setDirty] = useState(false)
   const [strategy, setStrategy] = useState("")
-  const [savedParams, setSavedParams] = useState<Record<string, unknown>>({})
 
   const strategies = catalog?.strategies
   const activeStrategy = useMemo(() => {
@@ -134,6 +182,10 @@ function Strategy() {
     () => parseSettingsSchema(activeStrategy?.settings_schema),
     [activeStrategy],
   )
+  const legacyKeys = useMemo(
+    () => activeStrategy?.legacy_keys ?? {},
+    [activeStrategy],
+  )
   const offeredNames = useMemo(
     () => new Set((strategies ?? []).map((item) => item.name)),
     [strategies],
@@ -141,15 +193,192 @@ function Strategy() {
   const activeLabel = activeStrategy?.label ?? "strategy"
   const catalogReady = !!catalog && catalog.available !== false
   const strategyOffered = strategy !== "" && offeredNames.has(strategy)
+  // Which strategy the lists and presets belong to does not wait for the
+  // schema: without a catalog the form cannot hydrate, but the option lists
+  // stay editable for the strategy the agent was told to run (Start stays
+  // closed — it needs the catalog).
+  const strategyName =
+    activeStrategy?.name || strategy || status?.desired.strategy || ""
 
+  const optionsQuery = useQuery({
+    ...fieldOptionsQueryOptions(strategyName),
+    enabled: strategyName !== "",
+  })
+  const presetsQuery = useQuery({
+    ...presetsQueryOptions(strategyName),
+    enabled: strategyName !== "",
+  })
+  const optionLists = useMemo(() => {
+    const lists: OptionLists = {}
+    for (const [field, entry] of Object.entries(optionsQuery.data ?? {}))
+      lists[field] = entry.options
+    return lists
+  }, [optionsQuery.data])
+
+  // What a check depends on besides the draft: the schema and the lists. A
+  // live Start confirmed in another context is cancelled (§4.5.3).
+  const contextReady =
+    catalogReady && !!activeStrategy && optionsQuery.isSuccess
+  const context = JSON.stringify([
+    catalog?.schema_hash ?? null,
+    activeStrategy?.name ?? null,
+    optionLists,
+  ])
+  const draftKey = `${context}|${JSON.stringify(values)}`
+
+  const validate = useCallback(
+    (draft: FieldValues): ValidationResult => {
+      if (!catalogReady || !activeStrategy)
+        return {
+          status: "unavailable",
+          reason:
+            "The strategy catalog is unavailable, so settings cannot be checked.",
+        }
+      if (optionsQuery.isError)
+        return {
+          status: "unavailable",
+          reason:
+            "The option lists could not be loaded, so settings cannot be checked.",
+        }
+      if (!optionsQuery.isSuccess)
+        return { status: "unavailable", reason: "Loading the option lists…" }
+      return validateSettings({
+        fields,
+        values: draft,
+        lookups: catalog?.lookups ?? {},
+        constraints: activeStrategy.constraints ?? [],
+        optionLists,
+      })
+    },
+    [
+      catalogReady,
+      activeStrategy,
+      optionsQuery.isError,
+      optionsQuery.isSuccess,
+      fields,
+      catalog?.lookups,
+      optionLists,
+    ],
+  )
+
+  // Live check: after every edit (debounced), and whenever the desired
+  // params, a chosen preset, the catalog or the lists change the draft or
+  // its context — edited or not.
   useEffect(() => {
-    if (dirty || !status || fields.length === 0) return
+    const timer = setTimeout(
+      () => setChecked({ key: draftKey, result: validate(values) }),
+      VALIDATION_DEBOUNCE_MS,
+    )
+    return () => clearTimeout(timer)
+  }, [draftKey, validate, values])
+
+  const validationState: ValidationState = !contextReady
+    ? "unavailable"
+    : checked?.key !== draftKey
+      ? "pending"
+      : checked.result.status
+
+  const presets = presetsQuery.data?.items
+
+  // A preset's server verdict (`valid`) depends on the schema and the lists
+  // as well. Presets are not polled, so when either changes — another
+  // administrator restored an option, a redeployed agent — read them again
+  // instead of showing a stale "invalid" beside a passing local check.
+  // Presets read while the agent had no catalog carry built-ins the server
+  // could not sync; they are read again once a catalog is there, the first
+  // time included.
+  const presetsContext = useRef<string | null>(null)
+  const presetsReadWithoutCatalog = useRef(false)
+  const catalogMissing = catalog?.available === false
+  useEffect(() => {
+    if (catalogMissing && presetsQuery.isSuccess)
+      presetsReadWithoutCatalog.current = true
+    if (!contextReady) return
+    const previous = presetsContext.current
+    presetsContext.current = context
+    const stale =
+      presetsReadWithoutCatalog.current ||
+      (previous !== null && previous !== context)
+    presetsReadWithoutCatalog.current = false
+    if (stale)
+      void queryClient.invalidateQueries({
+        queryKey: ["strategy-presets", strategyName],
+      })
+  }, [
+    catalogMissing,
+    presetsQuery.isSuccess,
+    contextReady,
+    context,
+    queryClient,
+    strategyName,
+  ])
+  const presetEntries: PresetEntry[] = useMemo(
+    () =>
+      (presets ?? []).map((preset) => ({
+        ...preset,
+        launchable:
+          preset.valid !== false &&
+          (!contextReady ||
+            validate(seedFormValues(fields, preset.params, legacyKeys))
+              .status === "valid"),
+      })),
+    [presets, contextReady, validate, fields, legacyKeys],
+  )
+  const defaultPreset = presetEntries.find(
+    (preset) => preset.is_builtin && preset.name === "Default",
+  )
+  const presetsSettled = strategyName === "" || !presetsQuery.isPending
+
+  // Hydration while the draft is untouched: the desired params, with the
+  // preset they match selected; without a snapshot, `Default` (§4.5.1).
+  useEffect(() => {
+    if (dirty || !status || fields.length === 0 || !presetsSettled) return
     const snapshot = status.desired
-    setValues(seedFormValues(fields, snapshot.params))
+    const hasSnapshot = Object.keys(snapshot.params ?? {}).length > 0
+    if (!hasSnapshot && defaultPreset) {
+      setValues(seedFormValues(fields, defaultPreset.params, legacyKeys))
+      setSelectedPreset(defaultPreset.id)
+    } else {
+      const seeded = seedFormValues(fields, snapshot.params, legacyKeys)
+      setValues(seeded)
+      const match = presetEntries.find((preset) =>
+        sameParams(fields, seeded, preset.params, legacyKeys),
+      )
+      setSelectedPreset(match?.id ?? CURRENT_PARAMS)
+    }
     setNetwork(snapshot.network ?? "testnet")
     setStrategy(snapshot.strategy ?? "")
-    setSavedParams(snapshot.params ?? {})
-  }, [status, fields, dirty])
+  }, [
+    status,
+    fields,
+    dirty,
+    legacyKeys,
+    presetsSettled,
+    presetEntries,
+    defaultPreset,
+  ])
+
+  // A new schema under a dirty draft: keep the draft, move renamed keys,
+  // drop unknown ones, and say so (§4.6). The check reruns by itself.
+  const seenSchema = useRef<string | null | undefined>(undefined)
+  const schemaHash = catalogReady ? (catalog?.schema_hash ?? null) : undefined
+  useEffect(() => {
+    if (schemaHash === undefined || fields.length === 0) return
+    const previous = seenSchema.current
+    seenSchema.current = schemaHash
+    if (previous === undefined || previous === schemaHash || !dirty) return
+    setValues((draft) => migrateDraft(fields, draft, legacyKeys))
+    setSchemaChanged(true)
+  }, [schemaHash, fields, legacyKeys, dirty])
+
+  useEffect(() => {
+    if (pendingLiveStart && pendingLiveStart.context !== context) {
+      setPendingLiveStart(null)
+      setNotice(
+        "The agent's schema or the option lists changed while the live Start was awaiting confirmation; it was cancelled. Review the settings and start again.",
+      )
+    }
+  }, [pendingLiveStart, context])
 
   // The symbols a Start carries are the ones marked on the Working Symbols
   // page: the agent owns that list, validates it against the exchange and
@@ -181,6 +410,7 @@ function Strategy() {
     onSuccess: ({ data }) => track(data),
     onError: handleError.bind(showErrorToast),
   })
+  const [presetBusy, setPresetBusy] = useState(false)
 
   const pending = startMutation.isPending || stopMutation.isPending
 
@@ -240,7 +470,8 @@ function Strategy() {
 
   // Once the draft is touched (dirty), Start is a deliberate reconfiguration,
   // not an unconscious repeat of the already-confirmed run. Start also needs a
-  // published catalog and a strategy the agent actually offers.
+  // published catalog, a strategy the agent actually offers and a draft that
+  // is not known to be invalid; a pending check is rerun on the click.
   const startDisabled =
     pending ||
     !status ||
@@ -248,6 +479,8 @@ function Strategy() {
     !activeStrategy ||
     (strategy !== "" && !strategyOffered) ||
     !!symbolsProblem ||
+    validationState === "unavailable" ||
+    validationState === "invalid" ||
     controlState === "loading" ||
     (!dirty && controlState === "running-confirmed")
   const stopDisabled =
@@ -255,44 +488,157 @@ function Strategy() {
     controlState === "loading" ||
     controlState === "stopped-confirmed"
 
-  const setValue = (key: string, value: string) => {
+  const setValue = (key: string, value: FieldValue) => {
     setDirty(true)
     setValues((current) => ({ ...current, [key]: value }))
+  }
+
+  /** Check the exact draft now, show the outcome, return the params if valid. */
+  const checkNow = (): Record<string, unknown> | null => {
+    const result = validate(values)
+    setChecked({ key: draftKey, result })
+    return result.status === "valid" ? result.params : null
   }
 
   const runStart = (payload: ValidatedStart) => startMutation.mutate(payload)
 
   const onStart = () => {
-    setFieldErrors({})
-    setFormErrors([])
+    setNotice(null)
     if (!activeStrategy) return
     if (startSymbols.length === 0) return
-    const result = validateSettings({
-      fields,
-      values,
-      lookups: catalog?.lookups ?? {},
-      constraints: activeStrategy.constraints ?? [],
-      savedParams,
-    })
-    if (!result.ok) {
-      setFieldErrors(result.fieldErrors)
-      setFormErrors(result.formErrors)
-      return
-    }
+    const params = checkNow()
+    if (!params) return
     const payload: ValidatedStart = {
       network,
       strategy: strategy || activeStrategy.name,
       symbols: startSymbols,
-      params: result.params,
+      params,
     }
     if (network === "live") {
-      setPendingLiveStart(payload)
+      setPendingLiveStart({ payload, context })
       return
     }
     runStart(payload)
   }
 
-  const hasErrors = Object.keys(fieldErrors).length > 0 || formErrors.length > 0
+  const onConfirmLive = () => {
+    if (!pendingLiveStart) return
+    const params = checkNow()
+    const unchanged =
+      pendingLiveStart.context === context &&
+      params !== null &&
+      JSON.stringify(params) === JSON.stringify(pendingLiveStart.payload.params)
+    setPendingLiveStart(null)
+    if (!unchanged) {
+      setNotice(
+        "The settings no longer pass the check they were confirmed with; the live Start was cancelled.",
+      )
+      return
+    }
+    runStart(pendingLiveStart.payload)
+  }
+
+  const selectPreset = (id: string) => {
+    setNotice(null)
+    if (id === CURRENT_PARAMS) {
+      // Back to the desired params: hydration seeds them again.
+      setSelectedPreset(CURRENT_PARAMS)
+      setDirty(false)
+      return
+    }
+    const preset = presetEntries.find((entry) => entry.id === id)
+    if (!preset) return
+    // A preset replaces the whole form; nothing of the previous draft stays.
+    setValues(seedFormValues(fields, preset.params, legacyKeys))
+    setSelectedPreset(id)
+    setDirty(true)
+  }
+
+  const presetRequest = async (
+    request: (params: Record<string, unknown> | null) => Promise<void>,
+    needsParams: boolean,
+  ): Promise<string | null> => {
+    const params = needsParams ? checkNow() : null
+    if (needsParams && !params)
+      return "The settings do not pass the check; fix them first."
+    setPresetBusy(true)
+    try {
+      await request(params)
+      await queryClient.invalidateQueries({
+        queryKey: ["strategy-presets", strategyName],
+      })
+      return null
+    } catch (error) {
+      return extractErrorMessage(error as Error)
+    } finally {
+      setPresetBusy(false)
+    }
+  }
+
+  const onSaveAs = (name: string) =>
+    presetRequest(async (params) => {
+      const { data } = await PresetsService.createPreset({
+        path: { strategy: strategyName },
+        body: { name, params: params ?? {} },
+      })
+      setSelectedPreset(data.id)
+      setDirty(true)
+    }, true)
+  const onUpdate = () =>
+    presetRequest(async (params) => {
+      const preset = presetEntries.find((entry) => entry.id === selectedPreset)
+      if (!preset) return
+      await PresetsService.updatePreset({
+        path: { strategy: strategyName, preset_id: preset.id },
+        body: { name: preset.name, params: params ?? {} },
+      })
+    }, true)
+  const onDelete = () =>
+    presetRequest(async () => {
+      await PresetsService.deletePreset({
+        path: { strategy: strategyName, preset_id: selectedPreset },
+      })
+      setSelectedPreset(CURRENT_PARAMS)
+    }, false)
+
+  const selected = presetEntries.find((preset) => preset.id === selectedPreset)
+  const modified =
+    selected !== undefined &&
+    !sameParams(fields, values, selected.params, legacyKeys)
+
+  const shownResult = checked?.result
+  const issues: ValidationIssue[] =
+    shownResult?.status === "invalid" ? shownResult.issues : []
+  const fieldIssue = (key: string) =>
+    issues.find((issue) => issue.field === key)
+  // Without a catalog the settings card says so itself.
+  const unavailableResult = contextReady ? shownResult : validate(values)
+  const unavailableReason =
+    catalogReady &&
+    validationState === "unavailable" &&
+    unavailableResult?.status === "unavailable"
+      ? unavailableResult.reason
+      : null
+  const history = useMemo(
+    () =>
+      new Map(
+        requiredHistory(
+          fields,
+          values,
+          catalog?.lookups ?? {},
+          activeStrategy?.constraints ?? [],
+        ).map((hint) => [hint.field, hint]),
+      ),
+    [fields, values, catalog?.lookups, activeStrategy],
+  )
+  const builtinSync = presetsQuery.data?.builtin_sync
+  const presetsProblem = presetsQuery.isError
+    ? "Presets could not be loaded."
+    : null
+  const canSave =
+    catalogReady &&
+    validationState !== "unavailable" &&
+    validationState !== "invalid"
 
   return (
     <div className="flex flex-col gap-6">
@@ -313,7 +659,13 @@ function Strategy() {
           : "Saved desired configuration"}
       </p>
       {dirty && (
-        <Button variant="outline" onClick={() => setDirty(false)}>
+        <Button
+          variant="outline"
+          onClick={() => {
+            setSchemaChanged(false)
+            setDirty(false)
+          }}
+        >
           Reload desired configuration
         </Button>
       )}
@@ -322,14 +674,37 @@ function Strategy() {
           Saved strategy {strategy} is not offered by the agent. Start disabled.
         </p>
       )}
-      {hasErrors && (
+      {schemaChanged && (
+        <p
+          role="alert"
+          className="rounded-md border border-amber-500 p-3 text-sm"
+        >
+          The agent's settings schema changed. Your draft was kept: renamed
+          settings moved to their new names and removed ones were dropped. Check
+          it before starting.
+        </p>
+      )}
+      {notice && (
+        <p role="alert" className="rounded-md border p-3 text-sm">
+          {notice}
+        </p>
+      )}
+      {unavailableReason && (
+        <p role="alert" className="rounded-md border p-3 text-sm">
+          {unavailableReason} Start and saving presets are disabled.
+        </p>
+      )}
+      {issues.length > 0 && (
         <div role="alert" className="space-y-1 rounded-md border p-3 text-sm">
           <p className="font-semibold">Fix the following before starting:</p>
-          {formErrors.map((message) => (
-            <p key={message}>{message}</p>
-          ))}
-          {Object.entries(fieldErrors).map(([key, message]) => (
-            <p key={key}>{message}</p>
+          {issues.map((issue) => (
+            <p
+              key={`${issue.field}:${issue.message}`}
+              data-issue-type={issue.type}
+              data-issue-field={issue.field ?? ""}
+            >
+              {issue.message}
+            </p>
           ))}
         </div>
       )}
@@ -432,6 +807,21 @@ function Strategy() {
         </Card>
       </div>
 
+      {status?.actual?.execution?.alerts?.unknown && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Unresolved entry</CardTitle>
+            <CardDescription>
+              An entry whose outcome the agent could not prove; its reserve and
+              slot stay held
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ReleaseEntry status={status} />
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <CardTitle>{activeLabel} settings</CardTitle>
@@ -439,7 +829,7 @@ function Strategy() {
             Fixed at start; the agent validates them before the strategy runs
           </CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex flex-col gap-6">
           {!catalog ? (
             <p role="status">
               {isCatalogError
@@ -456,53 +846,75 @@ function Strategy() {
               The agent publishes no configurable settings for this strategy.
             </p>
           ) : (
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {fields.map((field) => (
-                <div key={field.key} className="flex flex-col gap-2">
-                  <Label htmlFor={field.key}>{field.title}</Label>
-                  {field.kind === "const" ? (
-                    <Input
-                      id={field.key}
-                      value={field.defaultText}
-                      readOnly
-                      disabled
-                    />
-                  ) : field.kind === "enum" ? (
-                    <>
-                      <Input
-                        id={field.key}
-                        list={`${field.key}-options`}
-                        value={values[field.key] ?? ""}
-                        disabled={pending}
-                        aria-invalid={!!fieldErrors[field.key]}
-                        onChange={(event) =>
-                          setValue(field.key, event.target.value)
-                        }
-                      />
-                      <datalist id={`${field.key}-options`}>
-                        {(field.options ?? []).map((option) => (
-                          <option key={option} value={option} />
-                        ))}
-                      </datalist>
-                    </>
-                  ) : (
-                    <Input
-                      id={field.key}
-                      value={values[field.key] ?? ""}
-                      disabled={pending}
-                      aria-invalid={!!fieldErrors[field.key]}
-                      inputMode={field.kind === "text" ? undefined : "decimal"}
-                      onChange={(event) =>
-                        setValue(field.key, event.target.value)
-                      }
-                    />
-                  )}
+            <>
+              <PresetPicker
+                presets={presetEntries}
+                selected={selectedPreset}
+                modified={modified}
+                loadProblem={presetsProblem}
+                canSave={canSave}
+                busy={presetBusy || pending}
+                onSelect={selectPreset}
+                onSaveAs={onSaveAs}
+                onUpdate={onUpdate}
+                onDelete={onDelete}
+              />
+              {builtinSync?.status === "partial" && (
+                <div
+                  role="alert"
+                  className="rounded-md border border-amber-500 p-3 text-sm"
+                >
+                  <p className="font-semibold">
+                    Some built-in presets from the agent were not accepted:
+                  </p>
+                  {(builtinSync.errors ?? []).map((error) => (
+                    <p key={JSON.stringify(error)}>
+                      {typeof error.name === "string"
+                        ? error.name
+                        : `#${String(error.index)}`}
+                      : {String(error.type)}
+                    </p>
+                  ))}
                 </div>
-              ))}
-            </div>
+              )}
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {fields.map((field) => (
+                  <StrategyFieldInput
+                    key={field.key}
+                    field={field}
+                    value={values[field.key] ?? field.defaultValue}
+                    optionList={optionLists[field.key]}
+                    issue={fieldIssue(field.key)}
+                    history={history.get(field.key)}
+                    disabled={pending}
+                    onChange={(value) => setValue(field.key, value)}
+                  />
+                ))}
+              </div>
+            </>
           )}
         </CardContent>
       </Card>
+
+      {strategyName !== "" && (
+        <OptionListsEditor
+          strategy={strategyName}
+          fields={fields}
+          lists={optionsQuery.data}
+          loadFailed={optionsQuery.isError}
+          presets={presets ?? []}
+          onSaved={async () => {
+            await Promise.all([
+              queryClient.invalidateQueries({
+                queryKey: ["field-options", strategyName],
+              }),
+              queryClient.invalidateQueries({
+                queryKey: ["strategy-presets", strategyName],
+              }),
+            ])
+          }}
+        />
+      )}
 
       <Dialog
         open={pendingLiveStart !== null}
@@ -520,16 +932,17 @@ function Strategy() {
           </DialogHeader>
           {pendingLiveStart && (
             <div className="space-y-2 text-sm">
-              <p>Network: {pendingLiveStart.network.toUpperCase()}</p>
+              <p>Network: {pendingLiveStart.payload.network.toUpperCase()}</p>
               <p>
-                Strategy: {activeStrategy?.label ?? pendingLiveStart.strategy}
+                Strategy:{" "}
+                {activeStrategy?.label ?? pendingLiveStart.payload.strategy}
               </p>
               <div className="space-y-1">
                 <p className="font-medium">
-                  Symbols ({pendingLiveStart.symbols.length})
+                  Symbols ({pendingLiveStart.payload.symbols.length})
                 </p>
                 <p className="max-h-32 overflow-y-auto rounded border p-2 text-xs">
-                  {pendingLiveStart.symbols.join(", ")}
+                  {pendingLiveStart.payload.symbols.join(", ")}
                 </p>
               </div>
               <div className="space-y-1">
@@ -538,7 +951,9 @@ function Strategy() {
                   {fields.map((field) => (
                     <li key={field.key}>
                       {field.title}:{" "}
-                      {formatParamValue(pendingLiveStart.params[field.key])}
+                      {formatParamValue(
+                        pendingLiveStart.payload.params[field.key],
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -549,14 +964,7 @@ function Strategy() {
             <Button variant="outline" onClick={() => setPendingLiveStart(null)}>
               Cancel
             </Button>
-            <Button
-              onClick={() => {
-                if (pendingLiveStart) runStart(pendingLiveStart)
-                setPendingLiveStart(null)
-              }}
-            >
-              Confirm live Start
-            </Button>
+            <Button onClick={onConfirmLive}>Confirm live Start</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

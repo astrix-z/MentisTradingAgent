@@ -56,9 +56,11 @@ from typing import Annotated, Any, Literal, Self
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from redis.exceptions import RedisError
-from sqlmodel import col, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlmodel import Session, col, select
 
 from app.api.deps import CurrentUser, SessionDep, get_current_active_superuser
+from app.core.field_options import option_errors, read_options
 from app.core.redis_client import get_redis
 from app.core.strategy_catalog import (
     CatalogError,
@@ -82,6 +84,9 @@ REDIS_HEARTBEAT_KEY = "trading:heartbeat"
 REDIS_RESULT_KEY = "agent:result"
 REDIS_COMMAND_STATE_PREFIX = "agent:command:"
 REDIS_SYMBOLS_KEY = "agent:symbols"
+#: Set by the deploy fence script while the agent and its catalog change
+#: (plan §4.6 G4); no Start is written while it exists.
+REDIS_START_FENCE_KEY = "trading:start_fence"
 
 # Approximate trim keeps the durable command stream bounded without an exact
 # (expensive) length check on every write.
@@ -95,8 +100,14 @@ _TERMINAL_STATUSES = ("succeeded", "failed", "timed_out")
 
 # Compare the exact document read by this worker, then commit and durably
 # enqueue without interleaving with another worker. JSON stays in Python to
-# preserve empty arrays.
+# preserve empty arrays. A Start (ARGV[6] = "1") is refused while the start
+# fence KEYS[2] exists — checked in the same script as the write, so a Start
+# validated before the fence was set is still refused (plan §4.6 G4).
+# Returns 1 written, 0 snapshot CAS lost (re-read and retry), -1 fenced.
 COMMIT_RUNTIME_LUA = """
+if ARGV[6] == '1' and redis.call('EXISTS', KEYS[2]) == 1 then
+    return -1
+end
 local current = redis.call('GET', KEYS[1])
 if (current or '') ~= ARGV[1] then
     return 0
@@ -114,7 +125,18 @@ SuperUserDep = Annotated[User, Depends(get_current_active_superuser)]
 
 # Trading network the agent should run against (must match agent key selection).
 Network = Literal["testnet", "live"]
-CommandType = Literal["start", "stop", "balance", "symbols", "prices", "indicators"]
+CommandType = Literal[
+    "start",
+    "stop",
+    "balance",
+    "symbols",
+    "prices",
+    "indicators",
+    "execution_pause",
+    "execution_resume",
+    "close_position",
+    "release_entry",
+]
 
 # Commands that describe the running intent and therefore rewrite the runtime
 # snapshot. Everything else is observation-only (balance, symbols, prices,
@@ -129,6 +151,8 @@ _SNAPSHOT_COMMANDS: tuple[CommandType, ...] = ("start", "stop")
 # drift from the agent. ``GET /strategies/`` serves that declaration to the UI.
 
 _SYMBOL_RE = re.compile(r"[A-Z0-9]+")
+#: Client id of an entry attempt (agent ``attempts.client_id``, role ``e``).
+_ENTRY_CLIENT_ID_RE = re.compile(r"mta-[0-9a-f]{24}-e[1-9][0-9]{0,5}")
 
 
 def _now() -> datetime:
@@ -152,6 +176,10 @@ class StartPayload(BaseModel):
     strategy: str
     symbols: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
+    #: Real-execution settings, enforced against the catalog's ``execution``
+    #: section like ``params`` against the strategy's. Empty means defaults,
+    #: which keep real execution off.
+    execution: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate_symbols(self) -> Self:
@@ -201,6 +229,7 @@ class RuntimeSnapshot(BaseModel):
     strategy: str | None = None
     symbols: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
+    execution: dict[str, Any] = Field(default_factory=dict)
     last_command: str | None = None
     updated_at: datetime
     revision: int = Field(default=0, ge=0)
@@ -209,11 +238,24 @@ class RuntimeSnapshot(BaseModel):
 AgentState = Literal["running", "idle", "error"]
 
 
+class ExecutionHeartbeat(BaseModel):
+    """The agent's execution state (``ExecutionRuntime.heartbeat``).
+
+    The account id is left out: the UI needs the alerts, not the account.
+    """
+
+    mode: str
+    leader: bool = False
+    open_positions: int = 0
+    alerts: dict[str, str] = Field(default_factory=dict)
+
+
 class AgentHeartbeat(BaseModel):
     """Liveness + account state reported by the agent."""
 
     state: AgentState
     message: str | None = None
+    execution: ExecutionHeartbeat | None = None
     network: Network | None = None
     strategy: str | None = None
     balances: dict[str, float] | None = None
@@ -236,7 +278,8 @@ class StrategyDescription(BaseModel):
     the cross-field rules it cannot express (see ``agent/agent/protocol.py``
     for the grammar). Both are served verbatim: the backend compiles them to
     validate a Start, the UI renders a form from them, and neither restates
-    them.
+    them. ``legacy_keys`` lets the UI read saved params that still use a
+    renamed parameter's old name.
     """
 
     name: str
@@ -244,6 +287,10 @@ class StrategyDescription(BaseModel):
     description: str = ""
     settings_schema: dict[str, Any] | None = None
     constraints: list[dict[str, Any]] = Field(default_factory=list)
+    legacy_keys: dict[str, str] = Field(
+        default_factory=dict,
+        description="Renamed parameters, old name -> new name.",
+    )
 
 
 class StrategyCatalog(BaseModel):
@@ -402,6 +449,27 @@ class IndicatorRow(BaseModel):
     groups: dict[str, IndicatorGroupValues]
 
 
+class ScreeningSkip(BaseModel):
+    symbol: str
+    reason: str
+
+
+class ScreeningSummary(BaseModel):
+    """Outcome of the strategy's last screen of its universe: how many symbols
+    it kept for work and, in the strategy's own words, why the others stayed
+    out — so an empty table is explained rather than blank."""
+
+    at: datetime
+    universe: int
+    selected: int
+    skipped: list[ScreeningSkip]
+    #: Symbols actually at work; below ``selected`` when applying the screen
+    #: failed. Absent from agents that predate it.
+    active: int | None = None
+    #: Why the last screening cycle failed, until a later cycle succeeds.
+    error: str | None = None
+
+
 class IndicatorSnapshot(BaseModel):
     """Documented shape of ``CommandResult.data`` for a succeeded
     ``indicators`` command, as produced by ``Strategy.indicator_snapshot`` in
@@ -416,6 +484,8 @@ class IndicatorSnapshot(BaseModel):
     computed_at: datetime
     groups: list[IndicatorGroupDeclaration]
     rows: list[IndicatorRow]
+    #: Absent when the strategy does not screen its universe.
+    screening: ScreeningSummary | None = None
 
 
 class SignalPositionPublic(BaseModel):
@@ -478,6 +548,29 @@ class CommandState(BaseModel):
 
 def _redis_unavailable(_exc: RedisError) -> HTTPException:
     return HTTPException(status_code=503, detail="Redis is unavailable")
+
+
+def _start_fenced() -> HTTPException:
+    return HTTPException(status_code=503, detail="starting is closed for maintenance")
+
+
+async def _refuse_start_if_fenced() -> None:
+    """Early answer while a deploy holds the start fence (plan §4.6 G4).
+
+    Only a courtesy before validation: the guarantee is the check inside
+    ``COMMIT_RUNTIME_LUA``, atomic with the write.
+    """
+    try:
+        fenced = await get_redis().exists(REDIS_START_FENCE_KEY)
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    if fenced:
+        raise _start_fenced()
+
+
+def database_unavailable(exc: SQLAlchemyError) -> HTTPException:
+    logger.error("database error: %s", exc)
+    return HTTPException(status_code=503, detail="the database is unavailable")
 
 
 async def _enqueue(envelope: CommandEnvelope) -> None:
@@ -554,6 +647,7 @@ async def _apply_command(
                     snapshot.strategy = payload["strategy"]
                     snapshot.symbols = list(payload["symbols"])
                     snapshot.params = dict(payload["params"])
+                    snapshot.execution = dict(payload.get("execution") or {})
                 else:
                     # Stopping changes intent, not the saved configuration for the UI.
                     snapshot.running = False
@@ -563,14 +657,19 @@ async def _apply_command(
                 committed = await redis.execute_command(  # type: ignore[no-untyped-call]
                     "EVAL",
                     COMMIT_RUNTIME_LUA,
-                    1,
+                    2,
                     REDIS_RUNTIME_KEY,
+                    REDIS_START_FENCE_KEY,
                     raw if raw is not None else "",
                     snapshot.model_dump_json(),
                     REDIS_COMMAND_STREAM,
                     envelope.model_dump_json(),
                     str(COMMAND_STREAM_MAXLEN),
+                    "1" if type_ == "start" else "0",
                 )
+                if committed == -1:
+                    # Not retried: the fence stays until the deploy lifts it.
+                    raise _start_fenced()
                 if committed:
                     break
         except RedisError as exc:
@@ -586,7 +685,42 @@ def _start_command_payload(parsed: StartPayload) -> dict[str, Any]:
         "strategy": parsed.strategy,
         "symbols": [str(s).upper() for s in parsed.symbols],
         "params": dict(parsed.params),
+        "execution": dict(parsed.execution),
     }
+
+
+def _params_loc(loc: list[Any]) -> list[Any]:
+    """Point a strategy settings error at ``body.params`` (plan §4.3.4).
+
+    Field errors come from the compiled model by field name alone; rule and
+    unknown-parameter errors already carry ``["body", "params"]``.
+    """
+    return loc if loc[:2] == ["body", "params"] else ["body", "params", *loc]
+
+
+def _execution_loc(loc: list[Any]) -> list[Any]:
+    """Point an error of the execution section at ``body.execution``.
+
+    The compiled section reports rule failures under ``body.params`` (its
+    strategy-shaped origin) and field errors by field name alone.
+    """
+    rest = loc[2:] if loc[:2] == ["body", "params"] else loc
+    return ["body", "execution", *rest]
+
+
+async def _compiled_execution() -> CompiledStrategy:
+    """The catalog's execution section; ``503`` when the agent has none."""
+    redis = get_redis()
+    try:
+        catalog = await read_catalog(redis)
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    if catalog is None or catalog.execution is None:
+        raise HTTPException(
+            status_code=503,
+            detail="the agent has not published execution settings",
+        )
+    return catalog.execution
 
 
 async def _compiled_strategy(name: str) -> CompiledStrategy:
@@ -628,15 +762,55 @@ async def _compiled_strategy(name: str) -> CompiledStrategy:
     return compiled
 
 
-async def _enforce_strategy_params(strategy: str, params: dict[str, Any]) -> None:
+def strategy_params_errors(
+    compiled: CompiledStrategy,
+    params: dict[str, Any],
+    session: Session,
+    options: dict[str, list[str]] | None = None,
+) -> list[dict[str, Any]]:
+    """The pipeline of plan §4.3.5 for a Start or a saved preset, ``loc`` at
+    ``body.params``.
+
+    Steps 1–4 are the agent's published rules (schema + cross-field
+    constraints); step 5 is the option lists in the database, checked once
+    steps 1–3 passed and reported together with step 4. Raises
+    :class:`CatalogError` (a rule cannot be evaluated) and ``503`` when the
+    lists cannot be read — neither means valid or invalid. ``options`` spares
+    the read when the caller checks many presets at once.
+    """
+    checked = compiled.check(params)
+    errors = list(checked.errors)
+    if checked.canonical is not None:
+        if options is None:
+            try:
+                options = read_options(session, compiled.name)
+            except SQLAlchemyError as exc:
+                raise database_unavailable(exc) from exc
+        errors += option_errors(options, checked.canonical)
+    return [{**error, "loc": _params_loc(error.get("loc") or [])} for error in errors]
+
+
+async def _enforce_strategy_params(
+    strategy: str,
+    params: dict[str, Any],
+    execution: dict[str, Any] | None,
+    session: Session,
+) -> None:
     """Reject an invalid Start here, so nothing invalid reaches Redis.
 
     The rules enforced are the agent's own published ones (schema + cross-field
-    constraints); the backend contributes no domain knowledge.
+    constraints) and the option lists the operator keeps; the backend
+    contributes no domain knowledge.
     """
     compiled = await _compiled_strategy(strategy)
     try:
-        errors = compiled.validate(params)
+        errors = strategy_params_errors(compiled, params, session)
+        if execution:
+            section = await _compiled_execution()
+            errors += [
+                {**error, "loc": _execution_loc(error.get("loc") or [])}
+                for error in section.validate(execution)
+            ]
     except CatalogError as exc:
         logger.error("strategy catalog not evaluable: %s", exc)
         raise HTTPException(
@@ -662,6 +836,7 @@ def _catalog_response(catalog: CompiledCatalog | None) -> StrategyCatalog:
                 description=s.description,
                 settings_schema=s.settings_schema,
                 constraints=s.constraints,
+                legacy_keys=s.legacy_keys,
             )
             for s in catalog.strategies.values()
         ],
@@ -725,10 +900,12 @@ async def list_positions(session: SessionDep, _: SuperUserDep) -> PositionsList:
     """ENTRY-signal-derived virtual positions (see `SignalPositionPublic`).
 
     Recorded by ``app.core.signal_listener`` as ENTRY signals arrive on
-    ``agent:events``; a still-``open`` row is closed here, lazily, the first
-    time a read observes the last known price having crossed its stop or take
-    level — this endpoint is the only place that evaluates/persists that
-    transition, so "closed" always reflects what a viewer actually saw.
+    ``agent:events``, and closed there by the agent's EXIT: the 1m bar where
+    the price first crossed the stop or the take, and that price (the agent
+    alone reads the exchange). As a fallback for an EXIT that never arrived, a
+    still-``open`` row is also closed here the first time a read sees the last
+    known price beyond a level (``closed_by = "view"``); a later EXIT corrects
+    it.
     """
     rows = session.exec(
         select(SignalPosition).order_by(col(SignalPosition.emitted_at).desc())
@@ -783,6 +960,9 @@ def _position_public(
             row.status = crossed
             row.closed_at = datetime.now(UTC)
             row.closed_price = current
+            # A fallback: the agent's EXIT carries the crossing itself and
+            # replaces this (signal_listener._record_tracked_exit).
+            row.closed_by = "view"
             session.add(row)
     reference = row.closed_price if row.closed_price is not None else current
     return SignalPositionPublic(
@@ -814,14 +994,19 @@ async def set_working_symbols(
 
 
 @router.post("/commands/", status_code=202, response_model=CommandEnvelope)
-async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnvelope:
+async def issue_command(
+    request: CommandRequest, session: SessionDep, _: SuperUserDep
+) -> CommandEnvelope:
     """Publish an arbitrary known command to the agent."""
     if request.type == "start":
+        await _refuse_start_if_fenced()
         try:
             parsed = StartPayload(**request.payload)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=json_safe_errors(exc)) from exc
-        await _enforce_strategy_params(parsed.strategy, parsed.params)
+        await _enforce_strategy_params(
+            parsed.strategy, parsed.params, parsed.execution, session
+        )
         return await _apply_command("start", _start_command_payload(parsed))
     if request.type == "balance":
         return await _apply_command("balance", request.payload)
@@ -837,6 +1022,38 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
         return await _apply_command("indicators", {})
     if request.type == "stop":
         return await _apply_command("stop", {})
+    if request.type == "close_position":
+        symbol = str(request.payload.get("symbol") or "").strip().upper()
+        if _SYMBOL_RE.fullmatch(symbol) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "loc": ["body", "payload", "symbol"],
+                        "msg": "a valid symbol is required",
+                        "type": "value_error",
+                    }
+                ],
+            )
+        return await _apply_command("close_position", {"symbol": symbol})
+    if request.type == "release_entry":
+        # The agent proves the order absent itself; this only checks the shape.
+        cid = str(request.payload.get("client_order_id") or "").strip()
+        if _ENTRY_CLIENT_ID_RE.fullmatch(cid) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=[
+                    {
+                        "loc": ["body", "payload", "client_order_id"],
+                        "msg": "an entry client order id is required",
+                        "type": "value_error",
+                    }
+                ],
+            )
+        return await _apply_command("release_entry", {"client_order_id": cid})
+    if request.type in ("execution_pause", "execution_resume"):
+        # Entries only; positions, protection and exits are not affected.
+        return await _apply_command(request.type, {})
     # Unreachable while CommandType lists every type: the branches above are
     # exhaustive on purpose, so a new type cannot silently become a stop.
     raise HTTPException(  # pragma: no cover
@@ -845,9 +1062,14 @@ async def issue_command(request: CommandRequest, _: SuperUserDep) -> CommandEnve
 
 
 @router.post("/start/", status_code=202, response_model=CommandEnvelope)
-async def start_trading(payload: StartPayload, _: SuperUserDep) -> CommandEnvelope:
+async def start_trading(
+    payload: StartPayload, session: SessionDep, _: SuperUserDep
+) -> CommandEnvelope:
     """Convenience alias: start trading on a network with a strategy."""
-    await _enforce_strategy_params(payload.strategy, payload.params)
+    await _refuse_start_if_fenced()
+    await _enforce_strategy_params(
+        payload.strategy, payload.params, payload.execution, session
+    )
     return await _apply_command("start", _start_command_payload(payload))
 
 
@@ -937,7 +1159,7 @@ async def get_command_state(
     redis = get_redis()
     key = f"{REDIS_COMMAND_STATE_PREFIX}{command_id}"
     try:
-        raw = await redis.hgetall(key)  # type: ignore[misc]
+        raw = await redis.hgetall(key)  # type: ignore[misc] # ty: ignore[invalid-await]
     except RedisError as exc:
         raise _redis_unavailable(exc) from exc
     if not raw:

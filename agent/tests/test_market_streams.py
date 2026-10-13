@@ -20,10 +20,11 @@ STREAM_MAP = global_stream_connections.stream_connections_map
 
 
 class FakeSdk:
-    def __init__(self, *, failed_connects: int = 0) -> None:
+    def __init__(self, *, failed_connects: int = 0, failed_subscribes: int = 0) -> None:
         self.connections: list[Any] = []
         self.reconnect_tasks: list[str] = []
         self.failed_connects = failed_connects
+        self.failed_subscribes = failed_subscribes
         self.close_listeners: list[Callable[[], None]] = []
         self.subscribe_messages: list[list[str]] = []
         self.unsubscribe_messages: list[list[str]] = []
@@ -43,6 +44,9 @@ class FakeSdk:
     async def subscribe(self, streams: list[str], response_model: Any = None) -> None:
         if not self.connections:
             raise ValueError("No WebSocket connections available.")
+        if self.failed_subscribes:
+            self.failed_subscribes -= 1
+            raise ConnectionError("subscribe failed")
         streams = [s for s in streams if s not in STREAM_MAP]
         self.subscribe_messages.append(streams)
         for stream in streams:
@@ -218,6 +222,14 @@ def test_subscribe_ignores_streams_mapped_to_a_dead_connection() -> None:
     asyncio.run(scenario())
 
 
+def age(streams: MarketDataStreams, kind: str, *, minutes: float) -> None:
+    """Make ``kind``'s last data ``minutes`` old, its start grace long gone."""
+    past = datetime.now(UTC) - timedelta(minutes=minutes)
+    fresh = streams._fresh[kind]
+    fresh.last = past
+    fresh.grace_until = past
+
+
 def test_health_warning_reports_silent_or_dropped_stream() -> None:
     async def scenario() -> None:
         sdk = FakeSdk(failed_connects=0)
@@ -226,7 +238,7 @@ def test_health_warning_reports_silent_or_dropped_stream() -> None:
         await streams.subscribe_klines_batch([("BTCUSDT", "4h", noop)])
         assert streams.health_warning() is None  # fresh subscription
 
-        streams._last_message_at = datetime.now(UTC) - timedelta(minutes=3)
+        age(streams, "klines", minutes=3)
         warning = streams.health_warning()
         assert warning is not None and "(stream connected)" in warning
 
@@ -240,6 +252,62 @@ def test_health_warning_reports_silent_or_dropped_stream() -> None:
         await wait_recovered(streams)
         sdk.callbacks["btcusdt@kline_4h"][0](None)
         assert streams.health_warning() is None
+        await streams.stop()
+
+    asyncio.run(scenario())
+
+
+def test_subscribing_or_resubscribing_is_not_data() -> None:
+    # Review 2026-09-30: aged klines, then a new subscription (or a
+    # reconnect's resubscribe) with no message: the warning disappeared, and
+    # churn could hide silence for good.
+    async def scenario() -> None:
+        sdk = FakeSdk(failed_connects=0)
+        streams = make_streams(sdk)
+        await streams.subscribe_klines_batch([("BTCUSDT", "4h", noop)])
+        age(streams, "klines", minutes=3)
+        assert streams.health_warning() is not None
+        await streams.subscribe_klines_batch([("ETHUSDT", "4h", noop)])
+        assert streams.health_warning() is not None  # still no candle
+        sdk.drop()
+        await wait_recovered(streams)  # reconnect re-subscribes everything
+        warning = streams.health_warning()
+        assert warning is not None and "(klines)" in warning
+        sdk.callbacks["ethusdt@kline_4h"][0](None)
+        assert streams.health_warning() is None
+        await streams.stop()
+
+    asyncio.run(scenario())
+
+
+def test_trades_do_not_make_missing_candles_fresh() -> None:
+    async def scenario() -> None:
+        sdk = FakeSdk(failed_connects=0)
+        streams = make_streams(sdk)
+        await streams.subscribe_klines_batch([("BTCUSDT", "4h", noop)])
+        await streams.subscribe_trades_batch([("BTCUSDT", noop)])
+        age(streams, "klines", minutes=3)
+        age(streams, "trades", minutes=3)
+        sdk.callbacks["btcusdt@trade"][0](None)  # trades flow, candles do not
+        warning = streams.health_warning()
+        assert warning is not None and "(klines)" in warning
+        sdk.callbacks["btcusdt@kline_4h"][0](None)
+        assert streams.health_warning() is None
+        await streams.stop()
+
+    asyncio.run(scenario())
+
+
+def test_a_fresh_start_after_stop_gets_its_grace_again() -> None:
+    async def scenario() -> None:
+        sdk = FakeSdk(failed_connects=0)
+        streams = make_streams(sdk)
+        await streams.subscribe_klines_batch([("BTCUSDT", "4h", noop)])
+        age(streams, "klines", minutes=30)
+        await streams.unsubscribe_klines_batch([("BTCUSDT", "4h")])
+        assert streams.health_warning() is None  # nothing subscribed
+        await streams.subscribe_klines_batch([("BTCUSDT", "4h", noop)])
+        assert streams.health_warning() is None  # a new start, not silence
         await streams.stop()
 
     asyncio.run(scenario())

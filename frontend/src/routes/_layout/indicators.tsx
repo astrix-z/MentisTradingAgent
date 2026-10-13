@@ -49,6 +49,18 @@ type IndicatorSnapshot = {
     indicators: { key: string; label: string }[]
   }[]
   rows: { symbol: string; groups: Record<string, GroupValues> }[]
+  // Optional: the strategy's last screen of its universe, explaining why
+  // symbols are missing from `rows`.
+  screening?: {
+    at: string
+    universe: number
+    selected: number
+    skipped: { symbol: string; reason: string }[]
+    // Symbols actually at work: below `selected` when applying the screen
+    // failed with `error`. Absent from agents that predate them.
+    active?: number | null
+    error?: string | null
+  } | null
 }
 
 function asSnapshot(data: unknown): IndicatorSnapshot | null {
@@ -118,6 +130,14 @@ function IndicatorsMonitor() {
     latest?.phase === "accepted" ||
     latest?.phase === "pending"
   const actual = status?.actual
+  // The table shows what was read, from where it was read: a snapshot of
+  // another network or strategy than the one running now is marked, never
+  // relabelled with the current status.
+  const mismatch =
+    snapshot !== null &&
+    actual != null &&
+    ((actual.network != null && actual.network !== snapshot.network) ||
+      (actual.strategy != null && actual.strategy !== snapshot.strategy))
 
   return (
     <div className="flex flex-col gap-6">
@@ -143,9 +163,25 @@ function IndicatorsMonitor() {
         {snapshot && (
           <span className="text-muted-foreground" data-testid="computed-at">
             Updated {formatBarTime(snapshot.computed_at)}
+            <span data-testid="snapshot-source">
+              {` · read from ${snapshot.strategy} · ${snapshot.network.toUpperCase()}`}
+            </span>
           </span>
         )}
       </div>
+      {mismatch && snapshot && actual && (
+        <p
+          role="alert"
+          className="text-amber-600 dark:text-amber-400"
+          data-testid="snapshot-mismatch"
+        >
+          These values were read from {snapshot.strategy} on{" "}
+          {snapshot.network.toUpperCase()}; the agent now runs{" "}
+          {actual.strategy ?? "no strategy"} on{" "}
+          {actual.network?.toUpperCase() ?? "no network"}. Press Refresh for
+          current values.
+        </p>
+      )}
       {latest?.phase === "failed" && (
         <p role="alert">
           {latest.result?.message ?? "The agent could not read indicators."}
@@ -167,9 +203,58 @@ function IndicatorsMonitor() {
   )
 }
 
+/** Symbols grouped by the reason they stayed out, in first-seen order. */
+export function groupSkipped(
+  skipped: { symbol: string; reason: string }[],
+): { reason: string; symbols: string[] }[] {
+  const groups = new Map<string, string[]>()
+  for (const { symbol, reason } of skipped)
+    groups.set(reason, [...(groups.get(reason) ?? []), symbol])
+  return [...groups].map(([reason, symbols]) => ({ reason, symbols }))
+}
+
+function ScreeningSummary({
+  screening,
+}: {
+  screening: NonNullable<IndicatorSnapshot["screening"]>
+}) {
+  return (
+    <div className="flex flex-col gap-2 text-sm" data-testid="screening">
+      <p>
+        {screening.selected} of {screening.universe} symbols selected for work
+        at the last screening ({formatBarTime(screening.at)}).
+      </p>
+      {screening.active != null && screening.active < screening.selected && (
+        <p>
+          Only {screening.active} of them are active: the selection could not be
+          applied.
+        </p>
+      )}
+      {screening.error && (
+        <p role="alert" className="text-destructive">
+          The last screening cycle failed: {screening.error}
+        </p>
+      )}
+      {screening.skipped.length > 0 && (
+        <ul className="list-disc pl-5 text-muted-foreground">
+          {groupSkipped(screening.skipped).map(({ reason, symbols }) => (
+            <li key={reason}>
+              {symbols.join(", ")}: {reason}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 function IndicatorTable({ snapshot }: { snapshot: IndicatorSnapshot }) {
   if (snapshot.rows.length === 0)
-    return <p>No symbols are selected for work right now.</p>
+    return snapshot.screening ? (
+      <ScreeningSummary screening={snapshot.screening} />
+    ) : (
+      <p>No symbols are selected for work right now.</p>
+    )
   const shared = Object.fromEntries(
     snapshot.groups.map((group) => [
       group.key,

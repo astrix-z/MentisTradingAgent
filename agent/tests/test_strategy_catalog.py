@@ -12,13 +12,15 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from typing import Any
+from decimal import Decimal, Inexact, localcontext
+from typing import Any, Literal
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from pydantic import BaseModel, Field
 from redis.exceptions import RedisError
 
+from agent.common.intervals import interval_ms
 from agent.engine import REDIS_STRATEGIES_KEY
 from agent.protocol import (
     CATALOG_VERSION,
@@ -29,7 +31,8 @@ from agent.protocol import (
 )
 from agent.strategies import STRATEGIES
 from agent.strategies.base import Strategy, StrategyServices
-from agent.strategies.tripple_screen.settings import TripleScreenSettings, interval_ms
+from agent.strategies.tripple_screen.presets import BUILTIN_PRESETS
+from agent.strategies.tripple_screen.settings import TripleScreenSettings
 
 PARAMS_ENTRY = describe_strategy("tripple_screen", STRATEGIES["tripple_screen"])
 
@@ -41,13 +44,19 @@ class RuleFailed(Exception):
     """One published constraint could not be evaluated for this payload."""
 
 
-def _number(value: Any) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+def _number(value: Any) -> Decimal:
+    # Exact, never float arithmetic: the reference must not share a rounding
+    # bug with the evaluator it checks (large integers, long decimals). A JSON
+    # number that parsed as a float is taken by its shortest decimal text, as
+    # the model's Decimal fields take it, so 0.5 is 0.5 on both sides.
+    if isinstance(value, float) and math.isfinite(value):
+        return Decimal(repr(value))
+    if isinstance(value, bool) or not isinstance(value, (int, str, Decimal)):
         raise RuleFailed(f"not a number: {value!r}")
-    return float(value)
+    return Decimal(value)
 
 
-def _eval_expr(expr: dict[str, Any], values: dict[str, Any], lookups: Any) -> float:
+def _eval_expr(expr: dict[str, Any], values: dict[str, Any], lookups: Any) -> Decimal:
     if "const" in expr:
         return _number(expr["const"])
     if "lookup" in expr:
@@ -65,9 +74,12 @@ def _eval_expr(expr: dict[str, Any], values: dict[str, Any], lookups: Any) -> fl
     args = [_eval_expr(arg, values, lookups) for arg in expr["args"]]
     op = expr["op"]
     if op == "add":
-        return math.fsum(args)
+        return sum(args, Decimal(0))
     if op == "mul":
-        return math.prod(args)
+        product = Decimal(1)
+        for arg in args:
+            product *= arg
+        return product
     if op == "max":
         return max(args)
     if op == "sub":
@@ -103,8 +115,12 @@ def reference_check(params: dict[str, Any]) -> list[str]:
     failures: list[str] = []
     for rule in PARAMS_ENTRY["constraints"]:
         try:
-            lhs = _eval_expr(rule["lhs"], values, lookups)
-            rhs = _eval_expr(rule["rhs"], values, lookups)
+            with localcontext() as context:
+                # Far beyond any test value, and loud if that ever stops holding.
+                context.prec = 1000
+                context.traps[Inexact] = True
+                lhs = _eval_expr(rule["lhs"], values, lookups)
+                rhs = _eval_expr(rule["rhs"], values, lookups)
         except RuleFailed:
             failures.append(rule["message"])
             continue
@@ -174,6 +190,84 @@ def test_field_level_rules_survive_the_round_trip() -> None:
     assert props["ema_tide_periods"]["title"] == "EMA tide periods"
 
 
+def test_renamed_parameters_are_published_as_legacy_keys() -> None:
+    """The schema has only the new names; the map lets old ones be explained."""
+    props = PARAMS_ENTRY["settings_schema"]["properties"]
+    assert PARAMS_ENTRY["legacy_keys"] == {
+        "swing_low_h1_n": "swing_low_wave_n",
+        "trail_m15_n": "trail_ripple_n",
+    }
+    assert props["swing_low_wave_n"]["title"] == "Swing low WAVE N"
+    assert props["trail_ripple_n"]["title"] == "Trail RIPPLE N"
+    assert not {"swing_low_h1_n", "trail_m15_n"} & set(props)
+
+
+@pytest.mark.parametrize(
+    "legacy_keys",
+    [
+        {"gone": "missing"},  # the new name must be a published parameter
+        {"thing": "thing"},  # the old name must not be one any more
+    ],
+)
+def test_a_bad_legacy_map_fails_at_publish_time(legacy_keys: dict[str, str]) -> None:
+    class _Settings(BaseModel):
+        thing: int = 1
+
+    with pytest.raises(CatalogError, match="must map a retired name"):
+        describe_strategy(
+            "dummy",
+            _dummy(settings_model=_Settings, settings_legacy_keys=legacy_keys),
+        )
+
+
+def test_builtin_presets_are_full_valid_snapshots() -> None:
+    """Default is the agent's own defaults; Fast passes the model and the rules."""
+    props = PARAMS_ENTRY["settings_schema"]["properties"]
+    editable = {name for name, prop in props.items() if "const" not in prop}
+    assert "volume_window" not in editable
+    published = {preset["name"]: preset["params"] for preset in PARAMS_ENTRY["presets"]}
+    assert list(published) == ["Default", "Fast"]
+    for name, params in published.items():
+        assert set(params) == editable, name
+        assert params == BUILTIN_PRESETS[name], "published in JSON form, unchanged"
+        assert not model_rejects(params), name
+        assert reference_check(params) == [], name
+    assert TripleScreenSettings.model_validate(published["Default"]) == (
+        TripleScreenSettings()
+    )
+    fast = TripleScreenSettings.model_validate(published["Fast"])
+    assert (fast.tide_interval, fast.wave_interval, fast.ripple_interval) == (
+        "1h",
+        "15m",
+        "5m",
+    )
+
+
+@pytest.mark.parametrize(
+    ("presets", "expected"),
+    [
+        ({"P": {}}, "exactly the non-const parameters"),
+        ({"P": {"thing": 1, "fixed": "x"}}, "exactly the non-const parameters"),
+        ({"P": {"thing": 0}}, "invalid"),
+        ({"P": {"thing": 1}, " p ": {"thing": 2}}, "unique"),
+        ({"   ": {"thing": 1}}, "1-64 characters"),
+        ({"x" * 65: {"thing": 1}}, "1-64 characters"),  # R81: backend's envelope
+        ({"X\u0000": {"thing": 1}}, "without control characters"),  # R89
+    ],
+)
+def test_a_bad_builtin_preset_fails_at_publish_time(
+    presets: dict[str, Any], expected: str
+) -> None:
+    class _Settings(BaseModel):
+        thing: int = Field(default=1, gt=0)
+        fixed: Literal["x"] = "x"
+
+    with pytest.raises(CatalogError, match=expected):
+        describe_strategy(
+            "dummy", _dummy(settings_model=_Settings, settings_presets=presets)
+        )
+
+
 def test_no_constraints_when_a_strategy_has_no_settings() -> None:
     class _Bare(Strategy):
         async def on_start(self, services: StrategyServices) -> None: ...
@@ -183,6 +277,8 @@ def test_no_constraints_when_a_strategy_has_no_settings() -> None:
     entry = describe_strategy("bare", _Bare)
     assert entry["settings_schema"] is None
     assert entry["constraints"] == []
+    assert entry["legacy_keys"] == {}
+    assert entry["presets"] == []
     assert entry["label"] == "bare"
 
 
@@ -195,9 +291,16 @@ def test_no_constraints_when_a_strategy_has_no_settings() -> None:
         {},  # every default
         {"ema_tide_periods": [5, 13, 34]},
         {"kline_window": 35},  # exactly the required minimum
-        # The ratio rule admits other scales than the default 4h/1h/15m.
+        # Only the order tide > wave > ripple is required (D1), at any scale.
         {"tide_interval": "8h", "wave_interval": "2h", "ripple_interval": "30m"},
+        {"tide_interval": "1h", "wave_interval": "15m", "ripple_interval": "5m"},
+        {"tide_interval": "6h", "wave_interval": "4h", "ripple_interval": "1h"},
+        {"tide_interval": "12h", "wave_interval": "6h", "ripple_interval": "4h"},
+        {"tide_interval": "1w", "wave_interval": "1d", "ripple_interval": "4h"},
+        {"wave_interval": "2h"},  # 4h > 2h > 15m: no longer a ratio violation
         {"tp_pct": "12"},  # Decimal as a string
+        {"trail_cap_pct": 0.5, "tp_pct": 1.5},  # Decimal as a JSON number
+        {"trail_cap_pct": "0.5", "tp_pct": "1.5"},  # the same pair as strings
     ],
 )
 def test_published_rules_accept_what_the_model_accepts(params: dict[str, Any]) -> None:
@@ -210,10 +313,20 @@ def test_published_rules_accept_what_the_model_accepts(params: dict[str, Any]) -
     [
         {"ema_tide_periods": [34, 13, 5]},  # decreasing
         {"ema_tide_periods": [5, 5, 34]},  # not strictly increasing
-        {"wave_interval": "2h"},  # breaks the 16:4:1 ratio
-        {"ripple_interval": "5m"},  # breaks the 16:4:1 ratio
+        {"wave_interval": "4h"},  # tide == wave
+        {"tide_interval": "30m"},  # tide < wave
+        {"ripple_interval": "1h"},  # wave == ripple
+        {"ripple_interval": "2h"},  # ripple > wave
+        # Exact arithmetic: float would round the required window down to 1e28.
+        {
+            "stochastic_k_period": 10**28,
+            "stochastic_d_period": 1,
+            "stochastic_slow_period": 3,
+            "kline_window": 10**28,
+        },
         {"kline_window": 34},  # one below the required window
         {"stochastic_k_period": 1000},  # pushes the required window above 1000
+        {"trail_cap_pct": 1.5, "tp_pct": 1.5},  # Decimal as a JSON number
     ],
 )
 def test_published_rules_reject_what_the_model_rejects(params: dict[str, Any]) -> None:
@@ -224,16 +337,17 @@ def test_published_rules_reject_what_the_model_rejects(params: dict[str, Any]) -
 def test_kline_window_message_reports_the_real_minimum() -> None:
     """The message is UI copy, so it must carry the number the model computed."""
     assert reference_check({"kline_window": 10}) == ["kline_window must be at least 35"]
-    assert reference_check({"kline_window": 10, "swing_low_h1_n": 80}) == [
+    assert reference_check({"kline_window": 10, "swing_low_wave_n": 80}) == [
         "kline_window must be at least 80"
     ]
 
 
-def test_ratio_failure_message_is_the_published_one() -> None:
-    # Both ratio rules trip, and both carry the same published message.
-    assert set(reference_check({"wave_interval": "2h"})) == {
-        "timeframes must have tide:wave:ripple ratio 16:4:1"
-    }
+def test_timeframe_order_failure_message_is_the_published_one() -> None:
+    # 15m / 1h / 4h trips both order rules; both carry the same published message.
+    failures = reference_check({"tide_interval": "15m", "ripple_interval": "4h"})
+    assert failures == ["timeframes must satisfy tide > wave > ripple"] * 2
+    with pytest.raises(ValueError, match=r"tide > wave > ripple"):
+        TripleScreenSettings.from_params({"tide_interval": "1h"})
 
 
 # --- Publishing -------------------------------------------------------------

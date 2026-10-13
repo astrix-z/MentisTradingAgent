@@ -1,0 +1,743 @@
+"""EXEC-11b: startup integration — reconcile before admission, restored entries."""
+
+from __future__ import annotations
+
+import asyncio
+from decimal import Decimal
+from typing import Any
+
+import pytest
+from alembic import command
+from execution_world import World, run
+
+from agent.core.migrate import _config, migrate
+from agent.exchange.budget import RequestBudget
+from agent.exchange.hub import StreamHub
+from agent.exchange.rest import ExchangeRest
+from agent.exchange.trade import TradeClient
+from agent.execution.admission import Admission
+from agent.execution.attempts import Role
+from agent.execution.filters import FilterCache
+from agent.execution.models import AttemptState, IntentState, PositionStatus
+from agent.execution.orders import EntryOutcome
+from agent.execution.outcome import ExitMechanism, ExitReason
+from agent.execution.quotes import QuoteProvider
+from agent.execution.runtime import ExecutionRuntime
+from agent.execution.service import ExecutionService
+from agent.execution.worker import Operation
+
+
+def service(state: World, hub: StreamHub | None = None) -> ExecutionService:
+    """A fresh process: runtime, admission and service, not yet booted."""
+    fake, clock = state.fake, state.clock
+    runtime = ExecutionRuntime(
+        db=state.db,
+        db_url=state.url,
+        schema_ready=True,
+        trade_factory=lambda network: TradeClient(
+            "live", fake.spot(), budget=RequestBudget()
+        ),
+        clock=clock.now,
+    )
+    rest = ExchangeRest("live", fake.spot(), RequestBudget())
+
+    async def fetch(network: str, symbol: str) -> Any:
+        return await rest.exchange_info(symbol)
+
+    async def price(network: str, symbol: str) -> Decimal | None:
+        return fake.last.get(symbol)
+
+    async def bnb(asset: str, at: Any) -> Decimal | None:
+        return None if fake.valuation_down else fake.bnb_price
+
+    filters = FilterCache(fetch)
+    admission = Admission(
+        runtime,
+        quotes=lambda network: QuoteProvider(rest, clock=clock.now),
+        filters=filters,
+        prices=price,
+        clock=clock.now,
+    )
+    runtime.set_admission_wake(admission.wake)
+    built = ExecutionService(
+        runtime,
+        admission=admission,
+        market=lambda network: rest,
+        hub=hub,
+        filters=filters,
+        clock=clock.now,
+        sleep=clock.sleep,
+        commission_price=bnb,
+    )
+    runtime.settings = state.settings
+    return built
+
+
+def test_buy_filled_before_the_crash_is_opened_and_protected_after_restart() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+        state.fake.fault("new_order", "timeout_after")  # BUY fills, answer lost
+        assert (
+            await first.orders.execute_entry(signal_id)
+        ).outcome is EntryOutcome.UNKNOWN
+        await state.kill(first)  # dies before any position was written
+
+        restarted = service(state)
+        seen: list[bool] = []
+        original = restarted.reconciler.run
+
+        async def watched() -> Any:
+            seen.append(restarted.runtime.admission_block() is None)
+            return await original()
+
+        restarted.reconciler.run = watched  # type: ignore[method-assign]
+        await restarted.runtime.boot()  # lock → startup reconcile → mutations
+        assert seen == [False]  # admission was closed while reconciling
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.FILLED
+        position = await state.position_of(first, signal_id)
+        assert position is not None and position.status == PositionStatus.PROTECTING
+        await restarted.tick()
+        position = await state.position_of(first, signal_id)
+        assert position is not None and position.status == PositionStatus.PROTECTED
+        assert len(state.fake.orders_of("BTCUSDT", "BUY")) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_restart_in_the_middle_of_a_reprice_finishes_it() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        state.fake.fault("order_list_oco", "timeout_before")  # replacement lost
+        await first.worker.reprice(position_id, Decimal("99.5"))
+        await state.kill(first)
+        state.clock.advance(70)  # the lost OCO is provably absent now
+        state.fake.set_price("BTCUSDT", Decimal(100))
+        restarted = service(state)
+        await restarted.runtime.boot()
+        for _ in range(3):
+            await restarted.tick()
+        position = await state.position(first, position_id)
+        # 70 s without protection is past the 30 s deadline: once the lost
+        # replacement is proven absent, the proven remainder is sold.
+        assert position.status == PositionStatus.CLOSED and position.outcome is not None
+        assert position.outcome["mechanism"] == "market_unprotected"
+        assert position.operation is None
+        sells = [
+            o for o in state.fake.orders_of("BTCUSDT", "SELL") if o.type == "MARKET"
+        ]
+        assert len(sells) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_repeated_reconcile_does_not_book_twice() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        await state.kill(first)
+        restarted = service(state)
+        await restarted.runtime.boot()
+        before = await state.position(first, position_id)
+        await restarted.reconciler.run()
+        await restarted.reconciler.run()
+        after = await state.position(first, position_id)
+        assert (
+            after.bought_qty == before.bought_qty and after.sold_qty == before.sold_qty
+        )
+        assert after.status == PositionStatus.PROTECTED
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_reserved_entry_left_by_a_dead_process_is_executed_once() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)  # reserved, never sent
+        await state.kill(first)
+        restarted = service(state)
+        await restarted.runtime.boot()
+        restarted.runtime.open_admission("tripple_screen")
+        await restarted.tick()
+        await restarted.tick()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.FILLED
+        position = await state.position_of(first, signal_id)
+        assert position is not None and position.status == PositionStatus.PROTECTED
+        assert len(state.fake.orders_of("BTCUSDT", "BUY")) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+# --- review 2026-09-30 (EXEC-08) ---------------------------------------------------
+
+
+def test_crash_after_the_ack_commit_is_settled_after_restart() -> None:
+    # The ACK was committed, the process died before _settle(): intent
+    # submitted, attempt acked, a filled BUY and no position.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("process killed")
+
+        first.orders._settle = crash  # type: ignore[method-assign]
+        try:
+            await first.orders.execute_entry(signal_id)
+        except RuntimeError:
+            pass
+        await state.kill(first)
+        [attempt] = await state.attempts(first, signal_id)
+        assert attempt.state == AttemptState.ACKED
+        assert (await state.intent(first, signal_id)).state == IntentState.SUBMITTED
+
+        restarted = service(state)
+        await restarted.runtime.boot()
+        for _ in range(4):
+            await restarted.tick()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.FILLED
+        position = await state.position_of(first, signal_id)
+        assert position is not None and position.status == PositionStatus.PROTECTED
+        assert len(state.fake.orders_of("BTCUSDT", "BUY")) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_not_found_past_recv_window_is_not_absence_when_a_buy_filled() -> None:
+    # timeout_after (the BUY filled), then get_order misses twice past the
+    # recvWindow: that used to prove absence and release a filled entry.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+        state.fake.fault("new_order", "timeout_after")
+        assert (
+            await first.orders.execute_entry(signal_id)
+        ).outcome is EntryOutcome.UNKNOWN
+        await state.kill(first)
+
+        restarted = service(state)
+        state.fake.fault("get_order", "not_found", times=1000)
+        await restarted.runtime.boot()
+        for _ in range(6):  # well past recvWindow + grace, misses every time
+            state.clock.advance(60)
+            await restarted.tick()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.UNKNOWN  # still unproven, not released
+        assert intent.quote_reserved > 0
+        state.fake.faults.pop("get_order")  # the order becomes visible
+        for _ in range(3):
+            state.clock.advance(5)
+            await restarted.tick()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.FILLED
+        position = await state.position_of(first, signal_id)
+        assert position is not None
+        assert len(state.fake.orders_of("BTCUSDT", "BUY")) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_entry_never_placed_is_still_released() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+        state.fake.fault("new_order", "timeout_before")  # never reached matching
+        assert (
+            await first.orders.execute_entry(signal_id)
+        ).outcome is EntryOutcome.UNKNOWN
+        for _ in range(3):
+            state.clock.advance(60)
+            await first.orders.resolve_entries()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.NO_FILL
+        assert state.fake.orders_of("BTCUSDT", "BUY") == []
+
+    run(scenario)
+
+
+# --- review 2026-10-01 (EXEC-08 P2) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("refusal", "reason"),
+    [("exchange", "entry_rejected:-2010"), ("expired", "expired")],
+)
+def test_crash_after_a_refusal_is_released_after_restart(
+    refusal: str, reason: str
+) -> None:
+    # The attempt is recorded REJECTED, the process dies before _release():
+    # intent submitted, no open attempt. That used to hold the reserve forever.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+        if refusal == "exchange":
+            state.fake.fault("new_order", "reject", code=-2010)
+        else:
+            mark = first.orders.journal._mark
+
+            async def slow_mark(*args: Any, **kwargs: Any) -> None:
+                await mark(*args, **kwargs)
+                state.clock.advance(600)  # past valid_until before the send
+
+            first.orders.journal._mark = slow_mark  # type: ignore[method-assign]
+
+        async def crash(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("process killed")
+
+        first.orders._release = crash  # type: ignore[method-assign]
+        try:
+            await first.orders.execute_entry(signal_id)
+        except RuntimeError:
+            pass
+        await state.kill(first)
+        [attempt] = await state.attempts(first, signal_id)
+        assert attempt.state == AttemptState.REJECTED
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.SUBMITTED and intent.quote_reserved > 0
+
+        restarted = service(state)
+        await restarted.runtime.boot()
+        await restarted.tick()
+        intent = await state.intent(first, signal_id)
+        assert intent.state == IntentState.NO_FILL
+        assert intent.reason == reason
+        assert intent.quote_reserved == 0
+        assert state.fake.orders_of("BTCUSDT", "BUY") == []
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_protection_deadline_is_checked_while_the_round_is_blocked() -> None:
+    # The execution round is stuck on the OCO answer; the runtime watchdog
+    # must still mark the position overdue, without selling anything.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        signal_id = await state.reserve(first)
+        await state.kill(first)  # reserved, not executed
+        built = service(state)
+        await built.runtime.boot()
+        built.runtime.open_admission("tripple_screen")
+        entered, release = state.fake.gate("order_list_oco")
+        round_ = asyncio.create_task(built.tick())  # executes, fills, protects
+        assert await asyncio.to_thread(entered.wait, 5)
+        state.clock.advance(31)
+        await built.runtime.tick()  # one watchdog round
+        assert not round_.done()
+        position = await state.position_of(first, signal_id)
+        assert position is not None
+        assert position.status == PositionStatus.PROTECTION_OVERDUE
+        assert "overdue:BTCUSDT" in built.runtime.alerts
+        assert [
+            o for o in state.fake.orders_of("BTCUSDT", "SELL") if o.type == "MARKET"
+        ] == []
+        release.set()
+        await round_
+        position = await state.position_of(first, signal_id)
+        assert position is not None and position.status == PositionStatus.PROTECTED
+        await built.stop()
+        await built.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_fees_unpriced_at_close_are_revalued_by_a_later_round() -> None:
+    # Review 2026-09-30 (EXEC-15): restoring prices and reconciling did not
+    # correct a position closed with unvalued fees.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        state.fake.valuation_down = True  # the commission price source is down
+        position_id = await state.protected(first)
+        result = await first.worker.close(
+            position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
+        )
+        assert result.step.value == "closed"
+        position = await state.position(first, position_id)
+        assert position.outcome is not None and position.outcome["commission_pending"]
+        assert position.outcome["counted_losing"] is True
+        await state.kill(first)
+
+        state.fake.valuation_down = False
+        restarted = service(state)
+        await restarted.runtime.boot()
+        await restarted.runtime.prepare_start(
+            network="live", settings=state.settings, params={"quote_asset": "USDT"}
+        )
+        state.clock.advance(state.settings.reconcile_interval_s + 1)
+        await restarted.tick()  # the periodic reconcile round revalues
+        position = await state.position(first, position_id)
+        assert position.outcome is not None
+        assert position.outcome["commission_pending"] == []
+        assert position.commission_quote > 0
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+# --- review 2026-10-03 (EXEC-09): an OCO answer committed, never applied ----------
+
+
+def _live_lists(state: World) -> list[Any]:
+    return [ol for ol in state.fake.lists.values() if ol.status == "EXECUTING"]
+
+
+def _market_sells(state: World) -> list[Any]:
+    return [o for o in state.fake.orders_of("BTCUSDT", "SELL") if o.type == "MARKET"]
+
+
+def test_crash_between_the_replacement_ack_and_its_association() -> None:
+    # pl1 → reprice → pl2 accepted, ACK committed → the process dies before
+    # _mark_protected. It used to query only pl1, mark the position overdue
+    # and try MARKET sells against the balance pl2 holds.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("process killed")
+
+        first.protector._mark_protected = crash  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            await first.worker.reprice(position_id, Decimal("99.5"))
+        await state.kill(first)
+        [pl2] = _live_lists(state)
+        assert pl2.list_client_order_id.endswith("-pl2")
+
+        state.clock.advance(31)
+        restarted = service(state)
+        await restarted.runtime.boot()
+        for _ in range(3):
+            await restarted.tick()
+        position = await state.position(first, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        assert position.protection_list_id == pl2.list_client_order_id
+        assert position.exchange_stop == Decimal("99.5")
+        assert position.operation is None
+        assert _market_sells(state) == []
+        assert len(_live_lists(state)) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_crash_between_the_first_ack_and_its_association() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.filled(first)
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("process killed")
+
+        first.protector._mark_protected = crash  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            await first.protector.protect(position_id)
+        await state.kill(first)
+        [pl1] = _live_lists(state)
+
+        state.clock.advance(31)
+        restarted = service(state)
+        await restarted.runtime.boot()
+        for _ in range(3):
+            await restarted.tick()
+        position = await state.position(first, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        assert position.protection_list_id == pl1.list_client_order_id
+        assert _market_sells(state) == []
+        assert len(_live_lists(state)) == 1
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+def test_startup_reconcile_mutates_nothing_until_it_is_finished() -> None:
+    # Review 2026-10-03 (EXEC-05): a recorded reprice was resumed from inside
+    # the startup reconcile — delete_order_list and order_list_oco went out
+    # with reconciled=False, may_mutate()=False.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+
+        async def crash(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("process killed")
+
+        first.worker._continue = crash  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError):
+            await first.worker.reprice(position_id, Decimal("99.5"))
+        await state.kill(first)
+        assert (await state.position(first, position_id)).operation == "reprice"
+
+        restarted = service(state)
+        seen: list[tuple[str, bool]] = []
+        for name in (
+            "delete_order_list",
+            "order_list_oco",
+            "new_order",
+            "delete_order",
+        ):
+            real = getattr(state.fake, name)
+
+            def spy(*args: Any, _name: str = name, _real: Any = real, **kw: Any) -> Any:
+                seen.append((_name, restarted.runtime.may_mutate()))
+                return _real(*args, **kw)
+
+            setattr(state.fake, name, spy)
+        await restarted.runtime.boot()
+        assert seen == []  # the reconcile only read and recorded
+        assert restarted.runtime.reconciled
+        await restarted.tick()  # the first round resumes the reprice
+        assert [name for name, _ in seen] == ["delete_order_list", "order_list_oco"]
+        assert all(allowed for _, allowed in seen)
+        position = await state.position(first, position_id)
+        assert position.status == PositionStatus.PROTECTED
+        assert position.exchange_stop == Decimal("99.5")
+        await restarted.stop()
+        await restarted.runtime.shutdown()
+
+    run(scenario)
+
+
+# --- re-review 2026-10-03 (EXEC-09): a lost association recorded before 0003 ------
+
+
+async def upgrade_from_0002(state: World) -> None:
+    """The rows were written by the code before 0003: downgrade, then upgrade."""
+    async with state.db.begin() as connection:
+        await connection.run_sync(
+            lambda c: command.downgrade(_config(c), "0002_execution")
+        )
+    await migrate(state.db)
+
+
+async def _crash_on_association(state: World, first: Any) -> None:
+    async def crash(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("process killed")
+
+    first.protector._mark_protected = crash
+
+
+async def _restart_protects_with_the_live_list(
+    state: World, first: Any, position_id: Any, *, stop: Decimal | None = None
+) -> None:
+    [live] = _live_lists(state)
+    state.clock.advance(31)
+    restarted = service(state)
+    await restarted.runtime.boot()
+    for _ in range(3):
+        await restarted.tick()
+    position = await state.position(first, position_id)
+    assert position.status == PositionStatus.PROTECTED
+    assert position.protection_list_id == live.list_client_order_id
+    if stop is not None:
+        assert position.exchange_stop == stop
+    assert position.operation is None
+    assert _market_sells(state) == []
+    assert len(_live_lists(state)) == 1
+    await restarted.stop()
+    await restarted.runtime.shutdown()
+
+
+def test_legacy_lost_first_association_is_recovered_after_upgrade() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.filled(first)
+        await _crash_on_association(state, first)
+        with pytest.raises(RuntimeError):
+            await first.protector.protect(position_id)
+        await state.kill(first)
+        await upgrade_from_0002(state)
+        await _restart_protects_with_the_live_list(state, first, position_id)
+
+    run(scenario)
+
+
+def test_legacy_lost_replacement_association_is_recovered_after_upgrade() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        await _crash_on_association(state, first)
+        with pytest.raises(RuntimeError):
+            await first.worker.reprice(position_id, Decimal("99.5"))
+        await state.kill(first)
+        await upgrade_from_0002(state)
+        await _restart_protects_with_the_live_list(
+            state, first, position_id, stop=Decimal("99.5")
+        )
+
+    run(scenario)
+
+
+def test_legacy_resolved_list_lost_before_association_is_recovered() -> None:
+    # The OCO's answer was lost (UNKNOWN); the round found the list, recorded
+    # RESOLVED and died before associating it.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.filled(first)
+        signal_id = (await state.position(first, position_id)).signal_id
+        state.fake.fault("order_list_oco", "timeout_after")
+        await _crash_on_association(state, first)
+        with pytest.raises(RuntimeError):
+            await first.protector.protect(position_id)
+        [attempt] = [
+            a
+            for a in await state.attempts(first, signal_id)
+            if a.role == Role.LIST.value
+        ]
+        assert attempt.state == AttemptState.RESOLVED
+        await state.kill(first)
+        await upgrade_from_0002(state)
+        await _restart_protects_with_the_live_list(state, first, position_id)
+
+    run(scenario)
+
+
+def test_upgrade_keeps_lists_whose_effect_is_on_record() -> None:
+    # A completed reprice: pl1 replaced by pl2. Neither may be replayed.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        await first.worker.reprice(position_id, Decimal("99.5"))
+        signal_id = (await state.position(first, position_id)).signal_id
+        await upgrade_from_0002(state)
+        lists = [
+            a
+            for a in await state.attempts(first, signal_id)
+            if a.role == Role.LIST.value
+        ]
+        assert len(lists) == 2
+        assert all(a.applied_at is not None for a in lists)
+
+    run(scenario)
+
+
+# --- review 2026-10-04 (EXEC-09a/11b): a lost replacement ACK, then a recorded EXIT --
+
+
+async def _lost_replacement_then_close(state: World) -> tuple[Any, Any]:
+    """pl1 cancelled, pl2 accepted and its answer committed, the association
+    lost; then a manual Close recorded durably before the process died."""
+    first = await state.stack()
+    position_id = await state.protected(first)
+    await _crash_on_association(state, first)
+    with pytest.raises(RuntimeError):
+        await first.worker.reprice(position_id, Decimal("99.5"))
+    await first.worker._record(
+        position_id,
+        Operation.EXIT,
+        {
+            "reason": ExitReason.MANUAL.value,
+            "mechanism": ExitMechanism.MANUAL_CLOSE.value,
+        },
+    )
+    await state.kill(first)
+    position = await state.position(first, position_id)
+    assert position.operation == Operation.EXIT.value
+    assert len(_live_lists(state)) == 1  # pl2, held by nobody's record
+    return first, position_id
+
+
+async def _restart_closes_through_the_live_list(
+    state: World, first: Any, position_id: Any
+) -> None:
+    restarted = service(state)
+    await restarted.runtime.boot()
+    for _ in range(3):
+        await restarted.tick()
+    position = await state.position(first, position_id)
+    assert position.status == PositionStatus.CLOSED
+    assert _live_lists(state) == []
+    assert len(_market_sells(state)) == 1
+    signal_id = position.signal_id
+    exits = [
+        a for a in await state.attempts(first, signal_id) if a.role == Role.EXIT.value
+    ]
+    assert [a.state for a in exits] == [AttemptState.ACKED]  # no refused SELL
+    await restarted.stop()
+    await restarted.runtime.shutdown()
+
+
+def test_lost_replacement_then_close_exits_without_an_upgrade() -> None:
+    # The control: on the current schema the unapplied answer finds pl2.
+    async def scenario(state: World) -> None:
+        first, position_id = await _lost_replacement_then_close(state)
+        await _restart_closes_through_the_live_list(state, first, position_id)
+
+    run(scenario)
+
+
+def test_legacy_lost_replacement_then_close_exits_after_upgrade() -> None:
+    # The reviewer's repro: 0004 skipped every EXIT, so pl2 stayed applied and
+    # invisible; three ticks went overdue and every SELL was refused.
+    async def scenario(state: World) -> None:
+        first, position_id = await _lost_replacement_then_close(state)
+        await upgrade_from_0002(state)
+        await _restart_closes_through_the_live_list(state, first, position_id)
+
+    run(scenario)
+
+
+def test_upgrade_keeps_the_list_an_exit_is_already_cancelling() -> None:
+    # An EXIT recorded on a protected position: pl1 is the protection on
+    # record, so it stays applied — the exit cancels it, nothing replays it.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        await first.worker._record(
+            position_id,
+            Operation.EXIT,
+            {
+                "reason": ExitReason.MANUAL.value,
+                "mechanism": ExitMechanism.MANUAL_CLOSE.value,
+            },
+        )
+        signal_id = (await state.position(first, position_id)).signal_id
+        await upgrade_from_0002(state)
+        [pl1] = [
+            a
+            for a in await state.attempts(first, signal_id)
+            if a.role == Role.LIST.value
+        ]
+        assert pl1.applied_at is not None
+
+    run(scenario)
+
+
+def test_an_asset_with_no_usdt_market_does_not_stop_the_startup_reconcile() -> None:
+    # Rollback rehearsal 2026-10-05 (testnet): the account held assets with no
+    # USDT pair; their price lookup failed with -1121 and the reconcile before
+    # execution retried forever, so execution never started.
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        await state.protected(first)
+        await state.kill(first)
+        state.fake.free["NOPAIR"] = Decimal(1000)  # no NOPAIRUSDT market
+        state.fake.free["SOL"] = Decimal(1)  # 100 USDT, no position explains it
+        started = service(state)
+        await started.runtime.boot()  # unfinished work: lock → startup reconcile
+        assert started.runtime.reconciled
+        assert "reconcile" not in started.runtime.alerts
+        # The unvaluable asset is ignored; a real one is still a divergence.
+        assert "divergence:balance:SOLUSDT" in started.runtime.alerts
+        assert not any("NOPAIR" in key for key in started.runtime.alerts)
+        await started.runtime.shutdown()
+
+    run(scenario)

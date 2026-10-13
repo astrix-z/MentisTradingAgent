@@ -33,19 +33,25 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable
-from decimal import Decimal, InvalidOperation
-from typing import Annotated, Any
+import math
+import unicodedata
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
+from decimal import Decimal, Inexact, InvalidOperation, localcontext
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
+    Strict,
     TypeAdapter,
     ValidationError,
     create_model,
 )
+from pydantic_core import PydanticCustomError
 from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
@@ -71,12 +77,26 @@ _BOUNDS = {
     "exclusiveMaximum": "lt",
     "maximum": "le",
 }
+# Strict where the wire type is unambiguous (plan §4.3.5 step 1): an integer
+# field takes only a JSON integer — not a bool, a string or 5.0 — a number
+# field a JSON number (integer or not, never a bool or a string), and a string
+# or boolean field only its own type. Decimal fields (``anyOf`` number/string)
+# stay lax on purpose: they take a JSON number or a decimal string.
 _PRIMITIVES: dict[str, Any] = {
-    "string": str,
-    "integer": int,
-    "number": float,
-    "boolean": bool,
+    "string": Annotated[str, Strict()],
+    "integer": Annotated[int, Strict()],
+    "number": Annotated[float, Strict()],
+    "boolean": Annotated[bool, Strict()],
 }
+
+#: Numeric domain of the Start contract (plan §4.3.5 step 1): a non-zero
+#: number has at most this many significant digits and an adjusted exponent
+#: within ±DOMAIN_EXPONENT. Judged by value, not by its spelling.
+DOMAIN_DIGITS = 64
+DOMAIN_EXPONENT = 64
+#: Precision a rule leaf needs: its significant digits plus alignment of any
+#: two in-domain exponents to one fixed point (plan §4.3.5 step 4).
+_LEAF_PRECISION = 3 * DOMAIN_DIGITS
 
 
 class CatalogError(ValueError):
@@ -94,25 +114,105 @@ def json_safe_errors(exc: ValidationError) -> list[dict[str, Any]]:
     exception for a custom validator's ``ValueError``, and the actual ``Decimal``
     bounds for a Decimal field. Neither survives JSON, and an ``HTTPException``
     detail is not passed through ``jsonable_encoder`` the way FastAPI's own 422
-    handling is, so both are stringified here.
+    handling is, so both are stringified here. So is a non-finite float in the
+    ``input`` or the context: the request body may carry ``NaN``/``Infinity``
+    (Python's JSON parser accepts them), and the response writer does not.
+    """
+    return plain_errors(exc.errors(include_url=False))
+
+
+def plain_errors(raw_errors: Sequence[Any]) -> list[dict[str, Any]]:
+    """Validation errors as strict JSON (see :func:`json_safe_errors`).
+
+    Also for FastAPI's own ``RequestValidationError``, whose default handler
+    cannot write a non-finite ``input`` (R79).
     """
     errors: list[dict[str, Any]] = []
-    for raw_error in exc.errors(include_url=False):
+    for raw_error in raw_errors:
         error: dict[str, Any] = dict(raw_error)
         error["loc"] = list(raw_error.get("loc") or ())
+        if "input" in error:
+            error["input"] = _plain(error["input"])
         ctx = error.get("ctx")
         if ctx:
-            error["ctx"] = {
-                key: value
-                if value is None or isinstance(value, (str, int, float, bool))
-                else str(value)
-                for key, value in ctx.items()
-            }
+            error["ctx"] = {key: _plain(value) for key, value in ctx.items()}
         errors.append(error)
     return errors
 
 
+def _plain(value: Any) -> Any:
+    """``value`` as strict JSON: containers kept, anything else as a string."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    return str(value)
+
+
 # --- Schema -> pydantic model ----------------------------------------------
+
+
+def _as_decimal(value: Any) -> Decimal | None:
+    """The finite numeric value of a wire value, or ``None`` if it is not one.
+
+    A float is taken by its shortest decimal text, as a pydantic ``Decimal``
+    field takes it, so the domain is judged on the value validation will see.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        number = value
+    elif isinstance(value, int):
+        number = Decimal(value)
+    elif isinstance(value, float):
+        number = Decimal(repr(value))
+    elif isinstance(value, str):
+        try:
+            number = Decimal(value.strip())
+        except InvalidOperation:
+            return None
+    else:
+        return None
+    return number if number.is_finite() else None
+
+
+def in_domain(number: Decimal) -> bool:
+    """Whether ``number`` is inside the numeric domain (zero always is)."""
+    if number.is_zero():
+        return True
+    significant = len("".join(map(str, number.as_tuple().digits)).rstrip("0"))
+    return (
+        significant <= DOMAIN_DIGITS
+        and -DOMAIN_EXPONENT <= number.adjusted() <= DOMAIN_EXPONENT
+    )
+
+
+def _domain(*kinds: type) -> BeforeValidator:
+    """Reject an out-of-domain number before the field's own bounds run.
+
+    Runs first so that such a value yields exactly one ``too_large`` error,
+    whatever else is wrong with it. Values of other kinds pass through to the
+    field's type check (a float in an integer field is a type error there).
+    """
+
+    def check(value: Any) -> Any:
+        if isinstance(value, bool) or not isinstance(value, kinds):
+            return value
+        number = _as_decimal(value)
+        if number is not None and not in_domain(number):
+            raise PydanticCustomError(
+                "too_large",
+                "number is outside the supported range: at most {digits} "
+                "significant digits, exponent within ±{exponent}",
+                {"digits": DOMAIN_DIGITS, "exponent": DOMAIN_EXPONENT},
+            )
+        return value
+
+    return BeforeValidator(check)
 
 
 def _leaf(schema: dict[str, Any], where: str) -> tuple[Any, dict[str, Any]]:
@@ -124,8 +224,9 @@ def _leaf(schema: dict[str, Any], where: str) -> tuple[Any, dict[str, Any]]:
     """
     if "enum" in schema or "const" in schema:
         base = _primitive(schema, where)
+        is_enum = "enum" in schema
         check = _membership(
-            schema["enum"] if "enum" in schema else [schema["const"]], where
+            schema["enum"] if is_enum else [schema["const"]], where, enum=is_enum
         )
         return Annotated[base, AfterValidator(check)], {}
     if "anyOf" in schema:
@@ -143,9 +244,14 @@ def _leaf(schema: dict[str, Any], where: str) -> tuple[Any, dict[str, Any]]:
             if isinstance(branch, dict) and branch.get("type") == "number"
         ]
         if kinds == {"number", "string"} and len(numeric) == 1:
-            return Decimal, numeric[0]
+            return Annotated[Decimal, _domain(int, float, str, Decimal)], numeric[0]
         raise CatalogError(f"{where}: unsupported anyOf branches {sorted(kinds)}")
-    return _primitive(schema, where), schema
+    base = _primitive(schema, where)
+    if schema.get("type") == "integer":
+        base = Annotated[base, _domain(int)]
+    elif schema.get("type") == "number":
+        base = Annotated[base, _domain(int, float)]
+    return base, schema
 
 
 def _primitive(schema: dict[str, Any], where: str) -> Any:
@@ -158,16 +264,27 @@ def _primitive(schema: dict[str, Any], where: str) -> Any:
     return _PRIMITIVES[kind]
 
 
-def _membership(allowed: Any, where: str) -> Callable[[Any], Any]:
-    """A pydantic ``AfterValidator`` enforcing enum/const membership."""
+def _membership(allowed: Any, where: str, *, enum: bool) -> Callable[[Any], Any]:
+    """A pydantic ``AfterValidator`` enforcing enum/const membership.
+
+    An enum miss is ``unsupported_value`` (the agent cannot serve the value,
+    plan §4.3.5 step 1); a const miss stays a plain ``value_error``.
+    """
     if not isinstance(allowed, list) or not allowed:
         raise CatalogError(f"{where}: enum must be a non-empty list")
     values = tuple(allowed)
+    supported = ", ".join(map(str, values))
 
     def check(value: Any) -> Any:
-        if value not in values:
-            raise ValueError(f"must be one of: {', '.join(map(str, values))}")
-        return value
+        if value in values:
+            return value
+        if enum:
+            raise PydanticCustomError(
+                "unsupported_value",
+                "unsupported value '{value}'; supported: {supported}",
+                {"value": value, "supported": supported},
+            )
+        raise ValueError(f"must be one of: {supported}")
 
     return check
 
@@ -223,7 +340,11 @@ def _array_annotation(prefix: list[Any], where: str) -> Any:
     dynamically built type. Length is pinned in the same annotation so the whole
     array rule lives in one place.
     """
-    item = TypeAdapter(_item_annotation(prefix[0], f"{where}[]"))
+    # Items get the model's own rule: no NaN/Infinity in a numeric array.
+    item = TypeAdapter(
+        _item_annotation(prefix[0], f"{where}[]"),
+        config=ConfigDict(allow_inf_nan=False),
+    )
     length = len(prefix)
 
     def check(values: list[Any]) -> list[Any]:
@@ -284,6 +405,9 @@ def _compile_model(entry: dict[str, Any]) -> type[BaseModel] | None:
             # Mirrors the agent's model: the numeric branch of a Decimal field
             # must not smuggle in NaN/Infinity.
             allow_inf_nan=False,
+            # Defaults are published as JSON (a Decimal default is a string);
+            # validating them makes every canonical value typed (step 2).
+            validate_default=True,
         ),
         **fields,
     )
@@ -309,6 +433,36 @@ def _number_of(value: Any, where: str) -> Decimal:
     raise CatalogError(f"{where}: {type(value).__name__} is not a number")
 
 
+def _catalog_number(value: Any, where: str) -> Decimal:
+    """A number the catalog itself supplies (``const`` or a lookup value).
+
+    It must be inside the domain too: the rule precision is derived from it, so
+    an out-of-domain constant is a defect of the catalog, not of the request.
+    """
+    number = _number_of(value, where)
+    if not in_domain(number):
+        raise CatalogError(f"{where}: {value!r} is outside the numeric domain")
+    return number
+
+
+def _precision(expr: Any) -> int:
+    """Digits that evaluate ``expr`` exactly for in-domain leaves (§4.3.5 step 4).
+
+    A leaf needs ``_LEAF_PRECISION``; a sum, difference or maximum of ``n``
+    arguments needs the widest argument plus ``ceil(log10(n)) + 1`` carry
+    digits; a product needs the sum of its arguments' digits.
+    """
+    if not isinstance(expr, dict) or "op" not in expr:
+        return _LEAF_PRECISION
+    args = expr.get("args")
+    if not isinstance(args, list) or not args:
+        return _LEAF_PRECISION
+    widths = [_precision(arg) for arg in args]
+    if expr.get("op") == "mul":
+        return sum(widths)
+    return max(widths) + math.ceil(math.log10(len(widths))) + 1
+
+
 def _render(value: Decimal) -> str:
     """Integral decimals render without a trailing ``.0`` in rule messages."""
     return str(int(value)) if value == value.to_integral_value() else str(value)
@@ -318,7 +472,7 @@ def _eval_expr(expr: Any, values: dict[str, Any], lookups: dict[str, Any]) -> De
     if not isinstance(expr, dict):
         raise CatalogError(f"malformed expression {expr!r}")
     if "const" in expr:
-        return _number_of(expr["const"], "const")
+        return _catalog_number(expr["const"], "const")
     if "lookup" in expr:
         table_name = expr["lookup"]
         if "field" not in expr:
@@ -329,7 +483,7 @@ def _eval_expr(expr: Any, values: dict[str, Any], lookups: dict[str, Any]) -> De
         key = values.get(expr["field"])
         if str(key) not in table:
             raise CatalogError(f"{key!r} is not a value of lookup {table_name!r}")
-        return _number_of(table[str(key)], f"lookup {table_name!r}")
+        return _catalog_number(table[str(key)], f"lookup {table_name!r}")
     if "field" in expr:
         ref = expr["field"]
         if isinstance(ref, list):
@@ -382,7 +536,108 @@ def _check_rule(rule: Any) -> None:
         raise CatalogError("rule needs a non-empty message")
 
 
+# --- Built-in presets --------------------------------------------------------
+
+#: Same rule as a preset name in the API (plan §4.3.4): trimmed, 1–64 chars.
+PRESET_NAME_MAX = 64
+
+
+def preset_name(raw: Any) -> str | None:
+    """The trimmed name if it passes the envelope (plan §4.2), else ``None``.
+
+    A string of 1–64 characters after trim, with no control character
+    (PostgreSQL's ``text`` cannot hold NUL) and no lone surrogate (it cannot
+    be encoded). One rule for the agent, this parse and the API (§4.3.4).
+    """
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    if not 1 <= len(name) <= PRESET_NAME_MAX:
+        return None
+    if any(unicodedata.category(char) in ("Cc", "Cs") for char in name):
+        return None
+    return name
+
+
+PresetStatus = Literal["accepted", "rejected", "unreadable", "duplicate_name"]
+
+
+@dataclass(frozen=True)
+class PresetRecord:
+    """One entry of a strategy's published ``presets`` list, as parsed."""
+
+    index: int
+    #: Trimmed name, or ``None`` when it fails the envelope (not a string,
+    #: or not 1–64 characters after trim).
+    name: str | None
+    status: PresetStatus
+    #: Params after ``legacy_keys`` translation; ``None`` if unreadable.
+    params: dict[str, Any] | None = None
+    #: Why it was not accepted (validation errors), for logs.
+    reasons: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PresetsParse:
+    """What a strategy's ``presets`` metadata amounts to (plan §4.2).
+
+    ``absent``: an older agent publishes none. ``malformed``: not a list,
+    nothing accepted. ``list``: one record per entry. Any parse error makes the
+    list non-authoritative (no retirement) and the sync status ``partial``.
+    """
+
+    form: Literal["absent", "malformed", "list"]
+    records: list[PresetRecord] = field(default_factory=list)
+
+    @property
+    def accepted(self) -> list[PresetRecord]:
+        return [record for record in self.records if record.status == "accepted"]
+
+    @property
+    def errors(self) -> list[dict[str, Any]]:
+        return [
+            {"index": record.index, "name": record.name, "type": record.status}
+            for record in self.records
+            if record.status != "accepted"
+        ]
+
+    @property
+    def has_errors(self) -> bool:
+        return self.form == "malformed" or bool(self.errors)
+
+
 # --- Compiled catalog -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Checked:
+    """The outcome of the pipeline of plan §4.3.5, steps 1–4.
+
+    ``canonical`` (the model's output, with schema defaults) is set once steps
+    1–3 passed, whether or not a rule of step 4 failed: step 5 reads it.
+    """
+
+    errors: list[dict[str, Any]]
+    canonical: dict[str, Any] | None = None
+
+
+def _legacy_keys(entry: dict[str, Any], name: str) -> dict[str, str]:
+    """The strategy's renamed parameters (old -> new), or ``{}``.
+
+    Optional metadata: the backend only carries it to the UI and names the new
+    parameter when it rejects an old one, so a malformed map is logged and
+    dropped rather than failing the whole catalog.
+    """
+    raw = entry.get("legacy_keys")
+    if raw is None:
+        return {}
+    if isinstance(raw, dict) and all(
+        isinstance(old, str) and old and isinstance(new, str) and new
+        for old, new in raw.items()
+    ):
+        return dict(raw)
+    logger.warning("strategy %r: ignoring malformed legacy_keys %r", name, raw)
+    return {}
 
 
 class CompiledStrategy:
@@ -401,6 +656,7 @@ class CompiledStrategy:
         for rule in raw_rules:
             _check_rule(rule)
         self.constraints: list[dict[str, Any]] = list(raw_rules)
+        self.legacy_keys = _legacy_keys(entry, self.name)
         self._defaults: dict[str, Any] = {
             name: prop.get("default")
             for name, prop in (
@@ -410,38 +666,235 @@ class CompiledStrategy:
         }
         if self._model is None and self.constraints:
             raise CatalogError(f"strategy {self.name!r}: constraints without settings")
+        self._interval_fields: list[str] = [
+            name
+            for name, prop in (
+                (self.settings_schema or {}).get("properties") or {}
+            ).items()
+            if isinstance(prop, dict)
+            and (prop.get("ui") or {}).get("widget") == "interval"
+        ]
+        if self._interval_fields and not isinstance(
+            self.lookups.get("intervals_ms"), dict
+        ):
+            raise CatalogError(
+                f"strategy {self.name!r}: interval fields "
+                f"{', '.join(self._interval_fields)} need an intervals_ms lookup"
+            )
+        self._check_defaults()
+        self._raw_presets: Any = entry.get("presets")
+
+    def parse_presets(self) -> PresetsParse:
+        """Parse ``presets`` in isolation: a defect there never fails the catalog.
+
+        Not part of compiling and not cached with it (plan §4.3.2): only the
+        built-in sync calls this, after its idempotency check, so a Start and a
+        sync ``noop`` never pay for it. Everything that goes wrong is logged
+        and turned into a record status.
+        """
+        raw = self._raw_presets
+        try:
+            parsed = self._presets_from(raw)
+        except Exception:  # isolation is the contract: log, never raise
+            logger.exception("strategy %r: cannot parse presets", self.name)
+            return PresetsParse(form="malformed")
+        for error in parsed.errors:
+            logger.warning(
+                "strategy %r: built-in preset not accepted: %s", self.name, error
+            )
+        if parsed.form == "malformed":
+            logger.warning("strategy %r: presets is not a list: %r", self.name, raw)
+        return parsed
+
+    def _presets_from(self, raw: Any) -> PresetsParse:
+        if raw is None:
+            return PresetsParse(form="absent")
+        if not isinstance(raw, list):
+            return PresetsParse(form="malformed")
+        records = [self._preset_record(index, entry) for index, entry in enumerate(raw)]
+        # One identity more than once rejects the whole group, whatever each
+        # member's status: none of them may overwrite the stored row (plan
+        # §4.2). A name that passed the envelope counts even when its params
+        # are unreadable: a broken twin is an agent defect, not a winner.
+        counts: dict[str, int] = {}
+        for record in records:
+            if record.name is not None:
+                identity = record.name.lower()
+                counts[identity] = counts.get(identity, 0) + 1
+        return PresetsParse(
+            form="list",
+            records=[
+                PresetRecord(
+                    index=record.index,
+                    name=record.name,
+                    status="duplicate_name",
+                    params=record.params,
+                    reasons=record.reasons,
+                )
+                if record.name is not None and counts[record.name.lower()] > 1
+                else record
+                for record in records
+            ],
+        )
+
+    def _preset_record(self, index: int, entry: Any) -> PresetRecord:
+        """Envelope first (name, params object), then the preset itself."""
+        if not isinstance(entry, dict):
+            return PresetRecord(index=index, name=None, status="unreadable")
+        # Reported as null unless valid: only a valid name is an identity.
+        name = preset_name(entry.get("name"))
+        params = entry.get("params")
+        if name is None or not isinstance(params, dict):
+            return PresetRecord(index=index, name=name, status="unreadable")
+        moved, reasons = self.apply_legacy_keys(params)
+        editable = self.editable_fields()
+        missing, extra = editable - moved.keys(), moved.keys() - editable
+        if missing or extra:
+            # A full snapshot of exactly the editable parameters: a missing one
+            # would be filled by a default and change with it; a const one is
+            # the schema's to fix.
+            reasons.append(
+                {
+                    "msg": f"missing {sorted(missing)}, extra {sorted(extra)}",
+                    "type": "incomplete_preset",
+                }
+            )
+        if not reasons:
+            try:
+                reasons = self.validate(moved)
+            except CatalogError as exc:
+                reasons = [{"msg": str(exc), "type": "catalog_error"}]
+        return PresetRecord(
+            index=index,
+            name=name,
+            status="rejected" if reasons else "accepted",
+            params=moved,
+            reasons=reasons,
+        )
+
+    def editable_fields(self) -> set[str]:
+        """The non-const parameters: what a preset must set, exactly."""
+        properties = (self.settings_schema or {}).get("properties") or {}
+        return {
+            name
+            for name, prop in properties.items()
+            if isinstance(prop, dict) and "const" not in prop
+        }
+
+    def _check_defaults(self) -> None:
+        """Every published default must pass its own field: a catalog defect
+        found now, not dressed up as the user's error on each Start that omits
+        the field (type, bounds and the numeric domain alike). A field without
+        a default is the caller's to set and is not checked here.
+        """
+        if self._model is None:
+            return
+        try:
+            self._model.model_validate({})
+        except ValidationError as exc:
+            defects = [
+                error
+                for error in exc.errors(include_url=False)
+                if error["type"] != "missing"
+            ]
+            if defects:
+                raise CatalogError(
+                    f"strategy {self.name!r}: invalid defaults: "
+                    + "; ".join(
+                        f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in defects
+                    )
+                ) from exc
 
     def validate(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        """Field-level and cross-field errors for a Start's ``params``.
+        """Errors for a Start's ``params``; see :meth:`check`."""
+        return self.check(params).errors
 
-        Empty means the agent will accept these parameters. Raises
+    def materialize(self, params: dict[str, Any]) -> dict[str, Any]:
+        """The full snapshot a saved preset stores (plan §4.3.3).
+
+        Every non-const parameter, as sent or else the schema default, in its
+        JSON form. Call it only for params that :meth:`check` accepted: then
+        every non-const field is either sent or has a default.
+        """
+        return {
+            name: params[name] if name in params else self._defaults[name]
+            for name in sorted(self.editable_fields())
+            if name in params or name in self._defaults
+        }
+
+    def check(self, params: dict[str, Any]) -> Checked:
+        """Errors for a Start's ``params``, through the pipeline of plan §4.3.5.
+
+        1. fields — the compiled model: strict wire types, the numeric domain,
+           bounds, enums (``unsupported_value``), unknown parameters;
+        2. canonical values — the model's output with schema defaults; every
+           later step reads these, never the raw payload;
+        3. supported values — an interval-widget field must name an interval
+           the agent serves (a guard for a catalog published without enum);
+        4. cross-field rules, evaluated exactly.
+        A step with errors stops the pipeline, except step 4. Step 5, the
+        option lists kept in the database, belongs to the caller
+        (``app.core.field_options``): it runs on ``canonical``, which is set
+        once steps 1–3 passed, and its errors are collected with step 4's.
+
+        No errors means the agent will accept these parameters. Raises
         :class:`CatalogError` when a rule cannot be evaluated — the caller must
         not treat that as either valid or invalid.
         """
         if self._model is None:
-            return [] if not params else [self._unknown_params(params.keys())]
+            if not params:
+                return Checked(errors=[], canonical={})
+            return Checked(errors=[self._unknown_params(params.keys())])
         try:
-            self._model.model_validate(params)
+            canonical = self._model.model_validate(params).model_dump()
         except ValidationError as exc:
-            errors = json_safe_errors(exc)
-            return [
-                self._unknown_params(self._extra_keys(error))
-                if error["type"] == "extra_forbidden"
-                else error
-                for error in errors
-            ]
-        # Field-level rules passed, so fill the defaults the agent's own model
-        # would fill and evaluate the cross-field rules against that.
-        values = {**self._defaults, **params}
+            return Checked(
+                errors=[
+                    self._extra_param(self._extra_keys(error))
+                    if error["type"] == "extra_forbidden"
+                    else error
+                    for error in json_safe_errors(exc)
+                ]
+            )
+        unsupported = self._unsupported(canonical)
+        if unsupported:
+            return Checked(errors=unsupported)
+        return Checked(errors=self._rule_failures(canonical), canonical=canonical)
+
+    def _unsupported(self, values: dict[str, Any]) -> list[dict[str, Any]]:
+        """Step 3: interval-widget fields must name a served interval."""
+        errors: list[dict[str, Any]] = []
+        table = self.lookups.get("intervals_ms") or {}  # present: checked at compile
+        for name in self._interval_fields:
+            value = values.get(name)
+            if str(value) not in table:
+                errors.append(
+                    {
+                        "loc": [name],
+                        "msg": f"unsupported value {value!r}; supported: "
+                        f"{', '.join(table)}",
+                        "type": "unsupported_value",
+                    }
+                )
+        return errors
+
+    def _rule_failures(self, values: dict[str, Any]) -> list[dict[str, Any]]:
+        """Step 4: every published rule, at a precision that makes it exact."""
         failures: dict[tuple[Any, ...], dict[str, Any]] = {}
         for rule in self.constraints:
+            precision = max(_precision(rule["lhs"]), _precision(rule["rhs"]))
             try:
-                lhs = _eval_expr(rule["lhs"], values, self.lookups)
-                rhs = _eval_expr(rule["rhs"], values, self.lookups)
-            except CatalogError as exc:
+                with localcontext() as context:
+                    context.prec = precision
+                    context.traps[Inexact] = True
+                    lhs = _eval_expr(rule["lhs"], values, self.lookups)
+                    rhs = _eval_expr(rule["rhs"], values, self.lookups)
+            except (CatalogError, Inexact) as exc:
+                # In-domain values cannot round at this precision, so a trap
+                # here means the catalog itself is out of contract.
                 raise CatalogError(
                     f"strategy {self.name!r}: rule {rule['message']!r} cannot be "
-                    f"evaluated: {exc}"
+                    f"evaluated exactly: {exc!r}"
                 ) from exc
             if not _COMPARISONS[rule["cmp"]](lhs, rhs):
                 failure = {
@@ -449,15 +902,81 @@ class CompiledStrategy:
                     "msg": _format_message(rule["message"], lhs, rhs),
                     "type": "value_error",
                 }
-                # Two rules may carry the same text (the ratio chain is two
+                # Two rules may carry the same text (the order chain is two
                 # comparisons); report it once, as the agent's own validator
                 # would, instead of repeating an identical message.
                 failures.setdefault((tuple(failure["loc"]), failure["msg"]), failure)
         return list(failures.values())
 
+    def apply_legacy_keys(
+        self, params: dict[str, Any]
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Move renamed parameters to their new names (agent rule, plan §4.1.1).
+
+        For reading stored or built-in presets, never for a Start (a Start with
+        an old name is refused, see :meth:`_extra_param`). An old name alone is
+        moved as is and validated later like any value. With both names, each
+        value is validated by the field's **strict** type first; an invalid one
+        is left under the new name for the field's own error, and two valid
+        values that differ are a ``legacy_conflict``. Strictness is where this
+        differs from the agent on purpose: ``"7"`` beside ``7`` is a type error
+        here, while the lax agent reads both as 7. Presets only ever reach this
+        helper in their JSON form (saved through the strict API, or published
+        with integers as numbers), so a string there is a defect worth showing.
+        """
+        moved = dict(params)
+        errors: list[dict[str, Any]] = []
+        if self._model is None:
+            return moved, errors
+        fields = self._model.model_fields
+        for old, new in self.legacy_keys.items():
+            if old not in moved:
+                continue
+            legacy = moved.pop(old)
+            if new not in moved or new not in fields:
+                moved[new] = legacy
+                continue
+            info = fields[new]
+            adapter: TypeAdapter[Any] = TypeAdapter(
+                Annotated[info.annotation, *info.metadata]
+            )
+            try:
+                legacy_value = adapter.validate_python(legacy)
+            except ValidationError:
+                moved[new] = legacy
+                continue
+            try:
+                current_value = adapter.validate_python(moved[new])
+            except ValidationError:
+                continue
+            if legacy_value != current_value:
+                errors.append(
+                    {
+                        "loc": ["body", "params"],
+                        "msg": f"{old} (renamed to {new}) and {new} disagree: "
+                        f"{legacy!r} != {moved[new]!r}",
+                        "type": "legacy_conflict",
+                    }
+                )
+        return moved, errors
+
     @staticmethod
     def _extra_keys(error: dict[str, Any]) -> list[str]:
         return [str(part) for part in error.get("loc", [])[-1:]]
+
+    def _extra_param(self, keys: list[str]) -> dict[str, Any]:
+        """An extra key; a renamed one says so, since only a stale UI sends it."""
+        renamed = [key for key in keys if key in self.legacy_keys]
+        if not renamed:
+            return self._unknown_params(keys)
+        return {
+            "loc": ["body", "params"],
+            "msg": (
+                f"parameter {renamed[0]!r} was renamed to "
+                f"{self.legacy_keys[renamed[0]]!r}; reload the page"
+            ),
+            "type": "value_error",
+        }
 
     def _unknown_params(self, keys: Any) -> dict[str, Any]:
         known = ", ".join(sorted(self._defaults)) or "<none>"
@@ -501,6 +1020,15 @@ class CompiledCatalog:
                 raise CatalogError(f"malformed strategy entry {entry!r}")
             strategy = CompiledStrategy(entry, self.lookups)
             self.strategies[strategy.name] = strategy
+        # Execution settings travel next to the strategies in the same entry
+        # shape and are enforced the same way. An agent that does not publish
+        # them yet simply has none; a malformed section is a contract error.
+        execution = payload.get("execution")
+        self.execution: CompiledStrategy | None = None
+        if execution is not None:
+            if not isinstance(execution, dict):
+                raise CatalogError("catalog execution section must be an object")
+            self.execution = CompiledStrategy(execution, self.lookups)
 
     def strategy(self, name: str) -> CompiledStrategy | None:
         return self.strategies.get(name)
@@ -532,6 +1060,15 @@ async def read_catalog(redis: Redis) -> CompiledCatalog | None:
     raw = await redis.get(REDIS_STRATEGIES_KEY)
     if not raw:
         return None
+    return compile_published(raw)
+
+
+def compile_published(raw: str) -> CompiledCatalog:
+    """Parse and compile a published document, cached by its raw text.
+
+    Raises:
+        CatalogError: the document is unusable.
+    """
     cached = _CACHE.get(raw)
     if cached is not None:
         return cached
@@ -557,9 +1094,15 @@ __all__ = [
     "CATALOG_VERSION",
     "REDIS_STRATEGIES_KEY",
     "CatalogError",
+    "Checked",
     "CompiledCatalog",
     "CompiledStrategy",
+    "PresetRecord",
+    "PresetsParse",
     "compile_catalog",
+    "compile_published",
     "json_safe_errors",
+    "plain_errors",
+    "preset_name",
     "read_catalog",
 ]

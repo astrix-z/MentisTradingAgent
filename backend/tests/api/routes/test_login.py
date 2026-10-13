@@ -49,10 +49,9 @@ def test_use_access_token(
 def test_recovery_password(
     client: TestClient, normal_user_token_headers: dict[str, str]
 ) -> None:
-    with (
-        patch("app.core.config.settings.SMTP_HOST", "smtp.example.com"),
-        patch("app.core.config.settings.SMTP_USER", "admin@example.com"),
-    ):
+    # send_email is replaced: the test must not depend on SMTP settings in .env
+    # (EMAILS_FROM_EMAIL is empty in .env.example) or reach a mail server.
+    with patch("app.api.routes.login.send_email") as send_email:
         email = "test@example.com"
         r = client.post(
             f"{settings.API_V1_STR}/password-recovery/{email}",
@@ -62,6 +61,8 @@ def test_recovery_password(
         assert r.json() == {
             "message": "If that email is registered, we sent a password recovery link"
         }
+        send_email.assert_called_once()
+        assert send_email.call_args.kwargs["email_to"] == email
 
 
 def test_recovery_password_user_not_exits(
