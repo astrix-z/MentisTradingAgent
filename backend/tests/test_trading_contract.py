@@ -1454,6 +1454,17 @@ def test_real_trading_is_usdt_only_before_anything_is_stored(
     assert refused.status_code == 422
     assert refused.json()["detail"][0]["loc"] == ["body", "settings", "enabled"]
     assert trading.REDIS_EXECUTION_KEY not in redis.values
+    # A stopped strategy is checked by its next Start, as the agent does.
+    redis.values[trading.REDIS_RUNTIME_KEY] = json.dumps(
+        {"running": False, "params": usdc["params"], "updated_at": NOW.isoformat()}
+    )
+    stopped = client.post(
+        "/api/v1/trading/execution/",
+        json={"settings": {"enabled": True}},
+        headers=headers(client),
+    )
+    assert stopped.status_code == 202
+    del redis.values[trading.REDIS_EXECUTION_KEY]
     # Off is always accepted.
     off = client.post(
         "/api/v1/trading/execution/", json={"settings": {}}, headers=headers(client)

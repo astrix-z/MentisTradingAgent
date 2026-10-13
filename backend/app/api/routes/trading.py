@@ -805,7 +805,13 @@ async def _configure_execution(request: ExecutionRequest) -> CommandEnvelope:
         # The agent refuses this too; saying it here keeps a refused switch
         # from being stored ON (review 869fgqxah, P2-3).
         desired = await _get_snapshot()
-        if desired is not None and _quote_of(desired.params) != "USDT":
+        # Only a running strategy is checked, as the agent does; a stopped
+        # one is checked by its next Start (_refuse_quote_while_trading).
+        if (
+            desired is not None
+            and desired.running
+            and _quote_of(desired.params) != "USDT"
+        ):
             raise _usdt_only(_quote_of(desired.params), ["body", "settings", "enabled"])
     envelope = CommandEnvelope(
         id=uuid.uuid4(),

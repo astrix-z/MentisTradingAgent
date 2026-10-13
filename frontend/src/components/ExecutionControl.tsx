@@ -131,10 +131,10 @@ export function ExecutionControl({
   const busy = configure.isPending || pauseOrResume.isPending
   const latest = latestTrackedCommand(commands, isExecutionCommand)
 
-  const checkLimits = () =>
+  const checkLimits = (draft: FieldValues = values) =>
     validateSettings({
       fields,
-      values,
+      values: draft,
       lookups: {},
       constraints: section?.constraints ?? [],
       optionLists: {},
@@ -156,10 +156,17 @@ export function ExecutionControl({
 
   const onSwitch = (on: boolean) => {
     if (!on) {
-      // Never blocked by the limits: off with the form's limits when they
-      // pass, else with the agent's defaults (review 869fgqxah, P3-1).
-      const result = checkLimits()
-      const limits = result.status === "valid" ? result.params : {}
+      // Never blocked by the limits, and never a silent change of them: off
+      // with the stored limits when they still pass, else the form's, else
+      // the agent's defaults (review 869fgqxah, P3-1, P3-c).
+      const stored = checkLimits(seedFormValues(fields, desired))
+      const form = checkLimits(values)
+      const limits =
+        stored.status === "valid"
+          ? stored.params
+          : form.status === "valid"
+            ? form.params
+            : {}
       configure.mutate({ ...limits, [SWITCH_FIELD]: false })
       return
     }
