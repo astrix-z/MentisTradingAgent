@@ -15,8 +15,9 @@
 #   DEPLOY_T0_CONFIRM=1    решение человека снять отказ сверки T0
 #   DEPLOY_COMPOSE         команда compose (по умолчанию "docker compose")
 #
-# Порядок: .current → [T0: проверка и закрепление] → что умеет работающая
-# ревизия (флаг, исполнитель) → снапшот и его ротация →
+# Порядок: .current → [T0: проверка и закрепление] → что умеют работающие
+# backend/агент (по тегам их образов, не по releases/current) и цель → снапшот
+# и его ротация →
 # проверки контракта цели и сборка :<revision> из stage → установка stage в
 # APP_DIR (всё до флага: сбой здесь не оставляет ни флага, ни остановленного
 # агента, а до установки и APP_DIR работающей ревизии) →
@@ -24,6 +25,9 @@
 # [(2a) барьер исполнения при откате на ревизию без исполнителя] (3) DEL каталога,
 # (4) retag :latest и up, (5) ожидание каталога до 2 мин, healthcheck backend,
 # (6) снятие флага → releases/current, history, ротация образов и файлов попыток.
+# Цель, чей backend не знает флага (T0): на (4) backend не поднимается, (5)
+# проверяет изолированный экземпляр без портов, и только потом (6) — запуск
+# этого backend: он и есть снятие барьера. Сбой после запуска его останавливает.
 # Код выхода — в .exit попытки.
 
 set -Eeuo pipefail
@@ -65,6 +69,8 @@ FENCE_SINCE=c26ff5679de3dd20863396cf6fdc00067530fc56
 EXECUTOR_SINCE=e1333130fcd0472ecfaaaebb51eac498478931dd
 #: Остановлен ли backend, который не знает флага (шаг 0).
 BACKEND_QUIESCED=0
+#: Изолированный экземпляр backend цели без флага (шаг 5), пока он есть.
+PROBE=""
 
 exec >>"$LOG" 2>&1
 printf '%s %s\n' "$REVISION" "$ATTEMPT" >"$RELEASES/deploy.current"
@@ -73,7 +79,8 @@ echo "==> $(date -Is) попытка $ATTEMPT, ревизия $REVISION, скр�
 # PHASE говорит trap, что восстанавливать: before (ничего не тронуто), quiesced
 # (backend, не знающий флага, остановлен, флага ещё нет), fenced
 # (флаг стоит, агент работает), stopped (агент остановлен, up не начат), up
-# (внутри up), waiting (агент цели запущен), lifted (флаг снят).
+# (внутри up), waiting (агент цели запущен), opening (запускается backend цели,
+# не знающий флага), lifted (флаг снят).
 PHASE=before
 
 compose() { (cd "$APP_DIR" && "${COMPOSE[@]}" "$@"); }
@@ -155,16 +162,98 @@ running_images() {
   done
 }
 
+# since <commit> <revision>: 0 — <commit> есть в истории <revision> (по клону
+# сервера), 1 — нет, 2 — не доказано (ревизии нет в клоне, git не ответил).
+since() {
+  git -C "$CLONE" cat-file -e "$2^{commit}" 2>/dev/null || return 2
+  local rc=0
+  git -C "$CLONE" merge-base --is-ancestor "$1" "$2" 2>/dev/null || rc=$?
+  (( rc <= 1 )) || return 2
+  return "$rc"
+}
+# Образ контейнера сервиса в любом состоянии; пусто — контейнера нет.
+container_image() {
+  compose ps -aq "$1" 2>/dev/null | head -n 1 | xargs -r docker inspect -f '{{.Image}}' 2>/dev/null || true
+}
+# Образ работающего контейнера сервиса; пусто — не работает.
+running_image() {
+  compose ps -q "$1" 2>/dev/null | head -n 1 | xargs -r docker inspect -f '{{.Image}}' 2>/dev/null || true
+}
+# image_has <svc> <image> <commit>: yes | no | unknown — есть ли <commit> в
+# ревизиях, чьими тегами mentis-<svc>:<ревизия> помечен образ. Образ без такого
+# тега, ревизия не из клона, ответ git не получен, ревизии образа расходятся —
+# unknown: возможность не доказана.
+image_has() {
+  local revisions rev rc yes=0 no=0
+  revisions="$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}' "$2" 2>/dev/null \
+    | sed -n "s/^mentis-$1:\([0-9a-f]\{7,40\}\)\$/\1/p")"
+  [[ -n "$revisions" ]] || { echo unknown; return; }
+  while IFS= read -r rev; do
+    rc=0; since "$3" "$rev" || rc=$?
+    case "$rc" in 0) yes=1 ;; 1) no=1 ;; *) echo unknown; return ;; esac
+  done <<<"$revisions"
+  if (( yes && no )); then echo unknown; elif (( yes )); then echo yes; else echo no; fi
+}
+# Ревизии тегов образа — для журнала.
+image_has_revs() {
+  local revisions
+  revisions="$(docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}' "$2" 2>/dev/null \
+    | sed -n "s/^mentis-$1:\([0-9a-f]\{7,40\}\)\$/\1/p" | paste -sd, -)"
+  echo "${revisions:-без тега ревизии}"
+}
+# Знает ли флаг работающий сейчас backend — по его образу.
+backend_fenced() {
+  local image
+  image="$(running_image backend)"
+  [[ -n "$image" && "$(image_has backend "$image" "$FENCE_SINCE")" == yes ]]
+}
+# Остановить работающий backend, который флага не знает или чей образ не
+# доказан: при флаге Start закрывает только остановка.
+stop_unfenced_backend() {
+  [[ -n "$(running_image backend)" ]] || return 0
+  backend_fenced && return 0
+  echo "==> trap: работающий backend не знает флага (или его образ не доказан) — останавливаю"
+  compose stop backend
+  [[ -z "$(compose ps -q backend)" ]] || echo "!!! trap: backend не остановился — Start ОТКРЫТ, остановите его вручную"
+}
+# :latest backend — образ его контейнера: up мог пересоздать его, а мог не
+# дойти до него, а backend цели без флага на (4) не поднимается вовсе. Иначе
+# ручной `compose up` (или downgrade «текущим образом», §6) молча взял бы другой.
+latest_backend_is_container() {
+  local image
+  image="$(container_image backend)"
+  if [[ -n "$image" ]] && docker tag "$image" mentis-backend:latest; then
+    echo "==> trap: mentis-backend:latest = образ контейнера backend ($(image_has_revs backend "$image"))"
+  else
+    echo "!!! trap: образ backend не определён — mentis-backend:latest может указывать на цель"
+  fi
+}
+# Фактическое состояние Start: по работающему backend, а не по замыслу шагов.
+start_state() {
+  if [[ -z "$(running_image backend)" ]]; then
+    echo "    backend не работает — Start закрыт. Поднимать — повторный deploy.sh или осознанно:"
+    echo "    compose start backend (если его образ не знает флага, Start открыт, пока он работает)."
+  elif backend_fenced; then
+    if [[ "$(redis_cli GET "$FENCE_KEY" 2>/dev/null)" ]]; then
+      echo "    backend знает флаг, флаг $FENCE_KEY стоит — Start закрыт."
+    else
+      echo "!!! backend знает флаг, но флага $FENCE_KEY нет (или Redis не ответил) — Start может быть ОТКРЫТ."
+    fi
+  else
+    echo "!!! работает backend, который не знает флага (или его образ не доказан) — Start ОТКРЫТ."
+  fi
+}
+
 how_to_lift() {
   echo "    Образы сейчас:"
   running_images
   if (( BACKEND_QUIESCED )); then
     echo "    backend ${PREVIOUS:-?} остановлен на шаге (0) и оставлен остановленным: флага он не"
-    echo "    знает, поднятый — сразу принимает Start. Поднимать — повторный deploy.sh или"
-    echo "    осознанно: compose start backend (Start открыт, пока работает этот backend)."
+    echo "    знает, поднятый — сразу принимает Start."
   fi
-  echo "    Флаг $FENCE_KEY остаётся (Start закрыт). Снять — только после проверки, по runbook"
-  echo "    (docs/DEPLOY.md §6): повторный deploy.sh или redis-cli DEL $FENCE_KEY."
+  start_state
+  echo "    Флаг $FENCE_KEY снимать — только после проверки, по runbook (docs/DEPLOY.md §6):"
+  echo "    повторный deploy.sh или redis-cli DEL $FENCE_KEY."
 }
 
 on_exit() {
@@ -175,6 +264,7 @@ on_exit() {
   exec >>"$LOG" 2>&1
   if [[ $code -ne 0 ]]; then
     echo "!!! $(date -Is) сбой в фазе $PHASE (код $code)"
+    [[ -n "$PROBE" ]] && docker rm -f "$PROBE" >/dev/null 2>&1
     case "$PHASE" in
       stopped)
         echo "==> trap: поднимаю прежнего агента (контейнер и образ не тронуты)"
@@ -190,20 +280,16 @@ on_exit() {
         else
           echo "!!! trap: нет образа mentis-agent:$previous — агента не трогаю"
         fi
-        # :latest backend — образ, который реально работает: up мог пересоздать
-        # его, а мог не дойти до него. Иначе ручной `compose up` молча поднял бы
-        # другой backend.
-        local backend_image
-        backend_image="$(compose ps -aq backend | head -n 1 | xargs -r docker inspect -f '{{.Image}}' 2>/dev/null)"
-        if [[ -n "$backend_image" ]] && docker tag "$backend_image" mentis-backend:latest; then
-          echo "==> trap: mentis-backend:latest = образ работающего backend"
-        else
-          echo "!!! trap: образ backend не определён — mentis-backend:latest может указывать на цель"
-        fi
+        latest_backend_is_container
         echo "    Backend мог быть пересоздан и применить миграции: при «новый backend +"
         echo "    прежний агент» флаг снимается только повторным deploy.sh или решением человека."
+        stop_unfenced_backend
         how_to_lift ;;
-      quiesced|fenced|waiting)
+      waiting|opening)
+        latest_backend_is_container
+        stop_unfenced_backend
+        how_to_lift ;;
+      quiesced|fenced)
         how_to_lift ;;
       lifted)
         # Сбой после снятия флага (current/history, ротация): fail closed —
@@ -226,14 +312,12 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 fail() { echo "ОШИБКА: $*"; exit 1; }
-# contains <commit> <revision>: есть ли <commit> в истории <revision> (по клону
-# сервера). Ревизии нет в клоне или git не ответил — сбой, а не «нет»: от ответа
-# зависит, закрыт ли Start и проверено ли исполнение.
+# contains <commit> <revision>: since, где «не доказано» — сбой, а не «нет»: от
+# ответа зависит, закрыт ли Start и проверено ли исполнение.
 contains() {
-  git -C "$CLONE" cat-file -e "$2^{commit}" 2>/dev/null || fail "в клоне $CLONE нет ревизии $2"
   local rc=0
-  git -C "$CLONE" merge-base --is-ancestor "$1" "$2" 2>/dev/null || rc=$?
-  (( rc <= 1 )) || fail "git не ответил, есть ли ${1:0:7} в истории $2"
+  since "$1" "$2" || rc=$?
+  (( rc <= 1 )) || fail "не доказано, есть ли ${1:0:7} в истории $2 (нет ревизии в клоне $CLONE или git не ответил)"
   return "$rc"
 }
 
@@ -307,18 +391,58 @@ if [[ ! -s "$RELEASES/current" ]]; then
   echo "    T0 = $T0: образы помечены, закреплён в releases/pinned"
 fi
 
-# --- Что умеет работающая ревизия -----------------------------------------------
-# До снапшота и сборки: сбой ответа git ничего не оставляет.
+# --- Что умеют работающие backend/агент и цель ----------------------------------
+# До снапшота и сборки: сбой ответа git ничего не оставляет. releases/current —
+# только заявка: после сбоя попытки работать может другая ревизия (откат на T0
+# упал после up — current прежний, а backend уже T0). Решают образы работающих
+# контейнеров; возможность доказана, только когда её подтверждают и образ, и current.
 PREVIOUS="$(cat "$RELEASES/current" 2>/dev/null || true)"
 [[ "$PREVIOUS" =~ ^[0-9a-f]{7,40}$ ]] || fail "releases/current не ревизия: '$PREVIOUS'"
+current_fenced=0
+contains "$FENCE_SINCE" "$PREVIOUS" && current_fenced=1
+current_executor=0
+contains "$EXECUTOR_SINCE" "$PREVIOUS" && current_executor=1
+TARGET_FENCED=0
+contains "$FENCE_SINCE" "$REVISION" && TARGET_FENCED=1
+target_executor=0
+contains "$EXECUTOR_SINCE" "$REVISION" && target_executor=1
+
 LEGACY_BACKEND=0
-contains "$FENCE_SINCE" "$PREVIOUS" || LEGACY_BACKEND=1
-EXECUTION_BARRIER=0
-if contains "$EXECUTOR_SINCE" "$PREVIOUS" && ! contains "$EXECUTOR_SINCE" "$REVISION"; then
-  EXECUTION_BARRIER=1
+backend_image="$(running_image backend)"
+if [[ -n "$backend_image" ]]; then
+  backend_fence="$(image_has backend "$backend_image" "$FENCE_SINCE")"
+  if [[ "$backend_fence" != yes ]] || (( ! current_fenced )); then
+    LEGACY_BACKEND=1
+  fi
+  echo "==> Работает backend $(image_has_revs backend "$backend_image"): флаг — $backend_fence, по releases/current $PREVIOUS — $( (( current_fenced )) && echo yes || echo no)"
+  if (( LEGACY_BACKEND )); then
+    echo "    знание флага не доказано — backend будет остановлен до флага (шаг 0)"
+  fi
+else
+  echo "==> backend не работает — Start закрыт и без флага"
 fi
-echo "==> Работает $PREVIOUS: backend $( (( LEGACY_BACKEND )) && echo 'не знает флага — будет остановлен до него (шаг 0)' || echo 'знает флаг')"
-(( EXECUTION_BARRIER )) && echo "    цель $REVISION без исполнителя, у $PREVIOUS он есть — барьер исполнения (шаг 2a)"
+
+# Барьер исполнения: цель без исполнителя, а исполнитель мог работать — у
+# агента (по образу; образ не доказан — мог) или у releases/current.
+EXECUTION_BARRIER=0
+BARRIER_IMAGE=""
+if (( ! target_executor )); then
+  agent_image="$(container_image agent)"
+  agent_executor=no
+  [[ -n "$agent_image" ]] && agent_executor="$(image_has agent "$agent_image" "$EXECUTOR_SINCE")"
+  if [[ "$agent_executor" != no ]]; then
+    EXECUTION_BARRIER=1
+    BARRIER_IMAGE="$agent_image"
+  elif (( current_executor )); then
+    EXECUTION_BARRIER=1
+    BARRIER_IMAGE="$(image_id "mentis-agent:$PREVIOUS")"
+    [[ -n "$BARRIER_IMAGE" ]] || fail "барьеру исполнения нужен образ mentis-agent:$PREVIOUS — его нет"
+  fi
+  if (( EXECUTION_BARRIER )); then
+    echo "    цель $REVISION без исполнителя, а исполнитель мог работать (агент: $agent_executor, $PREVIOUS: $( (( current_executor )) && echo yes || echo no)) — барьер исполнения (шаг 2a)"
+  fi
+fi
+(( TARGET_FENCED )) || echo "    backend цели $REVISION не знает флага: до запуска его проверяет изолированный экземпляр, запуск — последний шаг"
 
 # --- Снапшот БД и его ротация ------------------------------------------------
 if [[ "${DEPLOY_NO_BACKUP:-0}" != 1 ]]; then
@@ -401,11 +525,11 @@ if (( LEGACY_BACKEND )); then
   # Флаг такой backend не читает: Start закрывает только его остановка. docker
   # stop ждёт запросов в работе — Start, проверенный раньше, записывается до
   # конца остановки или не записывается вовсе (запись — один Lua-скрипт).
-  echo "==> (0) остановка backend $PREVIOUS: он не знает флага"
+  echo "==> (0) остановка backend: знание флага не доказано"
   PHASE=quiesced
   BACKEND_QUIESCED=1
   compose stop backend
-  [[ -z "$(compose ps -q backend)" ]] || fail "backend $PREVIOUS не остановился — Start не закрыт"
+  [[ -z "$(compose ps -q backend)" ]] || fail "backend не остановился — Start не закрыт"
 fi
 echo "==> (1) флаг $FENCE_KEY"
 reply="$(redis_cli SET "$FENCE_KEY" "deploy $REVISION $ATTEMPT $(date -Is)")" \
@@ -417,10 +541,18 @@ PHASE=stopped
 compose stop agent
 if (( EXECUTION_BARRIER )); then
   # Агент остановлен: исполнение больше ничего не пишет, ответ окончательный.
-  # Спрашивает агент работающей ревизии — :latest ещё его образ (шаг 4 впереди).
+  # Спрашивает образ с исполнителем (агента или releases/current) — на время
+  # вопроса он :latest, потом :latest прежний (шаг 4 впереди).
   echo "==> (2a) барьер исполнения: незавершённая работа во всех контекстах"
-  compose run --rm --no-deps -T --entrypoint python agent -m agent.execution.barrier \
-    || fail "откат на $REVISION запрещён: исполнение $PREVIOUS не завершено или не проверено (docs/DEPLOY.md §6)"
+  latest_agent="$(image_id mentis-agent:latest)"
+  [[ "$BARRIER_IMAGE" == "$latest_agent" ]] || docker tag "$BARRIER_IMAGE" mentis-agent:latest
+  barrier=0
+  compose run --rm --no-deps -T --entrypoint python agent -m agent.execution.barrier || barrier=$?
+  if [[ "$BARRIER_IMAGE" != "$latest_agent" && -n "$latest_agent" ]]; then
+    docker tag "$latest_agent" mentis-agent:latest
+  fi
+  (( barrier == 0 )) \
+    || fail "откат на $REVISION запрещён: исполнение не завершено или не проверено (docs/DEPLOY.md §6)"
 fi
 echo "==> (3) удаление $CATALOG_KEY"
 redis_cli DEL "$CATALOG_KEY" >/dev/null
@@ -429,7 +561,16 @@ PHASE=up
 for svc in "${SERVICES[@]}"; do
   docker tag "mentis-$svc:$REVISION" "mentis-$svc:latest"
 done
-compose up -d --remove-orphans
+if (( TARGET_FENCED )); then
+  compose up -d --remove-orphans
+else
+  # Backend цели флага не знает: поднятый, он сразу принимает Start. Он
+  # поднимается последним, после приёмки (6); работающий backend знает флаг.
+  services="$(compose config --services)" || fail "compose config цели не ответил"
+  mapfile -t others < <(grep -vx backend <<<"$services")
+  printf '%s\n' "${others[@]}" | grep -qx agent || fail "в compose цели нет сервиса agent"
+  compose up -d --no-deps --remove-orphans "${others[@]}"
+fi
 PHASE=waiting
 echo "==> (5) ожидание каталога агента цели (до ${CATALOG_WAIT_S} с)"
 # Предел — время, а не число попыток: каждый вызов сам ограничен (R129).
@@ -445,26 +586,55 @@ done
 catalog_ok "$published" || fail "агент цели не опубликовал $CATALOG_KEY за ${CATALOG_WAIT_S} с"
 echo "    schema_hash: $(catalog_hash "$published")"
 
-# Healthcheck — до снятия флага: неработающий backend оставляет Start закрытым (R130).
-echo "==> Healthcheck backend (до ${HEALTH_WAIT_S} с)"
 bind="$(grep -E '^WEB_BIND=' "$APP_DIR/.env.prod" 2>/dev/null | cut -d= -f2 || true)"
 port="$(grep -E '^WEB_PORT=' "$APP_DIR/.env.prod" 2>/dev/null | cut -d= -f2 || true)"
 url="http://${bind:-127.0.0.1}:${port:-8010}/api/v1/utils/health-check/"
-healthy=0
-deadline=$((SECONDS + HEALTH_WAIT_S))
-while :; do
-  curl -fsS --max-time "$CALL_TIMEOUT_S" "$url" >/dev/null 2>&1 && { healthy=1; break; }
-  ((SECONDS < deadline)) || break
-  sleep "$PAUSE_S"
-done
-(( healthy )) || { compose logs --tail 50 backend || true; fail "backend не прошёл healthcheck $url"; }
-# Healthcheck отвечает всегда; принимает ли backend цели этот каталог, решает его компилятор.
-echo "==> Каталог проверяет backend цели"
-backend_accepts "$published" || fail "backend цели не принимает опубликованный каталог"
+# wait_healthy <команда...>: healthcheck до HEALTH_WAIT_S, каждый вызов ограничен.
+wait_healthy() {
+  local deadline=$((SECONDS + HEALTH_WAIT_S))
+  while :; do
+    "$@" >/dev/null 2>&1 && return 0
+    ((SECONDS < deadline)) || return 1
+    sleep "$PAUSE_S"
+  done
+}
+if (( TARGET_FENCED )); then
+  # Healthcheck — до снятия флага: неработающий backend оставляет Start закрытым (R130).
+  echo "==> Healthcheck backend (до ${HEALTH_WAIT_S} с)"
+  wait_healthy curl -fsS --max-time "$CALL_TIMEOUT_S" "$url" \
+    || { compose logs --tail 50 backend || true; fail "backend не прошёл healthcheck $url"; }
+  # Healthcheck отвечает всегда; принимает ли backend цели этот каталог, решает его компилятор.
+  echo "==> Каталог проверяет backend цели"
+  backend_accepts "$published" || fail "backend цели не принимает опубликованный каталог"
 
-echo "==> (6) снятие флага"
-redis_cli DEL "$FENCE_KEY" >/dev/null
-PHASE=lifted
+  echo "==> (6) снятие флага"
+  redis_cli DEL "$FENCE_KEY" >/dev/null
+  PHASE=lifted
+else
+  # Приёмка — на изолированном экземпляре backend цели: та же БД и миграции, но
+  # без опубликованных портов и сетевого имени backend, Start до него не дойдёт.
+  PROBE="mentis-deploy-probe-$ATTEMPT"
+  echo "==> Приёмка backend цели в изолированном экземпляре $PROBE (до ${HEALTH_WAIT_S} с)"
+  compose run -d --no-deps --name "$PROBE" backend >/dev/null
+  wait_healthy docker exec "$PROBE" curl -fsS --max-time "$CALL_TIMEOUT_S" \
+      http://localhost:8000/api/v1/utils/health-check/ \
+    || { docker logs --tail 50 "$PROBE" || true; fail "backend цели не прошёл healthcheck в $PROBE"; }
+  echo "==> Каталог проверяет backend цели"
+  (timeout "$CALL_TIMEOUT_S" docker exec -i "$PROBE" python -c "$CATALOG_ACCEPT" <<<"$published") \
+    || fail "backend цели не принимает опубликованный каталог"
+  docker rm -f "$PROBE" >/dev/null
+  PROBE=""
+
+  # Запуск backend, не знающего флага, — это и есть снятие барьера: с него Start
+  # открыт. Сбой дальше — trap останавливает его.
+  echo "==> (6) запуск backend цели (он не знает флага: с этого момента Start открыт)"
+  PHASE=opening
+  compose up -d --no-deps backend
+  wait_healthy curl -fsS --max-time "$CALL_TIMEOUT_S" "$url" \
+    || { compose logs --tail 50 backend || true; fail "backend не прошёл healthcheck $url"; }
+  redis_cli DEL "$FENCE_KEY" >/dev/null
+  PHASE=lifted
+fi
 
 echo "$REVISION" >"$RELEASES/current"
 echo "$(date -Is) $REVISION" >>"$RELEASES/history"

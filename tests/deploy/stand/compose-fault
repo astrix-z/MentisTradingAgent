@@ -13,6 +13,8 @@
 #   flag-hold        the flag is set, then the fence waits while ~/faults/hold
 #                    exists (marks ~/faults/hold.waiting): "Start right after
 #                    the flag". Keep it under DEPLOY_CALL_TIMEOUT_S (10 s).
+#   backend-up       `up` of the backend alone runs, then reports a failure:
+#                    a backend that ignores the flag is started (869fgdkgu)
 set -u
 fault="$(cat "$HOME/faults/active" 2>/dev/null || true)"
 args=" $* "
@@ -45,6 +47,10 @@ case "$fault" in
       touch "$HOME/faults/hold.waiting"
       while [[ -e "$HOME/faults/hold" ]]; do sleep 0.2; done
       exit 0
+    fi ;;
+  backend-up)
+    if [[ "$args" == *" up "* && "$args" == *" --no-deps backend " ]]; then
+      docker compose "$@"; fired; exit 1
     fi ;;
 esac
 exec docker compose "$@"

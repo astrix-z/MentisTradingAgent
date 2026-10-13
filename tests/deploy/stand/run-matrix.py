@@ -1880,6 +1880,15 @@ REVIEW_COVERAGE: list[tuple[str, list[str]]] = [
         ),
         ["R2", "R3"],
     ),
+    (
+        (
+            "869fgdkgu: откат на T0 падает после up (до и после запуска backend T0) — "
+            "Start закрыт, диагностика верна; повтор при работающем backend T0 и "
+            "current = кандидат останавливает его до флага; оба Start и удержанный "
+            "Start не меняют поток и desired; current/history верны"
+        ),
+        ["R4a", "R4b", "R4c"],
+    ),
 ]
 
 
@@ -1920,17 +1929,38 @@ def remote_flag(stand: Stand, path: str, timeout: float) -> bool:
     return False
 
 
-def first_deploy_from_t0(stand: Stand, journal: Journal, candidate: str) -> None:
-    """869fgbyar: T0's backend ignores the flag; the fence must stop it first."""
-    hooks = "-f compose.yml -f compose.prod.yml -f ~/stand-hooks/stand-hooks.yml"
-    stand.sh(f"cd {APP} && docker compose --env-file .env.prod {hooks} up -d backend")
-    wait_health(stand)
-    start = {
-        "network": "testnet",
-        "strategy": "tripple_screen",
-        "symbols": ["BTCUSDT"],
-        "params": default_params(),
+HOOKS = "-f compose.yml -f compose.prod.yml -f ~/stand-hooks/stand-hooks.yml"
+START = {
+    "network": "testnet",
+    "strategy": "tripple_screen",
+    "symbols": ["BTCUSDT"],
+}
+
+
+def start_body() -> dict[str, Any]:
+    return {**START, "params": default_params()}
+
+
+def both_starts() -> dict[str, str]:
+    return {
+        "start": try_api("POST", "/trading/start/", start_body()),
+        "commands": try_api(
+            "POST", "/trading/commands/", {"type": "start", "payload": start_body()}
+        ),
     }
+
+
+def legacy_backend_with_hooks(stand: Stand) -> None:
+    """The backend :latest names (T0's) runs with the stand's Start hook."""
+    stand.sh(f"cd {APP} && docker compose --env-file .env.prod {HOOKS} up -d backend")
+    wait_health(stand)
+
+
+def held_start_through_fence(
+    stand: Stand, *args: str
+) -> tuple[Deploy, dict[str, bool], list[str]]:
+    """A deploy past a T0 backend: a Start held before its write, both Start
+    routes right after the flag; neither may reach the stream or desired."""
     stand.sh(
         "mkdir -p ~/faults && rm -f ~/stand-state/start-held ~/faults/hold.waiting"
         " && touch ~/stand-state/pause-start ~/faults/hold"
@@ -1939,20 +1969,17 @@ def first_deploy_from_t0(stand: Stand, journal: Journal, candidate: str) -> None
     desired_before = desired(stand)
     answer: dict[str, str] = {}
     request = threading.Thread(
-        target=lambda: answer.update(held=try_api("POST", "/trading/start/", start)),
+        target=lambda: answer.update(
+            held=try_api("POST", "/trading/start/", start_body())
+        ),
         daemon=True,
     )
     request.start()
     held = remote_flag(stand, "~/stand-state/start-held", 30)
     stand.fault("flag-hold")
-    background = Background(stand, "--revision", candidate, "--t0-revision", T0)
+    background = Background(stand, *args)
     at_flag = remote_flag(stand, "~/faults/hold.waiting", 1500)
-    after_flag = {
-        "start": try_api("POST", "/trading/start/", start),
-        "commands": try_api(
-            "POST", "/trading/commands/", {"type": "start", "payload": start}
-        ),
-    }
+    after_flag = both_starts()
     backend_at_flag = stand.container("backend")
     stand.sh("rm -f ~/faults/hold ~/stand-state/pause-start")
     result = background.result()
@@ -1962,6 +1989,40 @@ def first_deploy_from_t0(stand: Stand, journal: Journal, candidate: str) -> None
     desired_after = desired(stand)
     out = result.out
     quiesce, flag = out.find("(0) остановка backend"), out.find("(1) флаг")
+    checks = {
+        "Start удержан перед записью (хук стенда)": held,
+        "фенс дошёл до флага": at_flag,
+        "шаг (0) раньше флага": 0 <= quiesce < flag,
+        "backend T0 остановлен при флаге": backend_at_flag.endswith("exited"),
+        "/trading/start/ после флага не принят": not after_flag["start"].startswith(
+            "2"
+        ),
+        "/trading/commands/ после флага не принят": not after_flag[
+            "commands"
+        ].startswith("2"),
+        "поток команд не вырос": stream_before == stream_after,
+        "desired не изменился": desired_before == desired_after,
+    }
+    notes = [
+        (
+            f"удержанный Start: {answer.get('held', 'нет ответа')}; после флага: "
+            f"/trading/start/ {after_flag['start']}, /trading/commands/ "
+            f"{after_flag['commands']}; backend при флаге: {backend_at_flag}"
+        ),
+        (
+            f"XLEN agent:commands:stream {stream_before} → {stream_after}; desired "
+            f"(running, revision) {desired_before} → {desired_after}"
+        ),
+    ]
+    return result, checks, notes
+
+
+def first_deploy_from_t0(stand: Stand, journal: Journal, candidate: str) -> None:
+    """869fgbyar: T0's backend ignores the flag; the fence must stop it first."""
+    legacy_backend_with_hooks(stand)
+    result, checks, notes = held_start_through_fence(
+        stand, "--revision", candidate, "--t0-revision", T0
+    )
     journal.add(
         "R1",
         "Первая выкладка с T0 `567f4f8`: Start удержан перед записью в backend T0, "
@@ -1972,27 +2033,132 @@ def first_deploy_from_t0(stand: Stand, journal: Journal, candidate: str) -> None
         result,
         stand.state(),
         {
-            "Start удержан перед записью (хук стенда)": held,
-            "фенс дошёл до флага": at_flag,
-            "шаг (0) раньше флага": 0 <= quiesce < flag,
-            "backend T0 остановлен при флаге": backend_at_flag.endswith("exited"),
-            "/trading/start/ после флага не принят": not after_flag["start"].startswith(
-                "2"
-            ),
-            "/trading/commands/ после флага не принят": not after_flag[
-                "commands"
-            ].startswith("2"),
-            "поток команд не вырос": stream_before == stream_after,
-            "desired не изменился": desired_before == desired_after,
+            **checks,
             "код 0": result.code == 0,
             "current = кандидат": stand.current() == candidate,
             "флаг снят": stand.fence() == "—",
         },
-        f"удержанный Start: {answer.get('held', 'нет ответа')}; после флага: "
-        f"/trading/start/ {after_flag['start']}, /trading/commands/ "
-        f"{after_flag['commands']}; backend при флаге: {backend_at_flag}",
-        f"XLEN agent:commands:stream {stream_before} → {stream_after}; desired "
-        f"(running, revision) {desired_before} → {desired_after}",
+        *notes,
+    )
+
+
+def history(stand: Stand) -> list[str]:
+    lines = stand.sh(f"cat {RELEASES}/history", check=False).splitlines()
+    return [line.split()[1] for line in lines if len(line.split()) > 1]
+
+
+def failed_rollback_then_retry(stand: Stand, journal: Journal, candidate: str) -> None:
+    """869fgdkgu: a rollback to T0 fails after up; the retry must stop the T0
+    backend that really runs, though releases/current names the candidate."""
+    stand.fault(None)
+    probes = "docker ps -aq --filter name=mentis-deploy-probe | wc -l"
+
+    # R4a: the runbook's downgrade skipped — T0's backend cannot start.
+    stream_before = stand.compose("exec -T redis redis-cli XLEN agent:commands:stream")
+    desired_before = desired(stand)
+    result = deploy(stand, "--revision", T0)
+    starts = both_starts()
+    journal.add(
+        "R4a",
+        "Откат кандидат → T0 без downgrade из runbook: backend T0 не проходит приёмку",
+        "сбой до запуска backend T0 (изолированный экземпляр без портов); backend "
+        "кандидата под флагом; Start закрыт; current — кандидат",
+        T0,
+        result,
+        stand.state(),
+        {
+            "код 1": result.code == 1,
+            "сбой в фазе waiting": has(result, "сбой в фазе waiting"),
+            "приёмка в изолированном экземпляре": has(
+                result, "изолированном экземпляре"
+            ),
+            "backend T0 не запускался": not has(result, "(6) запуск backend цели"),
+            "backend кандидата работает": stand.container("backend").startswith(
+                candidate
+            )
+            and stand.container("backend").endswith("running"),
+            "диагностика: Start закрыт": has(result, "Start закрыт"),
+            "/trading/start/ не принят": not starts["start"].startswith("2"),
+            "/trading/commands/ не принят": not starts["commands"].startswith("2"),
+            "поток команд не вырос": stand.compose(
+                "exec -T redis redis-cli XLEN agent:commands:stream"
+            )
+            == stream_before,
+            "desired не изменился": desired(stand) == desired_before,
+            "экземпляр приёмки удалён": stand.sh(probes) == "0",
+            "флаг стоит": stand.fence() != "—",
+            "current = кандидат": stand.current() == candidate,
+        },
+        f"Start после сбоя: /trading/start/ {starts['start']}, /trading/commands/ "
+        f"{starts['commands']}",
+    )
+
+    # R4b: by the runbook, and `up` of T0's backend reports a failure after it
+    # started — the backend that ignores the flag runs.
+    stand.compose("stop backend")
+    stand.compose("run --rm backend alembic downgrade b3f7a1c9d2e4")
+    stand.compose("stop agent")
+    stand.compose("exec -T redis redis-cli DEL agent:strategies")
+    stand.fault("backend-up")
+    result = deploy(stand, "--revision", T0)
+    starts = both_starts()
+    journal.add(
+        "R4b",
+        "Откат по runbook, `up` backend T0 сообщает сбой после запуска",
+        "приёмка пройдена до запуска; сбой в фазе opening; trap останавливает backend "
+        "T0; Start закрыт; current и history — кандидат",
+        T0,
+        result,
+        stand.state(),
+        {
+            "код 1": result.code == 1,
+            "приёмка до запуска": 0
+            <= result.out.find("Каталог проверяет backend цели")
+            < result.out.find("(6) запуск backend цели"),
+            "сбой в фазе opening": has(result, "сбой в фазе opening"),
+            "trap остановил backend T0": has(
+                result, "работающий backend не знает флага"
+            )
+            and stand.container("backend").startswith(T0)
+            and stand.container("backend").endswith("exited"),
+            "диагностика: Start закрыт": has(
+                result, "backend не работает — Start закрыт"
+            ),
+            "/trading/start/ не принят": not starts["start"].startswith("2"),
+            "/trading/commands/ не принят": not starts["commands"].startswith("2"),
+            "флаг стоит": stand.fence() != "—",
+            "current = кандидат": stand.current() == candidate,
+            "T0 не в history": history(stand)[-1] == candidate,
+        },
+        f"Start после сбоя: /trading/start/ {starts['start']}, /trading/commands/ "
+        f"{starts['commands']}",
+    )
+
+    # R4c: the state the review reached — T0's backend runs (here started by
+    # hand, with the Start hook), current names the candidate. The retry.
+    legacy_backend_with_hooks(stand)
+    running = stand.container("backend")
+    result, checks, notes = held_start_through_fence(stand, "--revision", candidate)
+    journal.add(
+        "R4c",
+        "Повторная выкладка кандидата, когда работает backend T0, а current — кандидат",
+        "backend остановлен до флага по его образу, а не по current; удержанный Start "
+        "и Start после флага не записаны; выкладка проходит",
+        candidate,
+        result,
+        stand.state(),
+        {
+            "до повтора работает backend T0": running.startswith(T0)
+            and running.endswith("running"),
+            "решение по образу": has(result, f"Работает backend {T0}: флаг — no"),
+            **checks,
+            "код 0": result.code == 0,
+            "current = кандидат": stand.current() == candidate,
+            "history: кандидат, T0 не добавлен": history(stand)[-1] == candidate
+            and history(stand).count(T0) == 1,
+            "флаг снят": stand.fence() == "—",
+        },
+        *notes,
     )
 
 
@@ -2097,6 +2263,7 @@ def release_review(stand: Stand, journal: Journal, candidate: str) -> None:
     stand.publish({"production": "HEAD"})
     setup_production_copy(stand)
     first_deploy_from_t0(stand, journal, candidate)
+    failed_rollback_then_retry(stand, journal, candidate)
     rollback_to_t0_with_execution(stand, journal, candidate)
 
 
