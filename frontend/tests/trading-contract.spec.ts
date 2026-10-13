@@ -133,6 +133,8 @@ test("strategy seeds desired config, preserves dirty draft and reports rejected 
     symbols: ["ETHUSDT"],
     params: { tp_pct: "19", swing_low_wave_n: 7, trail_ripple_n: 9 },
   })
+  // Real trading is not part of a Start (ClickUp 869fgqxah).
+  expect(api.posts[0].body).not.toHaveProperty("execution")
   // Only schema fields are sent: the backend rejects anything else.
   const sent = (api.posts[0].body as { params: Record<string, unknown> }).params
   for (const key of ["future_param", "swing_low_h1_n", "trail_m15_n"])
@@ -691,6 +693,10 @@ test("live Start requires explicit confirmation; cancel sends nothing", async ({
   await page.getByRole("button", { name: "Start", exact: true }).click()
   await expect(
     page.getByRole("heading", { name: "Confirm live Start" }),
+  ).toBeVisible()
+  // The dialog says whether real orders follow; the Start does not decide it.
+  await expect(
+    page.getByText(/Real trading: OFF — signals only, no orders/),
   ).toBeVisible()
   await page.getByRole("button", { name: "Cancel", exact: true }).click()
   await expect(
@@ -1756,4 +1762,111 @@ test("without a catalog an interval list still normalizes and refuses duplicates
   await quote.getByLabel("Add to quote_asset").fill(" H1 ")
   await quote.getByRole("button", { name: "Add", exact: true }).click()
   await expect(quote.locator('[data-option="H1"]')).toBeVisible()
+})
+
+// --- ClickUp 869fgqxah: real trading apart from the network and Start ---
+
+test("real trading is its own switch: on asks to confirm the network, off does not", async ({
+  page,
+}) => {
+  const status = snapshot()
+  const api = await mock(page, status)
+  await page.goto("/strategy")
+  const card = page.getByRole("region", { name: "Real trading" })
+  const toggle = card.getByRole("switch")
+  await expect(toggle).not.toBeChecked()
+  await expect(card.getByText("Real trading OFF")).toBeVisible()
+
+  // On: a confirmation naming the network the strategy runs on.
+  await toggle.click()
+  await expect(
+    page.getByRole("heading", { name: "Turn real trading on" }),
+  ).toBeVisible()
+  await expect(page.getByText(/with real money/)).toBeVisible()
+  await expect(page.getByText("Max symbols: 3")).toBeVisible()
+  await page.getByRole("button", { name: "Cancel", exact: true }).click()
+  expect(api.posts).toEqual([])
+
+  await toggle.click()
+  await page
+    .getByRole("button", { name: "Turn on on LIVE", exact: true })
+    .click()
+  await expect(card.getByText(accepted("execution_configure"))).toBeVisible()
+  expect(api.posts).toHaveLength(1)
+  expect(api.posts[0].path).toBe("/api/v1/trading/execution/")
+  const settings = (api.posts[0].body as { settings: Record<string, unknown> })
+    .settings
+  expect(settings).toMatchObject({
+    enabled: true,
+    max_symbols: 3,
+    max_slippage_pct: "0.3",
+  })
+  // Nothing about the strategy: no network, no Start.
+  expect(api.posts[0].body).not.toHaveProperty("network")
+
+  // The agent applied it; pause and resume become available.
+  status.execution = { settings, revision: 1, updated_at: at }
+  status.actual = {
+    ...status.actual!,
+    execution: { mode: "enabled", leader: true, open_positions: 0, alerts: {} },
+  }
+  await page.reload()
+  await expect(toggle).toBeChecked()
+  await expect(
+    card.getByText(/Agent: on — placing orders · network LIVE/),
+  ).toBeVisible()
+  await expect(
+    card.getByRole("button", { name: "Resume entries" }),
+  ).toBeDisabled()
+
+  // Off: no confirmation, the stored limits are kept.
+  await toggle.click()
+  await expect(
+    page.getByRole("heading", { name: "Turn real trading on" }),
+  ).toHaveCount(0)
+  expect(api.posts).toHaveLength(2)
+  expect(api.posts[1].body).toEqual({
+    settings: { ...settings, enabled: false },
+  })
+})
+
+test("real-trading limits are checked before they are saved", async ({
+  page,
+}) => {
+  const status = snapshot()
+  status.execution = {
+    settings: { enabled: true, max_symbols: 3 },
+    revision: 4,
+    updated_at: at,
+  }
+  const api = await mock(page, status)
+  await page.goto("/strategy")
+  const card = page.getByRole("region", { name: "Real trading" })
+  await card.getByText("Limits", { exact: true }).click()
+  await expect(card.getByLabel("Max symbols")).toHaveValue("3")
+  await expect(card.getByRole("button", { name: "Save limits" })).toBeDisabled()
+  await card.getByLabel("Max symbols").fill("0")
+  await card.getByRole("button", { name: "Save limits" }).click()
+  await expect(card.getByText(/Max symbols/).nth(1)).toBeVisible()
+  expect(api.posts).toEqual([])
+  await card.getByLabel("Max symbols").fill("2")
+  await card.getByRole("button", { name: "Save limits" }).click()
+  await expect(card.getByText(accepted("execution_configure"))).toBeVisible()
+  // The switch stays as it is: saving limits is not turning trading on or off.
+  expect(api.posts[0].body).toMatchObject({
+    settings: { enabled: true, max_symbols: 2 },
+  })
+})
+
+test("without a published execution section real trading cannot be switched", async ({
+  page,
+}) => {
+  const published = catalog()
+  delete (published as { execution?: unknown }).execution
+  await mock(page, snapshot(), published)
+  await page.goto("/strategy")
+  await expect(
+    page.getByText(/has not published its real-trading settings/),
+  ).toBeVisible()
+  await expect(page.getByRole("switch")).toHaveCount(0)
 })

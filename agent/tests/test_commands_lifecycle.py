@@ -99,6 +99,8 @@ def test_saved_running_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
                 "strategy": "test",
                 "symbols": ["btcusdt"],
                 "params": {"window": 10},
+                # An old snapshot's execution: never resumed (ClickUp 869fgqxah).
+                "execution": {"enabled": True},
             }
         )
         monkeypatch.setitem(STRATEGIES, "test", Mock())
@@ -109,7 +111,6 @@ def test_saved_running_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
             strategy="test",
             symbols=["BTCUSDT"],
             params={"window": 10},
-            execution=None,
         )
 
     asyncio.run(scenario())

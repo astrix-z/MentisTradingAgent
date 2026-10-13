@@ -30,6 +30,7 @@ from test_strategy_runtime import (  # noqa: F401
 from agent.core.migrate import migrate
 from agent.execution.models import Position, SymbolCooldown
 from agent.execution.runtime import ExecutionContext, ExecutionRuntime
+from agent.execution.settings import ExecutionSettings
 from agent.models import SignalWatch
 from agent.strategies.base import PositionEvent, PositionsSnapshot, Signal
 from agent.strategies.tripple_screen.strategy import TripleScreenStrategy
@@ -440,8 +441,9 @@ def test_with_real_execution_virtual_positions_are_not_reported(
         runtime.heartbeat = lambda: {}
         runtime.message = lambda: None
         runtime.context = None
+        runtime.settings = ExecutionSettings(enabled=True)
         engine.execution = runtime
-        await start(engine, execution={"enabled": True})
+        await start(engine)
         tracker.snapshot.assert_not_awaited()
         entry = Signal(
             type="ENTRY",

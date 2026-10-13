@@ -384,6 +384,7 @@ def test_status_keeps_desired_and_actual_separate(
     assert response.status_code == 200
     assert response.json() == {
         "desired": desired.model_dump(mode="json"),
+        "execution": {"settings": {}, "updated_at": None, "revision": 0},
         "actual": actual.model_dump(mode="json"),
         "online": online,
     }
@@ -729,13 +730,13 @@ def test_execution_settings_are_strict_too(
 ) -> None:
     """R69: the compiler is shared, so execution gets the same wire types."""
     response = client.post(
-        "/api/v1/trading/start/",
-        json={**START, "execution": execution},
+        "/api/v1/trading/execution/",
+        json={"settings": execution},
         headers=headers(client),
     )
     assert response.status_code == 422
     assert [(e["loc"], e["type"]) for e in response.json()["detail"]] == [
-        (["body", "execution", field], kind)
+        (["body", "settings", field], kind)
     ]
     assert not redis.publications
 
@@ -901,6 +902,7 @@ def test_strategies_endpoint_reports_a_missing_agent_without_erroring(
         "published_at": None,
         "lookups": {},
         "strategies": [],
+        "execution": None,
     }
 
 
@@ -1359,21 +1361,86 @@ def test_indicator_snapshot_carries_a_failed_activation() -> None:
     assert screening.error == "ValueError: No WebSocket connections available."
 
 
-def test_start_carries_validated_execution_settings(
+def test_a_start_no_longer_carries_real_trading(
     client: TestClient, redis: MemoryRedis
 ) -> None:
-    response = client.post(
+    """ClickUp 869fgqxah: the switch is POST /execution/, never a Start."""
+    refused = client.post(
         "/api/v1/trading/start/",
-        json={**START, "execution": {"enabled": True, "max_slippage_pct": "0.5"}},
+        json={**START, "execution": {"enabled": True}},
+        headers=headers(client),
+    )
+    assert refused.status_code == 422
+    assert "POST /api/v1/trading/execution/" in refused.text
+    assert not redis.publications
+    # An old snapshot's execution is dropped by the next Start.
+    redis.values[trading.REDIS_RUNTIME_KEY] = json.dumps(
+        {
+            "running": False,
+            "execution": {"enabled": True},
+            "updated_at": NOW.isoformat(),
+        }
+    )
+    accepted = client.post(
+        "/api/v1/trading/start/",
+        json={**START, "execution": {}},
+        headers=headers(client),
+    )
+    assert accepted.status_code == 202
+    assert "execution" not in accepted.json()["payload"]
+    snapshot = json.loads(redis.values[trading.REDIS_RUNTIME_KEY])
+    assert snapshot["execution"] == {}
+    assert trading.REDIS_EXECUTION_KEY not in redis.values
+
+
+def test_real_trading_is_set_apart_from_the_running_intent(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    start = client.post("/api/v1/trading/start/", json=START, headers=headers(client))
+    assert start.status_code == 202
+    runtime = redis.values[trading.REDIS_RUNTIME_KEY]
+    redis.values[trading.REDIS_START_FENCE_KEY] = "deploy"  # not a Start: allowed
+    response = client.post(
+        "/api/v1/trading/execution/",
+        json={"settings": {"enabled": True, "max_slippage_pct": "0.5"}},
         headers=headers(client),
     )
     assert response.status_code == 202
-    assert response.json()["payload"]["execution"] == {
-        "enabled": True,
-        "max_slippage_pct": "0.5",
+    command = redis.publications[-1][1]
+    assert command["type"] == "execution_configure"
+    assert command["payload"] == {
+        "settings": {"enabled": True, "max_slippage_pct": "0.5"}
     }
-    snapshot = json.loads(redis.values[trading.REDIS_RUNTIME_KEY])
-    assert snapshot["execution"] == {"enabled": True, "max_slippage_pct": "0.5"}
+    assert redis.values[trading.REDIS_RUNTIME_KEY] == runtime  # intent untouched
+    stored = json.loads(redis.values[trading.REDIS_EXECUTION_KEY])
+    assert stored["settings"] == {"enabled": True, "max_slippage_pct": "0.5"}
+    assert stored["revision"] == 1
+    assert redis.hashes[f"agent:command:{command['id']}"]["status"] == "accepted"
+
+    off = client.post(
+        "/api/v1/trading/commands/",
+        json={"type": "execution_configure", "payload": {"settings": {}}},
+        headers=headers(client),
+    )
+    assert off.status_code == 202
+    stored = json.loads(redis.values[trading.REDIS_EXECUTION_KEY])
+    assert (stored["settings"], stored["revision"]) == ({}, 2)
+
+    read = client.get("/api/v1/trading/execution/", headers=headers(client))
+    assert read.json()["revision"] == 2 and read.json()["settings"] == {}
+    status = client.get("/api/v1/trading/status/", headers=headers(client))
+    assert status.json()["execution"]["revision"] == 2
+    assert status.json()["desired"]["running"] is True
+
+
+def test_without_a_stored_switch_real_trading_reads_off(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    assert trading.REDIS_EXECUTION_KEY not in redis.values
+    read = client.get("/api/v1/trading/execution/", headers=headers(client))
+    assert read.json() == {"settings": {}, "updated_at": None, "revision": 0}
+    status = client.get("/api/v1/trading/status/", headers=headers(client))
+    assert status.json()["execution"]["settings"] == {}
 
 
 @pytest.mark.parametrize(
@@ -1387,16 +1454,21 @@ def test_start_carries_validated_execution_settings(
 def test_invalid_execution_settings_are_rejected_before_redis(
     client: TestClient, redis: MemoryRedis, execution: dict[str, Any]
 ) -> None:
-    response = client.post(
-        "/api/v1/trading/start/",
-        json={**START, "execution": execution},
-        headers=headers(client),
-    )
-    assert response.status_code == 422
-    assert all(
-        error["loc"][:2] == ["body", "execution"] for error in response.json()["detail"]
-    )
+    for path, body in (
+        ("/api/v1/trading/execution/", {"settings": execution}),
+        (
+            "/api/v1/trading/commands/",
+            {"type": "execution_configure", "payload": {"settings": execution}},
+        ),
+    ):
+        response = client.post(path, json=body, headers=headers(client))
+        assert response.status_code == 422
+        assert all(
+            error["loc"][:2] == ["body", "settings"]
+            for error in response.json()["detail"]
+        )
     assert not redis.publications
+    assert trading.REDIS_EXECUTION_KEY not in redis.values
 
 
 def test_execution_settings_need_a_published_execution_section(
@@ -1406,13 +1478,22 @@ def test_execution_settings_need_a_published_execution_section(
     del catalog["execution"]
     redis.values[REDIS_STRATEGIES_KEY] = json.dumps(catalog)
     refused = client.post(
-        "/api/v1/trading/start/",
-        json={**START, "execution": {"enabled": True}},
+        "/api/v1/trading/execution/",
+        json={"settings": {"enabled": True}},
         headers=headers(client),
     )
     assert refused.status_code == 503
     plain = client.post("/api/v1/trading/start/", json=START, headers=headers(client))
     assert plain.status_code == 202
+
+
+def test_the_catalog_serves_the_execution_section(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    assert REDIS_STRATEGIES_KEY in redis.values
+    catalog = client.get("/api/v1/trading/strategies/", headers=headers(client)).json()
+    assert catalog["execution"]["name"] == "execution"
+    assert "enabled" in catalog["execution"]["settings_schema"]["properties"]
 
 
 @pytest.mark.parametrize("command", ["execution_pause", "execution_resume"])

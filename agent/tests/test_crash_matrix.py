@@ -692,10 +692,9 @@ def test_failed_start_and_network_change_with_unknown_work() -> None:
         signal_id = await state.reserve(stack)
         state.fake.fault("new_order", "timeout_after")
         await stack.orders.execute_entry(signal_id)  # UNKNOWN entry on live
+        stack.runtime.settings = ExecutionSettings(enabled=True)
         with pytest.raises(ContextRefused):
-            await stack.runtime.prepare_start(
-                network="testnet", settings=ExecutionSettings(enabled=True), params={}
-            )
+            await stack.runtime.prepare_start(network="testnet", params={})
         await finish(state, await recover(state))
 
     matrix(scenario)
@@ -1302,9 +1301,9 @@ def _at_boundary(stack: Stack, boundary: str, change: Callable[[], None]) -> Non
 
 
 @pytest.mark.parametrize("boundary", ["journal", "budget"])
-def test_a_start_lowering_the_daily_limit_stops_a_reserved_buy(boundary: str) -> None:
-    # One loss, limit 5: ETH passes the gate. A Start sets the limit to 1
-    # (prepare_start assigns the settings) before the BUY goes out.
+def test_lowering_the_daily_limit_stops_a_reserved_buy(boundary: str) -> None:
+    # One loss, limit 5: ETH passes the gate. The owner sets the limit to 1
+    # (execution_configure assigns the settings) before the BUY goes out.
     async def scenario(state: World) -> None:
         stack = await state.stack()
         await _losing_close(state, stack)

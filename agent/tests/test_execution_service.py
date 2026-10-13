@@ -377,8 +377,9 @@ def test_fees_unpriced_at_close_are_revalued_by_a_later_round() -> None:
         state.fake.valuation_down = False
         restarted = service(state)
         await restarted.runtime.boot()
+        restarted.runtime.settings = state.settings
         await restarted.runtime.prepare_start(
-            network="live", settings=state.settings, params={"quote_asset": "USDT"}
+            network="live", params={"quote_asset": "USDT"}
         )
         state.clock.advance(state.settings.reconcile_interval_s + 1)
         await restarted.tick()  # the periodic reconcile round revalues

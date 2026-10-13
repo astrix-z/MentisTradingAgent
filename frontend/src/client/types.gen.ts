@@ -128,7 +128,7 @@ export type CommandRequest = {
     /**
      * Type
      */
-    type: 'start' | 'stop' | 'balance' | 'symbols' | 'prices' | 'indicators' | 'execution_pause' | 'execution_resume' | 'close_position' | 'release_entry';
+    type: 'start' | 'stop' | 'balance' | 'symbols' | 'prices' | 'indicators' | 'execution_pause' | 'execution_resume' | 'execution_configure' | 'close_position' | 'release_entry';
     /**
      * Payload
      */
@@ -235,6 +235,45 @@ export type ExecutionHeartbeat = {
     alerts?: {
         [key: string]: string;
     };
+};
+
+/**
+ * ExecutionRequest
+ *
+ * Body of ``POST /trading/execution/``: the whole real-trading section.
+ *
+ * ``settings`` is enforced against the catalog's ``execution`` section; what
+ * it leaves out takes the agent's defaults, and ``enabled`` defaults to off.
+ */
+export type ExecutionRequest = {
+    /**
+     * Settings
+     */
+    settings?: {
+        [key: string]: unknown;
+    };
+};
+
+/**
+ * ExecutionSnapshot
+ *
+ * The owner's real-trading switch and limits (``agent:execution``).
+ */
+export type ExecutionSnapshot = {
+    /**
+     * Settings
+     */
+    settings?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Updated At
+     */
+    updated_at?: string | null;
+    /**
+     * Revision
+     */
+    revision?: number;
 };
 
 /**
@@ -645,6 +684,7 @@ export type StrategyCatalog = {
      * Strategies
      */
     strategies?: Array<StrategyDescription>;
+    execution?: StrategyDescription | null;
 };
 
 /**
@@ -791,6 +831,7 @@ export type Token = {
  */
 export type TradingStatus = {
     desired: RuntimeSnapshot;
+    execution?: ExecutionSnapshot;
     actual: AgentHeartbeat | null;
     /**
      * Online
@@ -1737,6 +1778,47 @@ export type tradingStopTradingResponses = {
 };
 
 export type tradingStopTradingResponse = tradingStopTradingResponses[keyof tradingStopTradingResponses];
+
+export type tradingGetExecutionData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/execution/';
+};
+
+export type tradingGetExecutionResponses = {
+    /**
+     * Successful Response
+     */
+    200: ExecutionSnapshot;
+};
+
+export type tradingGetExecutionResponse = tradingGetExecutionResponses[keyof tradingGetExecutionResponses];
+
+export type tradingConfigureExecutionData = {
+    body: ExecutionRequest;
+    path?: never;
+    query?: never;
+    url: '/api/v1/trading/execution/';
+};
+
+export type tradingConfigureExecutionErrors = {
+    /**
+     * Validation Error
+     */
+    422: HTTPValidationError;
+};
+
+export type tradingConfigureExecutionError = tradingConfigureExecutionErrors[keyof tradingConfigureExecutionErrors];
+
+export type tradingConfigureExecutionResponses = {
+    /**
+     * Successful Response
+     */
+    202: CommandEnvelope;
+};
+
+export type tradingConfigureExecutionResponse = tradingConfigureExecutionResponses[keyof tradingConfigureExecutionResponses];
 
 export type tradingFetchBalanceData = {
     body: NetworkRequest;

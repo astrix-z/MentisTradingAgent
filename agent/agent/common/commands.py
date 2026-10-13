@@ -21,6 +21,11 @@ redelivered after it already reached a terminal state.
 The runtime snapshot (``agent:runtime``) lets the agent restore its intent after
 a restart: on boot we read it and, if it says ``running``, start the strategy
 with the stored settings.
+
+Real trading is not part of that intent. The owner's switch and limits live
+in ``agent:execution`` and change by ``execution_configure`` only (ClickUp
+869fgqxah): a Start, a resume or a network choice never turns trading on, and
+an ``execution`` object still carried by an old Start or snapshot is ignored.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ from agent.engine import (
     COMMAND_STATE_TTL_ACTIVE,
     COMMAND_STATE_TTL_TERMINAL,
     REDIS_COMMAND_STATE_PREFIX,
+    REDIS_EXECUTION_KEY,
     REDIS_RESULT_KEY,
     REDIS_RUNTIME_KEY,
     TERMINAL_STATUSES,
@@ -50,6 +56,7 @@ from agent.engine import (
 )
 from agent.exchange import ExchangeError
 from agent.execution.orders import ReleaseRefused
+from agent.execution.settings import ExecutionSettings
 from agent.selection import save_selected, validate_selection
 from agent.strategies import STRATEGIES
 from agent.symbols import (
@@ -294,7 +301,7 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
     strategy = str(payload.get("strategy") or "")
     symbols = _as_symbols(payload.get("symbols"))
     params = _as_params(payload.get("params"))
-    execution = payload.get("execution")
+    _ignore_execution(payload, "start")
     logger.info(
         "command start: network=%s strategy=%s symbols=%s params=%s",
         network,
@@ -310,7 +317,6 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
                 strategy=strategy,
                 symbols=symbols,
                 params=params,
-                execution=execution if isinstance(execution, dict) else None,
             ),
             timeout=timeout,
         )
@@ -332,6 +338,35 @@ async def _start(ctx: CommandContext, payload: dict[str, Any]) -> None:
             "symbols": symbols,
         },
     )
+
+
+def _ignore_execution(document: dict[str, Any], what: str) -> None:
+    """Real trading is never switched by a Start (``execution_configure``)."""
+    if document.get("execution"):
+        logger.warning(
+            "%s carries execution settings; ignored — real trading is set by "
+            "execution_configure only",
+            what,
+        )
+
+
+@command("execution_configure")
+async def _execution_configure(ctx: CommandContext, payload: dict[str, Any]) -> None:
+    """The owner's real-trading switch and limits (``agent:execution``).
+
+    Independent of Start and of the network: the running strategy keeps
+    running, admission follows the new settings at once.
+    """
+    try:
+        settings = ExecutionSettings.from_payload(payload.get("settings"))
+        await ctx.engine.configure_execution(settings)
+    except ValueError as exc:
+        logger.warning("execution settings rejected: %s", exc)
+        await ctx.report(ok=False, message=str(exc))
+        return
+    runtime = ctx.engine.execution
+    logger.info("real trading %s", "enabled" if settings.enabled else "off")
+    await ctx.report(ok=True, data=runtime.heartbeat() if runtime else None)
 
 
 @command("stop")
@@ -585,14 +620,50 @@ async def resume_from_runtime(engine: Engine, redis: Redis) -> None:
         strategy,
         symbols,
     )
+    _ignore_execution(data, "runtime snapshot")
     try:
-        execution = data.get("execution")
         await engine.start_run(
             network=network,
             strategy=strategy,
             symbols=symbols,
             params=params,
-            execution=execution if isinstance(execution, dict) else None,
         )
     except Exception as exc:
         logger.exception("resume failed: %s", exc)
+
+
+async def load_execution_settings(engine: Engine, redis: Redis) -> None:
+    """Apply the stored real-trading settings at boot, before any resume.
+
+    Fail-closed: no document, an unreadable one or settings the agent cannot
+    accept leave real trading off; the last two say so in the heartbeat.
+    """
+    runtime = engine.execution
+    if runtime is None:
+        return
+    try:
+        raw = await redis.get(REDIS_EXECUTION_KEY)
+    except RedisError:
+        runtime.alerts["settings"] = (
+            "cannot read the real-trading settings (Redis unavailable); real "
+            "trading off until they are set again"
+        )
+        logger.warning(runtime.alerts["settings"])
+        return
+    if not raw:
+        return
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+        settings = ExecutionSettings.from_payload(data.get("settings"))
+        await engine.configure_execution(settings)
+    except ValueError as exc:
+        runtime.alerts["settings"] = (
+            f"stored real-trading settings refused ({exc}); real trading off"
+        )
+        logger.warning(runtime.alerts["settings"])
+        return
+    logger.info(
+        "real-trading settings restored: %s", "enabled" if settings.enabled else "off"
+    )

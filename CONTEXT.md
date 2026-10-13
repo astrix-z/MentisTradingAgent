@@ -69,7 +69,13 @@
 
 - Backend публикует конверт в канал `agent:commands`:
   `{id, type, payload, issued_at}`. Типы: `start` `{network, strategy, symbols, params}`,
-  `stop`, `balance` `{network}`.
+  `stop`, `balance` `{network}`, `execution_configure` `{settings}` и др.
+- **Реальные сделки — отдельный переключатель владельца** (ClickUp 869fgqxah):
+  `POST /trading/execution/` → документ `agent:execution` + команда
+  `execution_configure`. Start его не несёт (непустое `execution` → 422), сеть и
+  Start на него не влияют. Без включённых сделок агент при Start только
+  идентифицирует аккаунт; lock и reconcile — лишь при включённых сделках или
+  незавершённой работе (`docs/ORDER_EXECUTION_PLAN.md` §4.3).
 - Агент слушает канал и вызывает обработчик по типу (реестр + `@command`).
   **Новая команда = новый обработчик в `common/commands.py`**, цикл подписки не трогается.
 - Backend атомарно через Redis CAS записывает revision снапшота `agent:runtime`
@@ -155,6 +161,13 @@
 ---
 
 ## ЖУРНАЛ (последняя задача сверху)
+
+### [2026-10-13] Отдельное управление реальными сделками (ClickUp 869fgqxah) — Claude-Mentis
+- Сеть, Start/Stop и реальные сделки теперь независимы. Переключатель и лимиты задаёт `POST /trading/execution/` (документ `agent:execution` + команда `execution_configure`); Start с непустым `execution` → 422, агент игнорирует `execution` старых команд и снапшотов. Агент читает `agent:execution` при boot до resume, отказ → сделки выключены, алерт `settings`.
+- `ExecutionRuntime`: `prepare_start(network, params)` без настроек; при выключенных сделках только идентификация аккаунта (ошибка не отклоняет Start), lock и reconcile — при включённых сделках или незавершённой работе (`tick`: `_lead` / `_step_down`). Это же убирает таймаут Start на testnet из 869fgqu5u, пока сделки выключены. `Engine.configure_execution` пересевает позиции работающей стратегии при переключении.
+- UI: карточка «Real trading» на Strategy (переключатель с подтверждением сети, лимиты из секции каталога, Pause/Resume), режим в статусе и в диалоге live Start. Каталог отдаёт секцию `execution`, статус — желаемый `execution`.
+- Файлы: `agent/agent/execution/runtime.py`, `agent/agent/engine.py`, `agent/agent/common/commands.py`, `agent/agent/main.py`, `backend/app/api/routes/trading.py`, `frontend/src/components/ExecutionControl.tsx`, `strategy.tsx`, `TradingStatusView.tsx`, клиент; тесты `agent/tests/test_execution_control.py`, `test_execution_runtime.py`, `backend/tests/test_trading_contract.py`, `frontend/tests/trading-contract.spec.ts`; доки — план §4.3/§9.4, runbook §3.
+- Проверки: agent 845 passed / 1 skip (PG18 + Redis 7 одноразовые); backend 682 passed; Playwright (mocked) 79 passed; ruff/mypy/biome/tsc чистые.
 
 ### [2026-10-13] Третье ревью релиза 869fg9avr, recovery G4 — GPT-Sol
 - Проверены PR #22 (open, head `048b1cc1d08d9dcf3f2f68da5e2adbea76c341e4`, base development `357d4d3`), коммиты `a175216`/`048b1cc`, комментарии Claude-Mentis в [869fgdkgu](https://app.clickup.com/t/869fgdkgu) и [869fg9avr](https://app.clickup.com/t/869fg9avr), DEPLOY §2/§6, EXECUTION_RUNBOOK §2 и журнал стенда. Чистый detached worktree; PR #21/#22 не мёрджились.

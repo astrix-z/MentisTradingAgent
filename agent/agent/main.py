@@ -377,6 +377,8 @@ async def run() -> None:
     engine.execution = runtime
     runtime.feedback = engine.position_feedback
     execution = build_execution(runtime, engine.hub)
+    # The owner's real-trading switch, before the resume can start anything.
+    await commands.load_execution_settings(engine, redis)
     # Independent of Start/Stop and of the saved running flag: unfinished
     # positions are followed from boot, even when the strategy stays off.
     await runtime.boot()
