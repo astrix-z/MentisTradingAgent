@@ -63,8 +63,9 @@
 Ветки: `development` — разработка (ветка по умолчанию, сюда идут PR), `stage` —
 кандидат в выпуск, `production` — то, что работает на 55.40. Код поднимается
 только вперёд: `development` → `stage` → `production`, merge через PR.
-На 2026-10-06 `production` и `stage` стоят на `567f4f8` — ревизии, выложенной
-2026-09-23 (`T0`, §3).
+На сервере работает `567f4f8`, выложенная 2026-09-23 (`T0`, §3); первая выкладка
+новой схемой — с `--t0-revision 567f4f8`. Что сейчас в ветках — `git log origin/production`
+и `git log origin/production..origin/stage`, а не этот файл.
 
 ```sh
 git switch production && git pull       # деплоится только то, что есть в origin/production
