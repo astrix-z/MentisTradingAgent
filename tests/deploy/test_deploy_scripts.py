@@ -231,10 +231,14 @@ STUBS: dict[str, str] = {
                 cp "$(img "mentis-backend:latest")" "$STATE/containers/c-backend.image"
                 exit 1
               fi
-              # `up -d <service>` recreates only that service, as compose does.
+              # `up -d <service>...` recreates only those services, as compose
+              # does; without names, every service.
+              named=""
+              for a in "$@"; do [[ "$a" == -* ]] || named+=" $a"; done
               for s in backend agent; do
-                [[ "$*" == *remove-orphans* || " $* " == *" $s "* ]] || continue
+                [[ -z "$named" || "$named " == *" $s "* ]] || continue
                 cp "$(img "mentis-$s:latest")" "$STATE/containers/c-$s.image" 2>/dev/null || true
+                rm -f "$STATE/containers/c-$s.stopped"
               done
               mkdir -p "$STATE/redis"
               if [[ -f "$STATE/catalog_payload" ]]; then
@@ -243,15 +247,50 @@ STUBS: dict[str, str] = {
                 cp "$STATE/valid_catalog" "$STATE/redis/agent:strategies"
               fi ;;
             ps)
+              # -q: running containers only; -aq: stopped ones too.
+              [[ "$1" == -q && -f "$STATE/containers/c-$2.stopped" ]] && exit 0
               [[ -f "$STATE/containers/c-$2.image" ]] && echo "c-$2" ;;
-            stop|start|logs) ;;
+            stop)
+              for s in "$@"; do
+                [[ -f "$STATE/stuck_$s" ]] || touch "$STATE/containers/c-$s.stopped"
+              done ;;
+            start)
+              for s in "$@"; do rm -f "$STATE/containers/c-$s.stopped"; done ;;
+            run)
+              if [[ " $* " == *" backend "* ]]; then
+                # The isolated backend of a target without the flag: no ports.
+                name=""; prev=""
+                for a in "$@"; do [[ "$prev" == --name ]] && name="$a"; prev="$a"; done
+                echo "probe with $(cat "$(img mentis-backend:latest)")" >>"$STATE/calls.log"
+                cp "$(img mentis-backend:latest)" "$STATE/containers/$name.image"
+                echo "$name"; exit 0
+              fi
+              # The execution barrier, in the image :latest names now.
+              echo "run with $(cat "$(img mentis-agent:latest)")" >>"$STATE/calls.log"
+              cat "$STATE/barrier_out" 2>/dev/null || true
+              exit "$(cat "$STATE/barrier_exit" 2>/dev/null || echo 0)" ;;
+            logs) ;;
           esac
           exit 0
         fi
         case "$1" in
-          tag) cp "$(img "$2")" "$(img "$3")" ;;
+          tag)
+            # An image id (id-<svc>-<rev>) is an image too, tagged or not.
+            if [[ -f "$(img "$2")" ]]; then cp "$(img "$2")" "$(img "$3")"
+            elif [[ "$2" == id-* ]]; then echo "$2" >"$(img "$3")"
+            else exit 1; fi ;;
+          rm)
+            shift; [[ "$1" == -f ]] && shift
+            rm -f "$STATE/containers/$1.image" ;;
+          logs) ;;
           image)
-            if [[ "$2" == inspect ]]; then cat "$(img "$5")" 2>/dev/null || exit 1
+            if [[ "$2" == inspect && "$4" == *RepoTags* ]]; then
+              # Every tag of the image: the names whose content is its id.
+              for f in "$STATE"/images/mentis-*; do
+                [[ "$(cat "$f")" == "$5" ]] && basename "$f"
+              done
+              exit 0
+            elif [[ "$2" == inspect ]]; then cat "$(img "$5")" 2>/dev/null || exit 1
             elif [[ "$2" == rm ]]; then rm "$(img "$3")" 2>/dev/null || exit 1; fi ;;
           inspect)
             case "$3" in
@@ -263,7 +302,14 @@ STUBS: dict[str, str] = {
               *) echo "image $(cat "$STATE/containers/$4.image")" ;;
             esac ;;
           exec)
-            if [[ "$*" == *psql* ]]; then
+            if [[ "$*" == *mentis-deploy-probe* ]]; then
+              if [[ "$*" == *curl* ]]; then
+                [[ ! -f "$STATE/unhealthy_probe" ]]; exit
+              fi
+              shift 4  # exec -i <probe> python
+              echo "backend python $1" | head -c 40 >>"$STATE/calls.log"; echo >>"$STATE/calls.log"
+              cd "$HOME/apps/mentis-trading-agent/backend" && exec "$BACKEND_PYTHON" "$@"
+            elif [[ "$*" == *psql* ]]; then
               case "$*" in *"'agent'"*) db=agent ;; *) db=app ;; esac
               cat "$STATE/db_exists_$db" 2>/dev/null || echo 1
             else
@@ -445,7 +491,8 @@ def test_a_failure_before_up_starts_the_previous_agent_and_keeps_the_fence(
     calls = server.calls()
     order(calls, "stop agent", "start agent")
     assert server.redis("trading:start_fence") is not None
-    assert "Флаг trading:start_fence остаётся" in result.stdout, result.stdout
+    # The real state of Start: the backend that ignores the flag is stopped.
+    assert "backend не работает — Start закрыт" in result.stdout, result.stdout
     assert "снимается только по runbook" in result.stdout
 
 
@@ -629,6 +676,263 @@ def test_a_rollback_to_an_admitted_historical_revision_passes_g4(
     assert any(call.startswith("backend python") for call in server.calls())
     assert server.redis("trading:start_fence") is None
     assert (server.releases / "current").read_text().strip() == revision
+
+
+# --- Release review 869fg9avr: a backend without the fence, the executor ------------
+#: The production T0: its backend does not know the flag, its agent has no executor.
+PRODUCTION_T0 = git("rev-parse", "--short=7", "567f4f8")
+
+
+def test_a_backend_that_ignores_the_fence_is_stopped_before_it(server: Server) -> None:
+    # 869fgbyar: the running backend (before c26ff56) accepts Start under the
+    # flag; only stopping it closes Start, and that comes before the flag.
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout
+    steps = order(
+        server.calls(),
+        "compose --env-file .env.prod -f compose.yml -f compose.prod.yml stop backend",
+        "redis SET trading:start_fence",
+        "stop agent",
+        "up -d --remove-orphans",
+    )
+    assert steps == sorted(steps)
+    assert "(0) остановка backend" in result.stdout
+
+
+def runs(server: Server, revision: str) -> None:
+    """The containers run the images of ``revision``, releases/current aside."""
+    for svc in ("backend", "agent"):
+        server.put(f"images/mentis-{svc}:{revision}", f"id-{svc}-{revision}")
+        server.put(f"images/mentis-{svc}:latest", f"id-{svc}-{revision}")
+        server.put(f"containers/c-{svc}.image", f"id-{svc}-{revision}")
+
+
+def test_a_backend_that_knows_the_fence_is_not_stopped(server: Server) -> None:
+    runs(server, NO_LOCK)
+    (server.releases / "current").write_text(f"{NO_LOCK}\n")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout
+    assert not any("stop backend" in call for call in server.calls())
+    assert "флаг — yes" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "current,image",
+    [(REVISION, PRODUCTION_T0), (T0, NO_LOCK), (REVISION, None)],
+    ids=["image-ignores-the-flag", "current-ignores-the-flag", "image-untagged"],
+)
+def test_the_backend_is_stopped_unless_its_image_and_current_know_the_flag(
+    server: Server, current: str, image: str | None
+) -> None:
+    # 869fgdkgu: releases/current is a claim — after a failed rollback the
+    # backend that runs may be T0. Only the running image, tagged with a
+    # revision the clone knows, together with current, proves the flag.
+    if image is None:
+        server.put("containers/c-backend.image", "id-backend-of-nobody")
+    else:
+        runs(server, image)
+    (server.releases / "current").write_text(f"{current}\n")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout
+    steps = order(server.calls(), "stop backend", "redis SET trading:start_fence")
+    assert steps == sorted(steps)
+
+
+def test_a_backend_that_does_not_stop_leaves_neither_fence_nor_a_stopped_agent(
+    server: Server,
+) -> None:
+    server.put("stuck_backend")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    assert "не остановился" in result.stdout
+    calls = server.calls()
+    assert not any("start_fence" in call or "stop agent" in call for call in calls)
+
+
+def test_a_failure_after_the_quiesce_keeps_the_ignorant_backend_stopped(
+    server: Server,
+) -> None:
+    server.put("fail_redis_DEL")  # step (3), the agent and the backend are stopped
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    calls = server.calls()
+    order(calls, "stop backend", "stop agent", "start agent")
+    assert not any("start backend" in call for call in calls)
+    assert "оставлен остановленным" in result.stdout
+
+
+def rollback_to_production_t0(server: Server) -> None:
+    for svc in ("backend", "agent"):
+        server.put(f"images/mentis-{svc}:{PRODUCTION_T0}", f"id-{svc}-{PRODUCTION_T0}")
+    server.put(
+        "valid_catalog",
+        git("show", f"{PRODUCTION_T0}:frontend/tests/fixtures/strategy-catalog.json"),
+    )
+
+
+@pytest.mark.parametrize("code", ["1", "2"], ids=["unfinished", "unreadable"])
+def test_a_rollback_without_the_executor_is_refused_while_execution_is_unfinished(
+    server: Server, code: str
+) -> None:
+    # 869fgbyaf: Stop, an empty stream and idle hold with a protected position;
+    # the agent that follows it is asked, after it stopped, before anything of
+    # the target runs. Refused: the same agent is started again.
+    rollback_to_production_t0(server)
+    server.put("barrier_exit", code)
+    server.put("barrier_out", "barrier: unfinished execution 1001/live: positions=1")
+    result = server.deploy("--revision", PRODUCTION_T0)
+    assert result.returncode == 1
+    calls = server.calls()
+    order(calls, "stop agent", f"run with id-agent-{T0}", "start agent")
+    assert not any("up -d" in call for call in calls)
+    assert server.image("mentis-agent:latest") == f"id-agent-{T0}"
+    assert server.redis("trading:start_fence") is not None
+    assert (server.releases / "current").read_text().strip() == T0
+    assert "запрещён" in result.stdout
+
+
+def test_a_rollback_without_the_executor_passes_when_execution_finished(
+    server: Server,
+) -> None:
+    rollback_to_production_t0(server)
+    result = server.deploy("--revision", PRODUCTION_T0)
+    assert result.returncode == 0, result.stdout
+    steps = order(
+        server.calls(),
+        "stop agent",
+        f"run with id-agent-{T0}",
+        f"tag mentis-agent:{PRODUCTION_T0} mentis-agent:latest",
+    )
+    assert steps == sorted(steps)
+    assert (server.releases / "current").read_text().strip() == PRODUCTION_T0
+
+
+def failed_rollback(server: Server, fault: str) -> subprocess.CompletedProcess[str]:
+    """Modern → the production T0, failing after up (869fgdkgu)."""
+    runs(server, REVISION)
+    (server.releases / "current").write_text(f"{REVISION}\n")
+    rollback_to_production_t0(server)
+    server.put(fault)
+    return server.deploy("--revision", PRODUCTION_T0)
+
+
+@pytest.mark.parametrize("fault", ["agent_silent", "unhealthy_probe"])
+def test_a_rollback_to_a_backend_without_the_flag_accepts_it_before_it_runs(
+    server: Server, fault: str
+) -> None:
+    # The T0 backend accepts Start the moment it runs, flag or not: catalog,
+    # healthcheck and compiler are proven first, on an instance without ports.
+    result = failed_rollback(server, fault)
+    assert result.returncode == 1
+    calls = server.calls()
+    assert not any("up -d --no-deps backend" in call for call in calls)
+    up = next(call for call in calls if "up -d" in call)
+    assert " backend" not in up.split("--remove-orphans")[1]
+    # The modern backend still runs under the flag; T0's never ran.
+    assert server.redis("trading:start_fence") is not None
+    running = (server.state / "containers/c-backend.image").read_text().strip()
+    assert running == f"id-backend-{REVISION}"
+    # :latest names it, not T0's: a manual up or the runbook's downgrade
+    # "with the current image" takes the backend that runs.
+    assert server.image("mentis-backend:latest") == f"id-backend-{REVISION}"
+    assert (server.releases / "current").read_text().strip() == REVISION
+    assert "Start закрыт" in result.stdout
+    assert not any(
+        "probe" in path.name for path in (server.state / "containers").iterdir()
+    )
+
+
+def test_a_rollback_whose_backend_fails_after_it_started_stops_it(
+    server: Server,
+) -> None:
+    result = failed_rollback(server, "unhealthy")
+    assert result.returncode == 1
+    calls = server.calls()
+    steps = order(
+        calls,
+        f"probe with id-backend-{PRODUCTION_T0}",
+        "backend python",
+        "up -d --no-deps backend",
+    )
+    assert steps == sorted(steps)
+    assert any("stop backend" in call for call in calls[steps[-1] :])
+    assert (server.state / "containers/c-backend.stopped").exists()
+    assert server.redis("trading:start_fence") is not None
+    assert (server.releases / "current").read_text().strip() == REVISION
+    assert "сбой в фазе opening" in result.stdout
+    assert "Start закрыт" in result.stdout
+    assert "ОТКРЫТ" not in result.stdout
+
+
+def test_a_retry_after_a_failed_rollback_stops_the_backend_that_really_runs(
+    server: Server,
+) -> None:
+    # The review's probe: the rollback fails after T0's backend started, the
+    # trap cannot stop it; current still names the modern revision. The retry
+    # must stop the backend that runs, not trust current.
+    server.put("stuck_backend")
+    result = failed_rollback(server, "unhealthy")
+    assert result.returncode == 1
+    assert "Start ОТКРЫТ" in result.stdout  # the diagnosis tells the truth
+    running = (server.state / "containers/c-backend.image").read_text().strip()
+    assert running == f"id-backend-{PRODUCTION_T0}"
+    assert (server.releases / "current").read_text().strip() == REVISION
+
+    for name in ("stuck_backend", "unhealthy", "calls.log"):
+        (server.state / name).unlink()
+    server.put("valid_catalog", CATALOG_FIXTURE.read_text())
+    retry = server.deploy("--revision", REVISION)
+    assert retry.returncode == 0, retry.stdout
+    steps = order(
+        server.calls(),
+        "stop backend",
+        "redis SET trading:start_fence",
+        "stop agent",
+        "up -d --remove-orphans",
+        "redis DEL trading:start_fence",
+    )
+    assert steps == sorted(steps)
+    assert f"Работает backend {PRODUCTION_T0}: флаг — no" in retry.stdout
+    assert (server.releases / "current").read_text().strip() == REVISION
+    history = [
+        line.split()[1]
+        for line in (server.releases / "history").read_text().splitlines()
+    ]
+    assert history[-1] == REVISION and PRODUCTION_T0 not in history
+
+
+def test_a_rollback_retried_after_it_failed_still_asks_the_execution_barrier(
+    server: Server,
+) -> None:
+    # The agent that runs is T0's (no executor, no barrier module); current
+    # still has the executor: the barrier asks current's image, then :latest
+    # is the running agent again.
+    failed_rollback(server, "unhealthy")
+    (server.state / "unhealthy").unlink()
+    (server.state / "calls.log").unlink()
+    result = server.deploy("--revision", PRODUCTION_T0)
+    assert result.returncode == 0, result.stdout
+    calls = server.calls()
+    order(calls, "stop agent", f"run with id-agent-{REVISION}")
+    assert (server.releases / "current").read_text().strip() == PRODUCTION_T0
+    assert server.image("mentis-agent:latest") == f"id-agent-{PRODUCTION_T0}"
+
+
+def test_a_target_with_the_executor_needs_no_execution_barrier(server: Server) -> None:
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout
+    assert not any(call.startswith("run with") for call in server.calls())
+
+
+def test_a_running_revision_without_the_executor_needs_no_execution_barrier(
+    server: Server,
+) -> None:
+    # The first deploy from the production T0: nothing to accompany yet.
+    (server.releases / "current").write_text(f"{PRODUCTION_T0}\n")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout
+    assert not any(call.startswith("run with") for call in server.calls())
+    assert any("stop backend" in call for call in server.calls())
 
 
 def test_a_target_without_images_or_a_tracked_lock_is_refused(server: Server) -> None:

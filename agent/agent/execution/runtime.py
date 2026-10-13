@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import ORMExecuteState, Session, SessionTransaction
 
 from agent.exchange.trade import RECV_WINDOW_MS, Outcome, TradeCallError, TradeClient
+from agent.execution.barrier import UNFINISHED
 from agent.execution.lock import LeaderLock
 from agent.execution.models import (
     INTENT_HOLDING_STATES,
@@ -566,33 +567,21 @@ class ExecutionRuntime:
         """Open positions + holding intents + attempts without a proven outcome."""
         if self._sessions is None:
             return 0
-        where_ctx = (context.account, context.network)
+        counts: dict[str, int] = {}
         async with self.session() as session:
-            positions = await session.scalar(
-                select(func.count()).where(
-                    Position.account == where_ctx[0],
-                    Position.network == where_ctx[1],
-                    Position.status != PositionStatus.CLOSED,
+            for kind, model, condition in UNFINISHED:
+                counts[kind] = int(
+                    await session.scalar(
+                        select(func.count()).where(
+                            model.account == context.account,
+                            model.network == context.network,
+                            condition,
+                        )
+                    )
+                    or 0
                 )
-            )
-            intents = await session.scalar(
-                select(func.count()).where(
-                    ExecutionIntent.account == where_ctx[0],
-                    ExecutionIntent.network == where_ctx[1],
-                    ExecutionIntent.state.in_(list(INTENT_HOLDING_STATES)),
-                )
-            )
-            attempts = await session.scalar(
-                select(func.count()).where(
-                    OrderAttempt.account == where_ctx[0],
-                    OrderAttempt.network == where_ctx[1],
-                    OrderAttempt.state.in_(
-                        [AttemptState.PREPARED, AttemptState.SENT, AttemptState.UNKNOWN]
-                    ),
-                )
-            )
-        self.open_positions = int(positions or 0)
-        return int(positions or 0) + int(intents or 0) + int(attempts or 0)
+        self.open_positions = counts["positions"]
+        return sum(counts.values())
 
     # --- context ------------------------------------------------------------------
 
