@@ -1932,7 +1932,7 @@ def first_deploy_from_t0(stand: Stand, journal: Journal, candidate: str) -> None
         "params": default_params(),
     }
     stand.sh(
-        "rm -f ~/stand-state/start-held ~/faults/hold.waiting"
+        "mkdir -p ~/faults && rm -f ~/stand-state/start-held ~/faults/hold.waiting"
         " && touch ~/stand-state/pause-start ~/faults/hold"
     )
     stream_before = stand.compose("exec -T redis redis-cli XLEN agent:commands:stream")
