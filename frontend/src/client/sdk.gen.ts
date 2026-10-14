@@ -2,7 +2,7 @@
 
 import { type Client, type Options as Options2, type TDataShape, urlSearchParamsBodySerializer } from './client';
 import { client } from './client.gen';
-import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, presetsCreatePresetData, presetsCreatePresetErrors, presetsCreatePresetResponses, presetsDeletePresetData, presetsDeletePresetErrors, presetsDeletePresetResponses, presetsListOptionsData, presetsListOptionsErrors, presetsListOptionsResponses, presetsListPresetsData, presetsListPresetsErrors, presetsListPresetsResponses, presetsUpdateOptionsData, presetsUpdateOptionsErrors, presetsUpdateOptionsResponses, presetsUpdatePresetData, presetsUpdatePresetErrors, presetsUpdatePresetResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingFetchIndicatorsData, tradingFetchIndicatorsResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetCommandStateData, tradingGetCommandStateErrors, tradingGetCommandStateResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListPositionsData, tradingListPositionsResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingListWorkingSymbolsData, tradingListWorkingSymbolsResponses, tradingRefreshPricesData, tradingRefreshPricesResponses, tradingSetWorkingSymbolsData, tradingSetWorkingSymbolsErrors, tradingSetWorkingSymbolsResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
+import type { itemsCreateItemData, itemsCreateItemErrors, itemsCreateItemResponses, itemsDeleteItemData, itemsDeleteItemErrors, itemsDeleteItemResponses, itemsReadItemData, itemsReadItemErrors, itemsReadItemResponses, itemsReadItemsData, itemsReadItemsErrors, itemsReadItemsResponses, itemsUpdateItemData, itemsUpdateItemErrors, itemsUpdateItemResponses, loginLoginAccessTokenData, loginLoginAccessTokenErrors, loginLoginAccessTokenResponses, loginRecoverPasswordData, loginRecoverPasswordErrors, loginRecoverPasswordHtmlContentData, loginRecoverPasswordHtmlContentErrors, loginRecoverPasswordHtmlContentResponses, loginRecoverPasswordResponses, loginResetPasswordData, loginResetPasswordErrors, loginResetPasswordResponses, loginTestTokenData, loginTestTokenResponses, presetsCreatePresetData, presetsCreatePresetErrors, presetsCreatePresetResponses, presetsDeletePresetData, presetsDeletePresetErrors, presetsDeletePresetResponses, presetsListOptionsData, presetsListOptionsErrors, presetsListOptionsResponses, presetsListPresetsData, presetsListPresetsErrors, presetsListPresetsResponses, presetsUpdateOptionsData, presetsUpdateOptionsErrors, presetsUpdateOptionsResponses, presetsUpdatePresetData, presetsUpdatePresetErrors, presetsUpdatePresetResponses, privateCreateUserData, privateCreateUserErrors, privateCreateUserResponses, tradingConfigureExecutionData, tradingConfigureExecutionErrors, tradingConfigureExecutionResponses, tradingFetchBalanceData, tradingFetchBalanceErrors, tradingFetchBalanceResponses, tradingFetchIndicatorsData, tradingFetchIndicatorsResponses, tradingGetCommandResultData, tradingGetCommandResultErrors, tradingGetCommandResultResponses, tradingGetCommandStateData, tradingGetCommandStateErrors, tradingGetCommandStateResponses, tradingGetExecutionData, tradingGetExecutionResponses, tradingGetStatusData, tradingGetStatusResponses, tradingIssueCommandData, tradingIssueCommandErrors, tradingIssueCommandResponses, tradingListPositionsData, tradingListPositionsResponses, tradingListStrategiesData, tradingListStrategiesResponses, tradingListWorkingSymbolsData, tradingListWorkingSymbolsResponses, tradingRefreshPricesData, tradingRefreshPricesResponses, tradingSetWorkingSymbolsData, tradingSetWorkingSymbolsErrors, tradingSetWorkingSymbolsResponses, tradingStartTradingData, tradingStartTradingErrors, tradingStartTradingResponses, tradingStopTradingData, tradingStopTradingResponses, usersCreateUserData, usersCreateUserErrors, usersCreateUserResponses, usersDeleteUserData, usersDeleteUserErrors, usersDeleteUserMeData, usersDeleteUserMeResponses, usersDeleteUserResponses, usersReadUserByIdData, usersReadUserByIdErrors, usersReadUserByIdResponses, usersReadUserMeData, usersReadUserMeResponses, usersReadUsersData, usersReadUsersErrors, usersReadUsersResponses, usersRegisterUserData, usersRegisterUserErrors, usersRegisterUserResponses, usersUpdatePasswordMeData, usersUpdatePasswordMeErrors, usersUpdatePasswordMeResponses, usersUpdateUserData, usersUpdateUserErrors, usersUpdateUserMeData, usersUpdateUserMeErrors, usersUpdateUserMeResponses, usersUpdateUserResponses, utilsHealthCheckData, utilsHealthCheckResponses, utilsTestEmailData, utilsTestEmailErrors, utilsTestEmailResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -490,6 +490,42 @@ export class TradingService {
             security: [{ scheme: 'bearer', type: 'http' }],
             url: '/api/v1/trading/stop/',
             ...options
+        });
+    }
+    
+    /**
+     * Get Execution
+     *
+     * The desired real-trading switch and limits (defaults: off).
+     */
+    public static getExecution<ThrowOnError extends boolean = true>(options?: Options<tradingGetExecutionData, ThrowOnError>) {
+        return (options?.client ?? client).get<tradingGetExecutionResponses, unknown, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/execution/',
+            ...options
+        });
+    }
+    
+    /**
+     * Configure Execution
+     *
+     * Turn real trading on or off and set its limits — apart from any Start.
+     *
+     * 202 only acknowledges the command; the agent may still refuse it (no
+     * migrated database, a running strategy not quoted in USDT) and reports
+     * that through ``/result/``, its mode through ``/status/``.
+     */
+    public static configureExecution<ThrowOnError extends boolean = true>(options: Options<tradingConfigureExecutionData, ThrowOnError>) {
+        return (options.client ?? client).post<tradingConfigureExecutionResponses, tradingConfigureExecutionErrors, ThrowOnError>({
+            responseType: 'json',
+            security: [{ scheme: 'bearer', type: 'http' }],
+            url: '/api/v1/trading/execution/',
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                ...options.headers
+            }
         });
     }
     

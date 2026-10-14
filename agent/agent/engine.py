@@ -55,6 +55,9 @@ REDIS_COMMAND_GROUP = "agent-workers"
 # pending (unacked) entries by reading id "0" instead of needing XCLAIM.
 REDIS_COMMAND_CONSUMER = "primary"
 REDIS_RUNTIME_KEY = "agent:runtime"
+#: The owner's real-trading switch and limits, written by the backend apart
+#: from the runtime snapshot (ClickUp 869fgqxah): no Start changes it.
+REDIS_EXECUTION_KEY = "agent:execution"
 REDIS_HEARTBEAT_KEY = "trading:heartbeat"
 REDIS_RESULT_KEY = "agent:result"
 REDIS_COMMAND_STATE_PREFIX = "agent:command:"
@@ -114,6 +117,8 @@ class Engine:
         self._startup_feedback: list[tuple[PositionEvent, bool]] | None = None
         self._network: str = "testnet"
         self._strategy_name: str = ""
+        #: Parameters of the running strategy (real trading is USDT only).
+        self._params: dict[str, Any] = {}
         self._state: AgentState = "idle"
         self._message: str | None = None
         self._health_warning: str | None = None
@@ -214,10 +219,11 @@ class Engine:
         strategy: str,
         symbols: list[str],
         params: dict[str, Any],
-        execution: dict[str, Any] | None = None,
     ) -> None:
         """Start a strategy with the UI settings; raises ValueError if invalid.
 
+        A Start names the network and the strategy; whether real orders are
+        placed is the owner's separate switch (:meth:`configure_execution`).
         Execution is checked first, before the current run is torn down: a
         Start that would move execution away from unfinished work (another
         network or account) is refused and leaves the current run alone.
@@ -236,7 +242,6 @@ class Engine:
             raise ValueError("symbols must be non-empty alphanumeric strings")
         normalized = list(dict.fromkeys(symbol.upper() for symbol in symbols))
         strategy_obj = build_strategy(strategy, params)
-        execution_settings = ExecutionSettings.from_payload(execution)
 
         async with self._lifecycle_lock:
             snapshot = PositionsSnapshot()
@@ -247,12 +252,10 @@ class Engine:
             self._startup_feedback = []
             try:
                 if self.execution is not None:
-                    await self.execution.prepare_start(
-                        network=network, settings=execution_settings, params=params
-                    )
+                    await self.execution.prepare_start(network=network, params=params)
                     snapshot = await self.execution.positions_snapshot()
                 self._virtual_feedback = (
-                    self.tracker is not None and not execution_settings.enabled
+                    self.tracker is not None and not self._trading_enabled()
                 )
                 if self._virtual_feedback:
                     snapshot = await self._virtual_snapshot(network, snapshot)
@@ -273,8 +276,55 @@ class Engine:
                     await self._replay_to_running()
                 finally:
                     self._startup_feedback = None
+            self._params = dict(params)
             if self.execution is not None:
                 self.execution.open_admission(strategy)
+
+    def _trading_enabled(self) -> bool:
+        return self.execution is not None and self.execution.settings.enabled is True
+
+    async def configure_execution(self, settings: ExecutionSettings) -> None:
+        """Apply the owner's real-trading switch and limits; no Start involved.
+
+        Raises ``ValueError`` when real trading cannot be enabled (no migrated
+        database, a running strategy quoted in something else than USDT);
+        nothing changes then. A switch while a strategy runs re-seeds its
+        positions: real ones when trading turns on, the followed signals
+        when it turns off — as the next Start would.
+        """
+        runtime = self.execution
+        if runtime is None:
+            raise ValueError("execution is not available")
+        async with self._lifecycle_lock:
+            running = self._strategy is not None and self._state == "running"
+            if settings.enabled and running:
+                quote = str(self._params.get("quote_asset") or "USDT")
+                if quote != "USDT":
+                    raise ValueError(
+                        f"real trading supports USDT only; the running strategy "
+                        f"uses quote_asset={quote}"
+                    )
+            switched = settings.enabled != runtime.settings.enabled
+            runtime.configure(settings)
+            self._virtual_feedback = self.tracker is not None and not settings.enabled
+            if switched and running:
+                await self._reseed_positions()
+        await self.publish_heartbeat()
+
+    async def _reseed_positions(self) -> None:
+        """Hand the running strategy the positions of the mode now in force."""
+        strategy = self._strategy
+        if strategy is None or self.execution is None:
+            return
+        self._startup_feedback = []
+        try:
+            snapshot = await self.execution.positions_snapshot()
+            if self._virtual_feedback:
+                snapshot = await self._virtual_snapshot(self._network, snapshot)
+            await strategy.restore_positions(snapshot)
+            await self._replay_startup_feedback(strategy)
+        finally:
+            self._startup_feedback = None
 
     async def _start_run(
         self,

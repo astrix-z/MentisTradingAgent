@@ -138,9 +138,8 @@ class World:
             clock=clock.now,
             sleep=clock.sleep,
         )
-        await runtime.prepare_start(
-            network="live", settings=self.settings, params={"quote_asset": "USDT"}
-        )
+        runtime.settings = self.settings
+        await runtime.prepare_start(network="live", params={"quote_asset": "USDT"})
         runtime.open_admission("tripple_screen")
         protector = Protector(orders, finalizer)
         stack = Stack(

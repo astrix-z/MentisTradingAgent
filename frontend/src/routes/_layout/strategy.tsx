@@ -10,6 +10,10 @@ import {
   UsersService,
 } from "@/client"
 import { CommandTrackingView } from "@/components/CommandTrackingView"
+import {
+  ExecutionControl,
+  executionModeLabel,
+} from "@/components/ExecutionControl"
 import { ReleaseEntry } from "@/components/ReleaseEntry"
 import { OptionListsEditor } from "@/components/strategy-form/OptionListsEditor"
 import {
@@ -807,6 +811,19 @@ function Strategy() {
         </Card>
       </div>
 
+      <Card>
+        <CardHeader>
+          <CardTitle>Real trading</CardTitle>
+          <CardDescription>
+            Whether the agent places real orders, and its limits — set apart
+            from the network and from Start
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <ExecutionControl status={status} section={catalog?.execution} />
+        </CardContent>
+      </Card>
+
       {status?.actual?.execution?.alerts?.unknown && (
         <Card>
           <CardHeader>
@@ -933,6 +950,15 @@ function Strategy() {
           {pendingLiveStart && (
             <div className="space-y-2 text-sm">
               <p>Network: {pendingLiveStart.payload.network.toUpperCase()}</p>
+              <p className="font-medium">
+                Real trading:{" "}
+                {status?.execution?.settings?.enabled === true
+                  ? "ON — the agent will place real orders on LIVE"
+                  : "OFF — signals only, no orders"}
+                {status?.actual?.execution?.mode
+                  ? ` (agent: ${executionModeLabel(status.actual.execution.mode)})`
+                  : ""}
+              </p>
               <p>
                 Strategy:{" "}
                 {activeStrategy?.label ?? pendingLiveStart.payload.strategy}
