@@ -68,6 +68,8 @@ REDIS_STRATEGIES_KEY = "agent:strategies"
 # Published tradeable universe (symbols, 24h volume, our classification of each)
 # the working-symbols page renders; see agent/symbols.py.
 REDIS_SYMBOLS_KEY = "agent:symbols"
+#: How many left-out symbols the run's warning names before counting the rest.
+_UNLISTED_SHOWN = 20
 
 # Command state TTLs (keep in sync with backend/app/api/routes/trading.py):
 # short while in flight, long once terminal.
@@ -122,6 +124,8 @@ class Engine:
         self._state: AgentState = "idle"
         self._message: str | None = None
         self._health_warning: str | None = None
+        #: Start symbols the run's network does not trade, left out of the run.
+        self._unlisted: list[str] = []
         self._balances: dict[str, float] = {}
         #: Whether the agent database migrated cleanly at boot. Real execution
         #: is fail-closed without it (plan §8.1).
@@ -340,7 +344,9 @@ class Engine:
             self._strategy_name = strategy
             self._balances = {}
             self._message = None
+            self._unlisted = []
             rest = self._ensure_rest(network)
+            symbols = await self._tradable_symbols(rest, network, symbols)
             self._streams = await self.hub.attach(network, "strategy")  # type: ignore[arg-type]
             await self._streams.start()
             # Register before on_start: it can acquire resources and then fail.
@@ -378,6 +384,34 @@ class Engine:
             strategy,
             symbols,
         )
+
+    async def _tradable_symbols(
+        self, rest: ExchangeRest, network: str, symbols: list[str]
+    ) -> list[str]:
+        """The Start symbols ``network`` trades; the rest is left out of the run.
+
+        The universe the UI offers is read from the live exchange, which lists
+        far more than testnet: one unlisted symbol would otherwise fail the
+        whole start with Binance's -1121. Raises ``ValueError`` when none is
+        left.
+        """
+        trading = {
+            info.symbol for info in await rest.symbols() if info.status == "TRADING"
+        }
+        listed = [symbol for symbol in symbols if symbol in trading]
+        unlisted = [symbol for symbol in symbols if symbol not in trading]
+        if not listed:
+            raise ValueError(
+                f"none of the symbols trades on {network}: {_names(unlisted)}"
+            )
+        if unlisted:
+            logger.warning(
+                "symbols not trading on %s left out of the run: %s",
+                network,
+                unlisted,
+            )
+        self._unlisted = unlisted
+        return listed
 
     async def _rollback_start(self, exc: BaseException) -> None:
         self._state = "error"
@@ -671,6 +705,7 @@ class Engine:
                 logger.debug("streams stop failed", exc_info=True)
 
         self._balances = {}
+        self._unlisted = []
         if reset_state and self._state != "idle":
             self._state = "idle"
             self._message = None
@@ -691,6 +726,12 @@ class Engine:
                 for part in (
                     self._streams.health_warning() if self._streams else None,
                     self._strategy.health_warning if self._strategy else None,
+                    (
+                        f"not trading on {self._network}, left out: "
+                        f"{_names(self._unlisted)}"
+                    )
+                    if self._unlisted
+                    else None,
                 )
                 if part
             ]
@@ -727,3 +768,10 @@ class Engine:
             await self._redis.set(REDIS_HEARTBEAT_KEY, payload, ex=HEARTBEAT_TTL)
         except RedisError:
             logger.warning("cannot publish heartbeat (Redis unavailable)")
+
+
+def _names(symbols: list[str]) -> str:
+    """``symbols`` for a message, the first few named and the rest counted."""
+    shown = ", ".join(symbols[:_UNLISTED_SHOWN])
+    rest = len(symbols) - _UNLISTED_SHOWN
+    return f"{shown} and {rest} more" if rest > 0 else shown

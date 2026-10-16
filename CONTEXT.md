@@ -162,6 +162,12 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-10-16] Start не падает из-за символов, которых нет в сети запуска — Claude-Mentis
+- Симптом на production: testnet, `tripple_screen` → `error`, `strategy start failed: Binance REST call failed: (-1121, 'Invalid symbol.')`. Причина: вселенная рабочих символов читается с live (`symbols.UNIVERSE_NETWORK`), testnet listит подмножество; отбор стратегии грузит свечи всех символов одним `gather`, и один неизвестный символ обрывает весь `on_start`.
+- `Engine._start_run` до `on_start` сверяет символы Start с `exchangeInfo` сети запуска (`status == "TRADING"`): остальные не входят в прогон, лог `warning`, в heartbeat — предупреждение `not trading on <network>, left out: …` (первые 20 по имени, дальше счётчиком), снимается при Stop. Если не осталось ни одного — `ValueError` с именами, состояние `error`.
+- `tripple_screen._load_window`: `ExchangeError` загрузки свечей содержит символ и интервал (`FOOUSDT 4h klines: …`).
+- Тесты: `test_engine_lifecycle.py` (+2, хелпер `listed_rest`), `test_strategy_runtime.py` (+1, `Rest.symbols`), `test_commands_lifecycle.py` переведён на `listed_rest`. Agent 601 passed / 252 skip без PG/Redis; ruff/format/mypy чистые.
+
 ### [2026-10-13] Отдельное управление реальными сделками (ClickUp 869fgqxah) — Claude-Mentis
 - Сеть, Start/Stop и реальные сделки теперь независимы. Переключатель и лимиты задаёт `POST /trading/execution/` (документ `agent:execution` + команда `execution_configure`); Start с непустым `execution` → 422, агент игнорирует `execution` старых команд и снапшотов. Агент читает `agent:execution` при boot до resume, отказ → сделки выключены, алерт `settings`.
 - `ExecutionRuntime`: `prepare_start(network, params)` без настроек; при выключенных сделках только идентификация аккаунта (ошибка не отклоняет Start), lock и reconcile — при включённых сделках или незавершённой работе (`tick`: `_lead` / `_step_down`). Это же убирает таймаут Start на testnet из 869fgqu5u, пока сделки выключены. `Engine.configure_execution` пересевает позиции работающей стратегии при переключении.

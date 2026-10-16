@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from test_engine_lifecycle import listed_rest
 
 from agent.common import commands
 from agent.core.config import settings
@@ -142,7 +143,7 @@ def test_stop_barrier_and_new_start(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         monkeypatch.setattr("agent.engine.build_strategy", Mock(return_value=strategy))
         monkeypatch.setattr(
-            "agent.engine.ExchangeRest.connect", Mock(return_value=Mock())
+            "agent.engine.ExchangeRest.connect", Mock(return_value=listed_rest())
         )
         monkeypatch.setattr(
             "agent.engine.MarketDataStreams", Mock(return_value=streams)
@@ -239,7 +240,7 @@ def test_listener_and_heartbeat_during_resume(
         strategy.on_start = AsyncMock(side_effect=bootstrap)
         monkeypatch.setattr("agent.engine.build_strategy", Mock(return_value=strategy))
         monkeypatch.setattr(
-            "agent.engine.ExchangeRest.connect", Mock(return_value=Mock())
+            "agent.engine.ExchangeRest.connect", Mock(return_value=listed_rest())
         )
         monkeypatch.setattr(
             "agent.engine.MarketDataStreams",
@@ -371,7 +372,7 @@ def test_start_failure_result(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         monkeypatch.setattr("agent.engine.build_strategy", Mock(return_value=strategy))
         monkeypatch.setattr(
-            "agent.engine.ExchangeRest.connect", Mock(return_value=Mock())
+            "agent.engine.ExchangeRest.connect", Mock(return_value=listed_rest())
         )
         monkeypatch.setattr(
             "agent.engine.MarketDataStreams",
