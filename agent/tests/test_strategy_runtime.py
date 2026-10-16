@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from itertools import permutations
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -16,7 +17,7 @@ from binance_sdk_spot.websocket_streams.models import KlineResponse, KlineRespon
 from pydantic import ValidationError
 
 from agent.common.intervals import bar_open, interval_ms
-from agent.exchange.rest import ExchangeRest
+from agent.exchange.rest import ExchangeError, ExchangeRest
 from agent.exchange.streams import MarketDataStreams
 from agent.strategies.base import Signal, StrategyServices
 from agent.strategies.tripple_screen.indicators import Candle
@@ -109,6 +110,9 @@ class Rest:
         self.windows = windows
         self.page_size = page_size
         self.calls: list[dict[str, Any]] = []
+
+    async def symbols(self) -> list[Any]:
+        return [SimpleNamespace(symbol=SYMBOL, status="TRADING")]
 
     async def klines(self, **kwargs: Any) -> list[Any]:
         self.calls.append(kwargs)
@@ -969,6 +973,32 @@ def test_open_position_retained_past_failed_rescreen() -> None:
             assert ("BTCUSDT", "4h") not in streams.unsubscribed
         finally:
             await strategy.on_stop()
+
+    asyncio.run(run())
+
+
+def test_failed_screen_names_the_symbol() -> None:
+    """One symbol failing aborts the whole screen; the error says which."""
+
+    async def run() -> None:
+        class FailingRest(MultiRest):
+            async def klines(self, **kwargs: Any) -> list[Any]:
+                if kwargs["symbol"] == "FOOUSDT":
+                    raise ExchangeError(
+                        "Binance REST call failed: (-1121, 'Invalid symbol.')"
+                    )
+                return await super().klines(**kwargs)
+
+        rest = FailingRest({"BTCUSDT": fixture()})
+        streams, sink = MultiStreams(), RedisSink()
+        strategy = TripleScreenStrategy(SCREEN_PARAMS)
+        with pytest.raises(ExchangeError) as raised:
+            await strategy.on_start(
+                multi_services(rest, streams, sink, ["BTCUSDT", "FOOUSDT"])
+            )
+        assert str(raised.value) == (
+            "FOOUSDT 4h klines: Binance REST call failed: (-1121, 'Invalid symbol.')"
+        )
 
     asyncio.run(run())
 

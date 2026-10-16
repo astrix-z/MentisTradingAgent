@@ -13,6 +13,7 @@ from typing import Any
 from binance_sdk_spot.websocket_streams.models import KlineResponse
 
 from agent.common.intervals import bar_open, interval_ms
+from agent.exchange import ExchangeError
 from agent.strategies.base import (
     EXIT_POLICY_VERSION,
     ExitPolicy,
@@ -461,13 +462,17 @@ class TripleScreenStrategy(Strategy):
         cursor = max(0, start)
         found: dict[int, Candle] = {}
         while cursor <= end:
-            rows = await self.services.rest.klines(
-                symbol=symbol,
-                interval=interval,
-                start_time=cursor,
-                end_time=end,
-                limit=min(1000, (end - cursor + 1) // step),
-            )
+            try:
+                rows = await self.services.rest.klines(
+                    symbol=symbol,
+                    interval=interval,
+                    start_time=cursor,
+                    end_time=end,
+                    limit=min(1000, (end - cursor + 1) // step),
+                )
+            except ExchangeError as exc:
+                # One symbol's failure aborts a whole screen: say which one.
+                raise ExchangeError(f"{symbol} {interval} klines: {exc}") from exc
             page = [Candle.from_rest_row(row) for row in rows]
             page = [c for c in page if cursor <= c.open_time and c.close_time <= end]
             if not page:

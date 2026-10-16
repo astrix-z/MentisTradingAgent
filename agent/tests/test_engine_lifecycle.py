@@ -16,6 +16,14 @@ from agent.exchange.streams import MarketDataStreams
 from agent.strategies import Signal
 
 
+def listed_rest(*symbols: str, **attrs: Any) -> Mock:
+    """A REST mock whose exchange trades ``symbols`` (BTCUSDT by default)."""
+    listed = [
+        Mock(symbol=symbol, status="TRADING") for symbol in symbols or ("BTCUSDT",)
+    ]
+    return Mock(symbols=AsyncMock(return_value=listed), **attrs)
+
+
 def setup_engine(monkeypatch: pytest.MonkeyPatch) -> tuple[Engine, Any, Any, Any]:
     redis = Mock(set=AsyncMock(), publish=AsyncMock())
     strategy = Mock(
@@ -29,7 +37,9 @@ def setup_engine(monkeypatch: pytest.MonkeyPatch) -> tuple[Engine, Any, Any, Any
         start=AsyncMock(), stop=AsyncMock(), health_warning=Mock(return_value=None)
     )
     monkeypatch.setattr("agent.engine.build_strategy", Mock(return_value=strategy))
-    monkeypatch.setattr("agent.engine.ExchangeRest.connect", Mock(return_value=Mock()))
+    monkeypatch.setattr(
+        "agent.engine.ExchangeRest.connect", Mock(return_value=listed_rest())
+    )
     monkeypatch.setattr("agent.engine.MarketDataStreams", Mock(return_value=streams))
     return Engine(redis), redis, strategy, streams
 
@@ -415,5 +425,55 @@ def test_a_published_entry_is_followed_and_a_tracker_exit_is_published() -> None
         assert payload == {"kind": "signal", **exit_.transport()}
         assert payload["entry_signal_id"] == entry.signal_id
         assert payload["exit_price"] == "0.02198799"
+
+    asyncio.run(scenario())
+
+
+def test_start_leaves_out_symbols_the_network_does_not_trade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The universe comes from the live exchange; testnet lists a subset."""
+
+    async def scenario() -> None:
+        engine, redis, strategy, _streams = setup_engine(monkeypatch)
+        rest = listed_rest("BTCUSDT", "ETHUSDT")
+        rest.symbols.return_value.append(Mock(symbol="XMRUSDT", status="BREAK"))
+        monkeypatch.setattr(
+            "agent.engine.ExchangeRest.connect", Mock(return_value=rest)
+        )
+        await start(engine, symbols=["ethusdt", "FOOUSDT", "BTCUSDT", "XMRUSDT"])
+        assert engine.state == "running"
+        services = strategy.on_start.await_args.args[0]
+        assert services.symbols == ["ETHUSDT", "BTCUSDT"]
+        heartbeat = json.loads(redis.set.await_args.args[1])
+        assert heartbeat["message"] == (
+            "not trading on testnet, left out: FOOUSDT, XMRUSDT"
+        )
+
+        await engine.stop()
+        await start(engine, symbols=["BTCUSDT"])
+        assert json.loads(redis.set.await_args.args[1])["message"] is None
+        await engine.stop()
+
+    asyncio.run(scenario())
+
+
+def test_start_with_no_symbol_the_network_trades_fails_naming_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        engine, redis, strategy, _streams = setup_engine(monkeypatch)
+        symbols = [f"COIN{i}USDT" for i in range(22)]
+        with pytest.raises(ValueError, match="none of the symbols trades"):
+            await start(engine, symbols=symbols)
+        assert engine.state == "error"
+        strategy.on_start.assert_not_awaited()
+        heartbeat = json.loads(redis.set.call_args.args[1])
+        assert heartbeat["message"] == (
+            "strategy start failed: none of the symbols trades on testnet: "
+            + ", ".join(symbols[:20])
+            + " and 2 more"
+        )
+        await engine.shutdown()
 
     asyncio.run(scenario())

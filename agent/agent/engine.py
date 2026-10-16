@@ -55,6 +55,9 @@ REDIS_COMMAND_GROUP = "agent-workers"
 # pending (unacked) entries by reading id "0" instead of needing XCLAIM.
 REDIS_COMMAND_CONSUMER = "primary"
 REDIS_RUNTIME_KEY = "agent:runtime"
+#: The owner's real-trading switch and limits, written by the backend apart
+#: from the runtime snapshot (ClickUp 869fgqxah): no Start changes it.
+REDIS_EXECUTION_KEY = "agent:execution"
 REDIS_HEARTBEAT_KEY = "trading:heartbeat"
 REDIS_RESULT_KEY = "agent:result"
 REDIS_COMMAND_STATE_PREFIX = "agent:command:"
@@ -65,6 +68,8 @@ REDIS_STRATEGIES_KEY = "agent:strategies"
 # Published tradeable universe (symbols, 24h volume, our classification of each)
 # the working-symbols page renders; see agent/symbols.py.
 REDIS_SYMBOLS_KEY = "agent:symbols"
+#: How many left-out symbols the run's warning names before counting the rest.
+_UNLISTED_SHOWN = 20
 
 # Command state TTLs (keep in sync with backend/app/api/routes/trading.py):
 # short while in flight, long once terminal.
@@ -114,9 +119,13 @@ class Engine:
         self._startup_feedback: list[tuple[PositionEvent, bool]] | None = None
         self._network: str = "testnet"
         self._strategy_name: str = ""
+        #: Parameters of the running strategy (real trading is USDT only).
+        self._params: dict[str, Any] = {}
         self._state: AgentState = "idle"
         self._message: str | None = None
         self._health_warning: str | None = None
+        #: Start symbols the run's network does not trade, left out of the run.
+        self._unlisted: list[str] = []
         self._balances: dict[str, float] = {}
         #: Whether the agent database migrated cleanly at boot. Real execution
         #: is fail-closed without it (plan §8.1).
@@ -214,10 +223,11 @@ class Engine:
         strategy: str,
         symbols: list[str],
         params: dict[str, Any],
-        execution: dict[str, Any] | None = None,
     ) -> None:
         """Start a strategy with the UI settings; raises ValueError if invalid.
 
+        A Start names the network and the strategy; whether real orders are
+        placed is the owner's separate switch (:meth:`configure_execution`).
         Execution is checked first, before the current run is torn down: a
         Start that would move execution away from unfinished work (another
         network or account) is refused and leaves the current run alone.
@@ -236,7 +246,6 @@ class Engine:
             raise ValueError("symbols must be non-empty alphanumeric strings")
         normalized = list(dict.fromkeys(symbol.upper() for symbol in symbols))
         strategy_obj = build_strategy(strategy, params)
-        execution_settings = ExecutionSettings.from_payload(execution)
 
         async with self._lifecycle_lock:
             snapshot = PositionsSnapshot()
@@ -247,12 +256,10 @@ class Engine:
             self._startup_feedback = []
             try:
                 if self.execution is not None:
-                    await self.execution.prepare_start(
-                        network=network, settings=execution_settings, params=params
-                    )
+                    await self.execution.prepare_start(network=network, params=params)
                     snapshot = await self.execution.positions_snapshot()
                 self._virtual_feedback = (
-                    self.tracker is not None and not execution_settings.enabled
+                    self.tracker is not None and not self._trading_enabled()
                 )
                 if self._virtual_feedback:
                     snapshot = await self._virtual_snapshot(network, snapshot)
@@ -273,8 +280,55 @@ class Engine:
                     await self._replay_to_running()
                 finally:
                     self._startup_feedback = None
+            self._params = dict(params)
             if self.execution is not None:
                 self.execution.open_admission(strategy)
+
+    def _trading_enabled(self) -> bool:
+        return self.execution is not None and self.execution.settings.enabled is True
+
+    async def configure_execution(self, settings: ExecutionSettings) -> None:
+        """Apply the owner's real-trading switch and limits; no Start involved.
+
+        Raises ``ValueError`` when real trading cannot be enabled (no migrated
+        database, a running strategy quoted in something else than USDT);
+        nothing changes then. A switch while a strategy runs re-seeds its
+        positions: real ones when trading turns on, the followed signals
+        when it turns off — as the next Start would.
+        """
+        runtime = self.execution
+        if runtime is None:
+            raise ValueError("execution is not available")
+        async with self._lifecycle_lock:
+            running = self._strategy is not None and self._state == "running"
+            if settings.enabled and running:
+                quote = str(self._params.get("quote_asset") or "USDT")
+                if quote != "USDT":
+                    raise ValueError(
+                        f"real trading supports USDT only; the running strategy "
+                        f"uses quote_asset={quote}"
+                    )
+            switched = settings.enabled != runtime.settings.enabled
+            runtime.configure(settings)
+            self._virtual_feedback = self.tracker is not None and not settings.enabled
+            if switched and running:
+                await self._reseed_positions()
+        await self.publish_heartbeat()
+
+    async def _reseed_positions(self) -> None:
+        """Hand the running strategy the positions of the mode now in force."""
+        strategy = self._strategy
+        if strategy is None or self.execution is None:
+            return
+        self._startup_feedback = []
+        try:
+            snapshot = await self.execution.positions_snapshot()
+            if self._virtual_feedback:
+                snapshot = await self._virtual_snapshot(self._network, snapshot)
+            await strategy.restore_positions(snapshot)
+            await self._replay_startup_feedback(strategy)
+        finally:
+            self._startup_feedback = None
 
     async def _start_run(
         self,
@@ -290,7 +344,9 @@ class Engine:
             self._strategy_name = strategy
             self._balances = {}
             self._message = None
+            self._unlisted = []
             rest = self._ensure_rest(network)
+            symbols = await self._tradable_symbols(rest, network, symbols)
             self._streams = await self.hub.attach(network, "strategy")  # type: ignore[arg-type]
             await self._streams.start()
             # Register before on_start: it can acquire resources and then fail.
@@ -328,6 +384,34 @@ class Engine:
             strategy,
             symbols,
         )
+
+    async def _tradable_symbols(
+        self, rest: ExchangeRest, network: str, symbols: list[str]
+    ) -> list[str]:
+        """The Start symbols ``network`` trades; the rest is left out of the run.
+
+        The universe the UI offers is read from the live exchange, which lists
+        far more than testnet: one unlisted symbol would otherwise fail the
+        whole start with Binance's -1121. Raises ``ValueError`` when none is
+        left.
+        """
+        trading = {
+            info.symbol for info in await rest.symbols() if info.status == "TRADING"
+        }
+        listed = [symbol for symbol in symbols if symbol in trading]
+        unlisted = [symbol for symbol in symbols if symbol not in trading]
+        if not listed:
+            raise ValueError(
+                f"none of the symbols trades on {network}: {_names(unlisted)}"
+            )
+        if unlisted:
+            logger.warning(
+                "symbols not trading on %s left out of the run: %s",
+                network,
+                unlisted,
+            )
+        self._unlisted = unlisted
+        return listed
 
     async def _rollback_start(self, exc: BaseException) -> None:
         self._state = "error"
@@ -621,6 +705,7 @@ class Engine:
                 logger.debug("streams stop failed", exc_info=True)
 
         self._balances = {}
+        self._unlisted = []
         if reset_state and self._state != "idle":
             self._state = "idle"
             self._message = None
@@ -641,6 +726,12 @@ class Engine:
                 for part in (
                     self._streams.health_warning() if self._streams else None,
                     self._strategy.health_warning if self._strategy else None,
+                    (
+                        f"not trading on {self._network}, left out: "
+                        f"{_names(self._unlisted)}"
+                    )
+                    if self._unlisted
+                    else None,
                 )
                 if part
             ]
@@ -677,3 +768,10 @@ class Engine:
             await self._redis.set(REDIS_HEARTBEAT_KEY, payload, ex=HEARTBEAT_TTL)
         except RedisError:
             logger.warning("cannot publish heartbeat (Redis unavailable)")
+
+
+def _names(symbols: list[str]) -> str:
+    """``symbols`` for a message, the first few named and the rest counted."""
+    shown = ", ".join(symbols[:_UNLISTED_SHOWN])
+    rest = len(symbols) - _UNLISTED_SHOWN
+    return f"{shown} and {rest} more" if rest > 0 else shown

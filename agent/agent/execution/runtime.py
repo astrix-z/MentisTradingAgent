@@ -17,6 +17,11 @@ What it owns here:
   (reconciliation) ran after taking it;
 * **admission state**: settings (enabled / off), Stop, pause, and every
   condition that keeps entries closed, reported through the heartbeat;
+* **when it leads**: the settings are the owner's, set apart from Start
+  (:meth:`ExecutionRuntime.configure`, ClickUp 869fgqxah). A Start only
+  names the network: the account behind it is identified, which is cheap,
+  but the lock and the reconciliation are taken only while real trading is
+  enabled or unfinished work is there, and given back once neither is;
 * the **key preflight** (``canTrade`` and ``SPOT``), the **clock check** and
   the **BNB low** warning.
 
@@ -213,6 +218,9 @@ class ExecutionRuntime:
         self.strategy: str | None = None
         self.admission_open = False
         self.paused_by_owner = False
+        #: The network of the running strategy (the last Start): the context
+        #: follows it when nothing unfinished holds it elsewhere.
+        self.target_network: str | None = None
         #: True once the leadership hooks ran after the lock was (re)taken.
         self.reconciled = False
         self.alerts: dict[str, str] = {}
@@ -302,22 +310,24 @@ class ExecutionRuntime:
 
     # --- Start / Stop ----------------------------------------------------------
 
-    async def prepare_start(
-        self, *, network: str, settings: ExecutionSettings, params: Mapping[str, Any]
-    ) -> None:
-        """Validate a Start against execution before anything is torn down.
+    async def prepare_start(self, *, network: str, params: Mapping[str, Any]) -> None:
+        """Check a Start against execution before anything is torn down.
 
-        Raises ``ValueError`` (the Start is refused, the current run stays).
+        The Start carries no execution settings: they are the owner's
+        (:meth:`configure`). Raises ``ValueError`` (the Start is refused, the
+        current run stays). With real trading off nothing here waits for the
+        lock or the reconciliation: the account is identified, best effort.
         """
-        if settings.enabled:
+        enabled = self.settings.enabled
+        if enabled:
             quote = str(params.get("quote_asset") or "USDT")
             if quote != "USDT":
                 raise ValueError(
-                    f"real execution supports USDT only; quote_asset={quote} "
-                    "can run with execution disabled"
+                    f"real trading supports USDT only; quote_asset={quote} "
+                    "can run with real trading off"
                 )
             if not self.schema_ready:
-                raise ValueError("agent database is not ready; real execution refused")
+                raise ValueError("agent database is not ready; real trading refused")
         async with self._context_lock:
             if self._restore_pending:
                 await self._restore()
@@ -337,11 +347,41 @@ class ExecutionRuntime:
             expected = current.account if busy and current is not None else None
             if self.context is not None and self.context.network != network:
                 await self._leave()
-            if self.context is None and (self.schema_ready or settings.enabled):
-                await self._enter(network, expected_account=expected)
+            # ``target_network`` moves only with a Start that goes ahead: a
+            # refused one leaves the running strategy on its network, and the
+            # watchdog brings execution back there (review 869fgqxah, P2-2).
+            if self.context is None and (self.schema_ready or enabled):
+                try:
+                    await self._enter(
+                        network, expected_account=expected, lead=enabled or busy
+                    )
+                except ContextRefused:
+                    raise
+                except (TradeCallError, ValueError) as exc:
+                    if enabled or busy:
+                        raise
+                    # Real trading is off: the strategy does not wait for the
+                    # account; the watchdog identifies it later.
+                    self.alerts["context"] = (
+                        f"cannot identify the account on {network}: {exc}"
+                    )
+                    logger.warning(self.alerts["context"])
             elif expected is not None and self.trade is not None:
                 await self._verify_account(expected)
-            self.settings = settings
+            self.target_network = network
+
+    def configure(self, settings: ExecutionSettings) -> None:
+        """The owner's real-trading switch and limits, apart from any Start.
+
+        Takes effect at once for admission (``execution_off`` / the limits);
+        the lock and the reconciliation follow on the next watchdog round, so
+        the command never waits on the exchange. Turning real trading off
+        while work is unfinished keeps leading until that work is done.
+        """
+        if settings.enabled and not self.schema_ready:
+            raise ValueError("agent database is not ready; real trading refused")
+        self.settings = settings
+        self.alerts.pop("settings", None)
 
     def open_admission(self, strategy: str) -> None:
         self.strategy = strategy
@@ -585,8 +625,11 @@ class ExecutionRuntime:
 
     # --- context ------------------------------------------------------------------
 
-    async def _enter(self, network: str, *, expected_account: str | None) -> None:
-        """Connect to ``network``, identify the account, take the lock."""
+    async def _enter(
+        self, network: str, *, expected_account: str | None, lead: bool = True
+    ) -> None:
+        """Connect to ``network``, identify the account and, to ``lead``, take
+        the lock and reconcile."""
         trade = self._trade_factory(network)
         account = (await trade.get_account()).data
         uid = str(account.uid) if account.uid is not None else None
@@ -601,26 +644,47 @@ class ExecutionRuntime:
         self.trade = trade
         self.context = ExecutionContext(account=uid, network=network)
         self.alerts.pop("account", None)
+        self.alerts.pop("context", None)
         self._check_key(account)
         self._check_bnb(account)
         self._last_account_check = self._clock()
         await self._check_clock()
-        if self.schema_ready and self._db_url is not None:
-            self.lock = self._lock_factory(self._db_url, uid, network)
+        if lead:
+            await self._lead()
+
+    async def _lead(self) -> None:
+        """Take the lock of the context and reconcile before any mutation."""
+        assert self.context is not None
+        if self.lock is None and self.schema_ready and self._db_url is not None:
+            self.lock = self._lock_factory(
+                self._db_url, self.context.account, self.context.network
+            )
+        if self.lock is not None:
             await self._take_lead()
 
-    async def _leave(self) -> None:
+    async def _step_down(self) -> None:
+        """Give the lock back: real trading is off and nothing is unfinished.
+
+        The account stays identified, so signals keep their durable record;
+        what the reconciliation found no longer concerns anyone.
+        """
         if self.lock is not None:
             await self.lock.dispose()
         self.lock = None
-        self.trade = None
-        self.context = None
         self.reconciled = False
-        self.open_positions = 0
-        for name in ("lock", "key", "clock", "bnb", "account", "reconcile"):
+        for name in ("lock", "reconcile"):
             self.alerts.pop(name, None)
         for key in [k for k in self.alerts if k.startswith(_CONTEXT_PREFIXES)]:
             del self.alerts[key]
+        logger.info("real trading off and nothing unfinished: execution lock released")
+
+    async def _leave(self) -> None:
+        await self._step_down()
+        self.trade = None
+        self.context = None
+        self.open_positions = 0
+        for name in ("key", "clock", "bnb", "account", "context"):
+            self.alerts.pop(name, None)
 
     async def _verify_account(self, expected: str) -> None:
         assert self.trade is not None
@@ -703,11 +767,41 @@ class ExecutionRuntime:
             self.alerts.pop("clock_warning", None)
 
     async def tick(self) -> None:
-        """One watchdog round: lock health, re-lead, clock, account."""
+        """One watchdog round: context, leadership, lock health, clock, account."""
         async with self._context_lock:
             if self._restore_pending:
                 await self._restore()
-            if self.lock is not None and self.context is not None:
+            if (
+                self.context is None
+                and self.target_network is not None
+                and not self._restore_pending
+                and (self.schema_ready or self.settings.enabled)
+            ):
+                try:
+                    await self._enter(
+                        self.target_network, expected_account=None, lead=False
+                    )
+                except (TradeCallError, ValueError) as exc:
+                    self.alerts["context"] = (
+                        f"cannot identify the account on {self.target_network}: {exc}"
+                    )
+            work = 0
+            if self.context is not None and self._sessions is not None:
+                try:
+                    work = await self.unfinished(self.context)
+                except SQLAlchemyError as exc:
+                    self.alerts["database"] = f"cannot read execution state: {exc}"
+                    work = -1  # unknown: keep leading if already leading
+                else:
+                    self.alerts.pop("database", None)
+            led = False
+            if self.context is not None:
+                if self.lock is None and (self.settings.enabled or work > 0):
+                    await self._lead()
+                    led = True
+                elif self.lock is not None and not self.settings.enabled and work == 0:
+                    await self._step_down()
+            if not led and self.lock is not None and self.context is not None:
                 if self.lock.held and not await self.lock.check():
                     self.reconciled = False
                     self.alerts["lock"] = "execution lock lost; mutations stopped"
@@ -735,13 +829,6 @@ class ExecutionRuntime:
                         self.alerts["account"] = (
                             f"credentials switched to account {account.uid}"
                         )
-            if self.context is not None and self._sessions is not None:
-                try:
-                    await self.unfinished(self.context)
-                except SQLAlchemyError as exc:
-                    self.alerts["database"] = f"cannot read execution state: {exc}"
-                else:
-                    self.alerts.pop("database", None)
             if self.context is not None and self.lock is not None and self.lock.held:
                 for check in self._watches:
                     try:

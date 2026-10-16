@@ -305,9 +305,14 @@ export async function mock(
       posts.push({ path: url.pathname, body: payload })
       // The generic endpoint names its type in the body; the others in the path.
       const generic = url.pathname.endsWith("/trading/commands/")
+      const configure = url.pathname.endsWith("/trading/execution/")
       const envelope: CommandEnvelope = {
         id: posts.length === 1 ? firstId : secondId,
-        type: generic ? payload.type : (url.pathname.split("/").at(-2) ?? ""),
+        type: generic
+          ? payload.type
+          : configure
+            ? "execution_configure"
+            : (url.pathname.split("/").at(-2) ?? ""),
         payload: (generic ? payload.payload : payload) ?? {},
         issued_at: at,
       }
