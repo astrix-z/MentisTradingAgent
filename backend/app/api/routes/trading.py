@@ -11,6 +11,10 @@ The backend talks to the agent through *commands*, not through a shared
 * a *runtime snapshot* key (``agent:runtime``) is kept alongside so the agent
   can resume its intent after a restart and the UI can report what *should* be
   running;
+* the owner's *real-trading* switch and limits live in their own key
+  (``agent:execution``), written with the ``execution_configure`` command by
+  ``POST /trading/execution/`` only. A Start names the network and the
+  strategy and never carries them (ClickUp 869fgqxah);
 * a per-command state hash (``agent:command:<id>``) tracks the lifecycle
   (accepted -> dispatched -> running -> succeeded|failed|timed_out) for
   diagnostics/audit, separate from the terminal-only ``/result/`` polling
@@ -80,6 +84,7 @@ router = APIRouter(prefix="/trading", tags=["trading"])
 REDIS_COMMAND_STREAM = "agent:commands:stream"
 REDIS_COMMAND_GROUP = "agent-workers"
 REDIS_RUNTIME_KEY = "agent:runtime"
+REDIS_EXECUTION_KEY = "agent:execution"
 REDIS_HEARTBEAT_KEY = "trading:heartbeat"
 REDIS_RESULT_KEY = "agent:result"
 REDIS_COMMAND_STATE_PREFIX = "agent:command:"
@@ -134,6 +139,7 @@ CommandType = Literal[
     "indicators",
     "execution_pause",
     "execution_resume",
+    "execution_configure",
     "close_position",
     "release_entry",
 ]
@@ -176,10 +182,19 @@ class StartPayload(BaseModel):
     strategy: str
     symbols: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
-    #: Real-execution settings, enforced against the catalog's ``execution``
-    #: section like ``params`` against the strategy's. Empty means defaults,
-    #: which keep real execution off.
+    #: No longer part of a Start: real trading is switched by
+    #: ``POST /trading/execution/``. Refused when not empty, so a client still
+    #: sending it learns that instead of trading being silently off.
     execution: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _no_execution(self) -> Self:
+        if self.execution:
+            raise ValueError(
+                "real trading is no longer part of a Start; set it with "
+                "POST /api/v1/trading/execution/"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_symbols(self) -> Self:
@@ -229,10 +244,34 @@ class RuntimeSnapshot(BaseModel):
     strategy: str | None = None
     symbols: list[str] = Field(default_factory=list)
     params: dict[str, Any] = Field(default_factory=dict)
+    #: Read from snapshots written before real trading had its own switch;
+    #: never written now and never resumed by the agent.
     execution: dict[str, Any] = Field(default_factory=dict)
     last_command: str | None = None
     updated_at: datetime
     revision: int = Field(default=0, ge=0)
+
+
+class ExecutionRequest(BaseModel):
+    """Body of ``POST /trading/execution/``: the whole real-trading section.
+
+    ``settings`` is enforced against the catalog's ``execution`` section; what
+    it leaves out takes the agent's defaults, and ``enabled`` defaults to off.
+    """
+
+    settings: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionSnapshot(BaseModel):
+    """The owner's real-trading switch and limits (``agent:execution``)."""
+
+    settings: dict[str, Any] = Field(default_factory=dict)
+    updated_at: datetime | None = None
+    revision: int = Field(default=0, ge=0)
+
+    @property
+    def enabled(self) -> bool:
+        return self.settings.get("enabled") is True
 
 
 AgentState = Literal["running", "idle", "error"]
@@ -267,6 +306,9 @@ class TradingStatus(BaseModel):
     """Intent (snapshot) + agent liveness (heartbeat) for the UI."""
 
     desired: RuntimeSnapshot
+    #: The desired real-trading switch and limits; the agent's actual mode is
+    #: ``actual.execution.mode``.
+    execution: ExecutionSnapshot = Field(default_factory=ExecutionSnapshot)
     actual: AgentHeartbeat | None
     online: bool
 
@@ -306,6 +348,8 @@ class StrategyCatalog(BaseModel):
     published_at: str | None = None
     lookups: dict[str, dict[str, int]] = Field(default_factory=dict)
     strategies: list[StrategyDescription] = Field(default_factory=list)
+    #: The real-trading settings section, in the same shape as a strategy.
+    execution: StrategyDescription | None = None
 
 
 class SymbolEntry(BaseModel):
@@ -647,7 +691,8 @@ async def _apply_command(
                     snapshot.strategy = payload["strategy"]
                     snapshot.symbols = list(payload["symbols"])
                     snapshot.params = dict(payload["params"])
-                    snapshot.execution = dict(payload.get("execution") or {})
+                    # Real trading has its own key: an old value is dropped.
+                    snapshot.execution = {}
                 else:
                     # Stopping changes intent, not the saved configuration for the UI.
                     snapshot.running = False
@@ -685,8 +730,125 @@ def _start_command_payload(parsed: StartPayload) -> dict[str, Any]:
         "strategy": parsed.strategy,
         "symbols": [str(s).upper() for s in parsed.symbols],
         "params": dict(parsed.params),
-        "execution": dict(parsed.execution),
     }
+
+
+def _parse_execution(raw: str | None) -> ExecutionSnapshot:
+    """The stored document; an unreadable one reads as off so it can be
+    overwritten (the agent refuses it at boot the same way)."""
+    if not raw:
+        return ExecutionSnapshot()
+    try:
+        return ExecutionSnapshot.model_validate_json(raw)
+    except ValidationError:
+        logger.error("agent:execution is unreadable; treated as off")
+        return ExecutionSnapshot()
+
+
+async def _get_execution() -> ExecutionSnapshot:
+    redis = get_redis()
+    try:
+        raw = await redis.get(REDIS_EXECUTION_KEY)
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    return _parse_execution(raw)
+
+
+def _usdt_only(quote: Any, loc: list[Any]) -> HTTPException:
+    return HTTPException(
+        status_code=422,
+        detail=[
+            {
+                "loc": loc,
+                "msg": f"real trading supports USDT only; quote_asset={quote} "
+                "can run with real trading off",
+                "type": "value_error",
+            }
+        ],
+    )
+
+
+def _quote_of(params: dict[str, Any]) -> str:
+    return str(params.get("quote_asset") or "USDT")
+
+
+async def _refuse_quote_while_trading(params: dict[str, Any]) -> None:
+    """A Start the agent would refuse while real trading is on, refused here."""
+    if _quote_of(params) != "USDT" and (await _get_execution()).enabled:
+        raise _usdt_only(_quote_of(params), ["body", "params", "quote_asset"])
+
+
+async def _configure_execution(request: ExecutionRequest) -> CommandEnvelope:
+    """Validate, store and send the owner's real-trading settings.
+
+    The document and the command are written by one script (compare-and-set
+    on the document, then ``XADD``), like a Start: the agent restores the
+    document at boot and applies the command now. Nothing about the running
+    strategy or its network changes.
+    """
+    section = await _compiled_execution()
+    try:
+        errors = [
+            {**error, "loc": _execution_loc(error.get("loc") or [])}
+            for error in section.validate(request.settings)
+        ]
+    except CatalogError as exc:
+        logger.error("execution settings not evaluable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="the agent's execution settings cannot be evaluated",
+        ) from exc
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    settings = dict(request.settings)
+    if settings.get("enabled") is True:
+        # The agent refuses this too; saying it here keeps a refused switch
+        # from being stored ON (review 869fgqxah, P2-3).
+        desired = await _get_snapshot()
+        # Only a running strategy is checked, as the agent does; a stopped
+        # one is checked by its next Start (_refuse_quote_while_trading).
+        if (
+            desired is not None
+            and desired.running
+            and _quote_of(desired.params) != "USDT"
+        ):
+            raise _usdt_only(_quote_of(desired.params), ["body", "settings", "enabled"])
+    envelope = CommandEnvelope(
+        id=uuid.uuid4(),
+        type="execution_configure",
+        payload={"settings": settings},
+        issued_at=_now(),
+    )
+    redis = get_redis()
+    try:
+        while True:
+            raw = await redis.get(REDIS_EXECUTION_KEY)
+            current = _parse_execution(raw)
+            document = ExecutionSnapshot(
+                settings=settings,
+                updated_at=envelope.issued_at,
+                revision=current.revision + 1,
+            )
+            committed = await redis.execute_command(  # type: ignore[no-untyped-call]
+                "EVAL",
+                COMMIT_RUNTIME_LUA,
+                2,
+                REDIS_EXECUTION_KEY,
+                REDIS_START_FENCE_KEY,
+                raw if raw is not None else "",
+                document.model_dump_json(),
+                REDIS_COMMAND_STREAM,
+                envelope.model_dump_json(),
+                str(COMMAND_STREAM_MAXLEN),
+                "0",
+            )
+            if committed:
+                break
+    except RedisError as exc:
+        raise _redis_unavailable(exc) from exc
+    logger.info("real trading set %s", "on" if document.enabled else "off")
+    await _record_command_accepted(envelope, network=None)
+    return envelope
 
 
 def _params_loc(loc: list[Any]) -> list[Any]:
@@ -699,13 +861,13 @@ def _params_loc(loc: list[Any]) -> list[Any]:
 
 
 def _execution_loc(loc: list[Any]) -> list[Any]:
-    """Point an error of the execution section at ``body.execution``.
+    """Point an error of the execution section at ``body.settings``.
 
     The compiled section reports rule failures under ``body.params`` (its
     strategy-shaped origin) and field errors by field name alone.
     """
     rest = loc[2:] if loc[:2] == ["body", "params"] else loc
-    return ["body", "execution", *rest]
+    return ["body", "settings", *rest]
 
 
 async def _compiled_execution() -> CompiledStrategy:
@@ -715,6 +877,13 @@ async def _compiled_execution() -> CompiledStrategy:
         catalog = await read_catalog(redis)
     except RedisError as exc:
         raise _redis_unavailable(exc) from exc
+    except CatalogError as exc:
+        logger.error("strategy catalog unusable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="the agent's catalog cannot be used; refusing to validate "
+            "execution settings",
+        ) from exc
     if catalog is None or catalog.execution is None:
         raise HTTPException(
             status_code=503,
@@ -791,10 +960,7 @@ def strategy_params_errors(
 
 
 async def _enforce_strategy_params(
-    strategy: str,
-    params: dict[str, Any],
-    execution: dict[str, Any] | None,
-    session: Session,
+    strategy: str, params: dict[str, Any], session: Session
 ) -> None:
     """Reject an invalid Start here, so nothing invalid reaches Redis.
 
@@ -805,12 +971,6 @@ async def _enforce_strategy_params(
     compiled = await _compiled_strategy(strategy)
     try:
         errors = strategy_params_errors(compiled, params, session)
-        if execution:
-            section = await _compiled_execution()
-            errors += [
-                {**error, "loc": _execution_loc(error.get("loc") or [])}
-                for error in section.validate(execution)
-            ]
     except CatalogError as exc:
         logger.error("strategy catalog not evaluable: %s", exc)
         raise HTTPException(
@@ -840,6 +1000,15 @@ def _catalog_response(catalog: CompiledCatalog | None) -> StrategyCatalog:
             )
             for s in catalog.strategies.values()
         ],
+        execution=StrategyDescription(
+            name=catalog.execution.name,
+            label=catalog.execution.label,
+            description=catalog.execution.description,
+            settings_schema=catalog.execution.settings_schema,
+            constraints=catalog.execution.constraints,
+        )
+        if catalog.execution is not None
+        else None,
     )
 
 
@@ -1004,9 +1173,8 @@ async def issue_command(
             parsed = StartPayload(**request.payload)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=json_safe_errors(exc)) from exc
-        await _enforce_strategy_params(
-            parsed.strategy, parsed.params, parsed.execution, session
-        )
+        await _enforce_strategy_params(parsed.strategy, parsed.params, session)
+        await _refuse_quote_while_trading(parsed.params)
         return await _apply_command("start", _start_command_payload(parsed))
     if request.type == "balance":
         return await _apply_command("balance", request.payload)
@@ -1054,6 +1222,12 @@ async def issue_command(
     if request.type in ("execution_pause", "execution_resume"):
         # Entries only; positions, protection and exits are not affected.
         return await _apply_command(request.type, {})
+    if request.type == "execution_configure":
+        try:
+            body = ExecutionRequest(**request.payload)
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=json_safe_errors(exc)) from exc
+        return await _configure_execution(body)
     # Unreachable while CommandType lists every type: the branches above are
     # exhaustive on purpose, so a new type cannot silently become a stop.
     raise HTTPException(  # pragma: no cover
@@ -1067,9 +1241,8 @@ async def start_trading(
 ) -> CommandEnvelope:
     """Convenience alias: start trading on a network with a strategy."""
     await _refuse_start_if_fenced()
-    await _enforce_strategy_params(
-        payload.strategy, payload.params, payload.execution, session
-    )
+    await _enforce_strategy_params(payload.strategy, payload.params, session)
+    await _refuse_quote_while_trading(payload.params)
     return await _apply_command("start", _start_command_payload(payload))
 
 
@@ -1077,6 +1250,25 @@ async def start_trading(
 async def stop_trading(_: SuperUserDep) -> CommandEnvelope:
     """Convenience alias: stop trading."""
     return await _apply_command("stop", {})
+
+
+@router.get("/execution/", response_model=ExecutionSnapshot)
+async def get_execution(_: SuperUserDep) -> ExecutionSnapshot:
+    """The desired real-trading switch and limits (defaults: off)."""
+    return await _get_execution()
+
+
+@router.post("/execution/", status_code=202, response_model=CommandEnvelope)
+async def configure_execution(
+    request: ExecutionRequest, _: SuperUserDep
+) -> CommandEnvelope:
+    """Turn real trading on or off and set its limits — apart from any Start.
+
+    202 only acknowledges the command; the agent may still refuse it (no
+    migrated database, a running strategy not quoted in USDT) and reports
+    that through ``/result/``, its mode through ``/status/``.
+    """
+    return await _configure_execution(request)
 
 
 @router.post("/balance/", status_code=202, response_model=CommandEnvelope)
@@ -1198,6 +1390,7 @@ async def get_status(_: SuperUserDep) -> TradingStatus:
 
     return TradingStatus(
         desired=snapshot or RuntimeSnapshot(updated_at=_now()),
+        execution=await _get_execution(),
         actual=heartbeat,
         online=online,
     )

@@ -100,11 +100,8 @@ async def world(usdt: str = "100", **settings: Any) -> AsyncIterator[World]:
                 "live", fake.spot(), budget=RequestBudget()
             ),
         )
-        await runtime.prepare_start(
-            network="live",
-            settings=ExecutionSettings(enabled=True, **settings),
-            params={"quote_asset": "USDT"},
-        )
+        runtime.settings = ExecutionSettings(enabled=True, **settings)
+        await runtime.prepare_start(network="live", params={"quote_asset": "USDT"})
         runtime.open_admission("tripple_screen")
         try:
             yield World(db, url, fake, runtime)

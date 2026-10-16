@@ -1,4 +1,5 @@
 import type { TradingStatus } from "@/client"
+import { executionModeLabel } from "@/components/ExecutionControl"
 import {
   Table,
   TableBody,
@@ -44,6 +45,10 @@ export function TradingStatusView({
       </p>
       <p>Actual network: {actual?.network?.toUpperCase() ?? "unknown"}</p>
       <p>Actual strategy: {actual?.strategy ?? "unknown"}</p>
+      <p>
+        Real trading: {executionModeLabel(actual?.execution?.mode)}
+        {stale && actual ? " (stale)" : ""}
+      </p>
       {actual && <p>Heartbeat: {actual.updated_at}</p>}
       {actual?.message && (
         // One entry per line, and a bounded box: dozens of execution
@@ -64,6 +69,10 @@ export function TradingStatusView({
       <p>Desired state: {desired.running ? "running" : "stopped"}</p>
       <p>Desired network: {desired.network?.toUpperCase()}</p>
       <p>Desired strategy: {desired.strategy ?? "none"}</p>
+      <p>
+        Desired real trading:{" "}
+        {status.execution?.settings?.enabled === true ? "on" : "off"}
+      </p>
       <details>
         <summary className="cursor-pointer select-none">
           Desired symbols ({desired.symbols?.length ?? 0})

@@ -20,14 +20,14 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from fake_exchange import FakeExchange
 from pg import scratch_database
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from test_engine_lifecycle import setup_engine, start
 
 from agent.core.migrate import migrate
 from agent.exchange.budget import RequestBudget
 from agent.exchange.rest import ExchangeError
-from agent.exchange.trade import TradeClient
+from agent.exchange.trade import TradeCallError, TradeClient
 from agent.execution.models import (
     AttemptState,
     OrderAttempt,
@@ -129,8 +129,10 @@ def position(account: str = "1001", network: str = "live") -> Position:
 def test_a_second_runtime_on_the_same_database_does_not_lead() -> None:
     async def scenario(state: World) -> None:
         first, second = state.runtime(), state.runtime()
-        await first.prepare_start(network="live", settings=ENABLED, params=USDT)
-        await second.prepare_start(network="live", settings=ENABLED, params=USDT)
+        first.settings = ENABLED
+        await first.prepare_start(network="live", params=USDT)
+        second.settings = ENABLED
+        await second.prepare_start(network="live", params=USDT)
         assert first.may_mutate() and not second.may_mutate()
         first.open_admission("tripple_screen")
         second.open_admission("tripple_screen")
@@ -157,8 +159,10 @@ def test_losing_the_lock_session_hands_over_after_reconcile() -> None:
 
         first.on_leadership(hook("first", first))
         second.on_leadership(hook("second", second))
-        await first.prepare_start(network="live", settings=ENABLED, params=USDT)
-        await second.prepare_start(network="live", settings=ENABLED, params=USDT)
+        first.settings = ENABLED
+        await first.prepare_start(network="live", params=USDT)
+        second.settings = ENABLED
+        await second.prepare_start(network="live", params=USDT)
         assert first.lock is not None
         pid = await first.lock.backend_pid()
         async with state.db.connect() as admin:
@@ -193,7 +197,8 @@ def test_failed_startup_reconcile_is_retried_while_the_lock_is_held() -> None:
         runtime = state.runtime()
         calls, reconcile = _flaky_reconcile(failures=2)
         runtime.on_leadership(reconcile)
-        await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
+        runtime.settings = ENABLED
+        await runtime.prepare_start(network="live", params=USDT)
         assert runtime.lock is not None and runtime.lock.held
         assert not runtime.may_mutate()
         assert "ticker price timed out" in runtime.alerts["reconcile"]
@@ -246,10 +251,9 @@ def test_live_position_refuses_a_testnet_start_and_survives_a_restart() -> None:
         await runtime.boot()
         assert runtime.context == ExecutionContext("1001", "live")
         assert runtime.may_mutate() and runtime.open_positions == 1
+        runtime.settings = ENABLED
         with pytest.raises(ContextRefused, match="on live"):
-            await runtime.prepare_start(
-                network="testnet", settings=ENABLED, params=USDT
-            )
+            await runtime.prepare_start(network="testnet", params=USDT)
         assert runtime.context == ExecutionContext("1001", "live")
         await runtime.shutdown()
 
@@ -292,8 +296,9 @@ def test_unknown_buy_without_a_position_restores_its_context() -> None:
         runtime = state.runtime()
         await runtime.boot()
         assert runtime.context == ExecutionContext("1001", "testnet")
+        runtime.settings = ENABLED
         with pytest.raises(ContextRefused):
-            await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
+            await runtime.prepare_start(network="live", params=USDT)
 
     run(scenario)
 
@@ -305,8 +310,9 @@ def test_other_account_behind_the_credentials_is_refused() -> None:
         await runtime.boot()
         assert runtime.context is None and not runtime.may_mutate()
         assert "work belongs to 999" in runtime.alerts["restore"]
+        runtime.settings = ENABLED
         with pytest.raises(ValueError, match="could not be restored"):
-            await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
+            await runtime.prepare_start(network="live", params=USDT)
 
     run(scenario)
 
@@ -314,11 +320,14 @@ def test_other_account_behind_the_credentials_is_refused() -> None:
 def test_switching_network_is_free_without_unfinished_work() -> None:
     async def scenario(state: World) -> None:
         runtime = state.runtime()
-        await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
-        await runtime.prepare_start(network="testnet", settings=ENABLED, params=USDT)
+        runtime.settings = ENABLED
+        await runtime.prepare_start(network="live", params=USDT)
+        runtime.settings = ENABLED
+        await runtime.prepare_start(network="testnet", params=USDT)
         assert runtime.context == ExecutionContext("1001", "testnet")
         other = state.runtime()
-        await other.prepare_start(network="live", settings=ENABLED, params=USDT)
+        other.settings = ENABLED
+        await other.prepare_start(network="live", params=USDT)
         assert other.may_mutate()  # the live lock was released
 
     run(scenario)
@@ -330,13 +339,12 @@ def test_switching_network_is_free_without_unfinished_work() -> None:
 def test_admission_follows_settings_stop_and_pause() -> None:
     async def scenario(state: World) -> None:
         runtime = state.runtime()
-        await runtime.prepare_start(
-            network="live", settings=ExecutionSettings(), params=USDT
-        )
+        await runtime.prepare_start(network="live", params=USDT)
         runtime.open_admission("tripple_screen")
         assert runtime.admission_block() == "execution_off"
         assert runtime.heartbeat()["mode"] == "off"
-        await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
+        runtime.configure(ENABLED)
+        await runtime.tick()  # the lock and the reconciliation follow
         assert runtime.admission_block() is None
         assert runtime.heartbeat()["mode"] == "enabled"
         runtime.pause()
@@ -352,13 +360,11 @@ def test_admission_follows_settings_stop_and_pause() -> None:
 def test_real_execution_is_usdt_only() -> None:
     async def scenario(state: World) -> None:
         runtime = state.runtime()
+        runtime.settings = ENABLED
         with pytest.raises(ValueError, match="USDT only"):
-            await runtime.prepare_start(
-                network="live", settings=ENABLED, params={"quote_asset": "USDC"}
-            )
-        await runtime.prepare_start(
-            network="live", settings=ExecutionSettings(), params={"quote_asset": "USDC"}
-        )
+            await runtime.prepare_start(network="live", params={"quote_asset": "USDC"})
+        runtime.settings = ExecutionSettings()
+        await runtime.prepare_start(network="live", params={"quote_asset": "USDC"})
 
     run(scenario)
 
@@ -367,7 +373,8 @@ def test_key_without_spot_trading_keeps_entries_closed() -> None:
     async def scenario(state: World) -> None:
         state.exchange("live").can_trade = False
         runtime = state.runtime()
-        await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
+        runtime.settings = ENABLED
+        await runtime.prepare_start(network="live", params=USDT)
         runtime.open_admission("tripple_screen")
         assert runtime.admission_block() == "key"
         assert "cannot trade spot" in runtime.alerts["key"]
@@ -381,7 +388,8 @@ def test_skewed_clock_closes_admission_and_low_bnb_warns() -> None:
         fake._clock = lambda: wall_clock() + 10_000
         fake.free["BNB"] = Decimal(0)
         runtime = state.runtime()
-        await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
+        runtime.settings = ENABLED
+        await runtime.prepare_start(network="live", params=USDT)
         runtime.open_admission("tripple_screen")
         assert runtime.admission_block() == "clock"
         assert "bnb" in runtime.alerts
@@ -396,10 +404,13 @@ def test_without_a_migrated_database_real_execution_is_refused() -> None:
         await runtime.boot()
         assert "schema" in runtime.alerts
         with pytest.raises(ValueError, match="database is not ready"):
-            await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
-        await runtime.prepare_start(
-            network="live", settings=ExecutionSettings(), params=USDT
-        )
+            runtime.configure(ENABLED)
+        assert not runtime.settings.enabled
+        runtime.settings = ENABLED  # as if set before the schema went away
+        with pytest.raises(ValueError, match="database is not ready"):
+            await runtime.prepare_start(network="live", params=USDT)
+        runtime.settings = ExecutionSettings()
+        await runtime.prepare_start(network="live", params=USDT)
 
     run(scenario)
 
@@ -437,15 +448,132 @@ def test_refused_start_leaves_the_current_run_and_stop_only_closes_admission(
     asyncio.run(scenario())
 
 
-def test_invalid_execution_settings_refuse_the_start(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def scenario() -> None:
-        engine, *_ = setup_engine(monkeypatch)
-        with pytest.raises(ValueError):
-            await start(engine, execution={"enabled": True, "max_slippage_pct": 50})
-        with pytest.raises(ValueError):
-            await start(engine, execution={"unknown": 1})
-        assert not engine.running
+# --- real trading is the owner's switch, not the Start's (ClickUp 869fgqxah) ------
 
-    asyncio.run(scenario())
+
+def _counting_reconcile() -> tuple[list[ExecutionContext], Any]:
+    seen: list[ExecutionContext] = []
+
+    async def reconcile(context: ExecutionContext) -> None:
+        seen.append(context)
+
+    return seen, reconcile
+
+
+def test_a_start_with_trading_off_identifies_the_account_but_does_not_lead() -> None:
+    # 2026-10-13: a testnet Start timed out in the reconciliation of ~490
+    # faucet balances although real trading was off.
+    async def scenario(state: World) -> None:
+        runtime = state.runtime()
+        seen, reconcile = _counting_reconcile()
+        runtime.on_leadership(reconcile)
+        await runtime.prepare_start(network="testnet", params=USDT)
+        assert runtime.context == ExecutionContext("1001", "testnet")
+        assert runtime.lock is None and seen == []
+        await runtime.tick()
+        assert runtime.lock is None and seen == []
+        assert runtime.heartbeat()["mode"] == "off"
+        # Another process may lead the same context meanwhile.
+        other = state.runtime()
+        other.configure(ENABLED)
+        await other.prepare_start(network="testnet", params=USDT)
+        assert other.may_mutate()
+
+    run(scenario)
+
+
+def test_the_switch_takes_and_gives_back_the_lead_without_a_start() -> None:
+    async def scenario(state: World) -> None:
+        runtime = state.runtime()
+        seen, reconcile = _counting_reconcile()
+        runtime.on_leadership(reconcile)
+        await runtime.prepare_start(network="live", params=USDT)
+        runtime.open_admission("tripple_screen")
+        runtime.configure(ENABLED)
+        assert runtime.admission_block() == "no_execution_lock"
+        await runtime.tick()
+        assert runtime.may_mutate() and len(seen) == 1
+        assert runtime.heartbeat()["mode"] == "enabled"
+        runtime.alerts["divergence:balance:ETHUSDT"] = "0.1 ETH held without a position"
+        runtime.configure(ExecutionSettings())
+        assert runtime.admission_block() == "execution_off"
+        await runtime.tick()
+        assert runtime.lock is None and not runtime.may_mutate()
+        assert runtime.context == ExecutionContext("1001", "live")
+        assert "divergence:balance:ETHUSDT" not in runtime.alerts
+        other = state.runtime()
+        other.configure(ENABLED)
+        await other.prepare_start(network="live", params=USDT)
+        assert other.may_mutate()  # the lock was given back
+
+    run(scenario)
+
+
+def test_trading_off_keeps_leading_while_work_is_unfinished() -> None:
+    async def scenario(state: World) -> None:
+        await add(state, position())
+        runtime = state.runtime()
+        await runtime.boot()
+        assert runtime.may_mutate() and not runtime.settings.enabled
+        await runtime.tick()
+        assert runtime.may_mutate()  # the open position is still accompanied
+        async with runtime.session() as session:
+            row = (await session.scalars(select(Position))).one()
+            row.status = PositionStatus.CLOSED
+            await session.commit()
+        await runtime.tick()
+        assert runtime.lock is None
+
+    run(scenario)
+
+
+def test_with_trading_off_an_unreachable_account_does_not_refuse_the_start() -> None:
+    async def scenario(state: World) -> None:
+        runtime = state.runtime()
+        fake = state.exchange("testnet")
+        fake.fault("get_account", "reject")
+        await runtime.prepare_start(network="testnet", params=USDT)
+        assert runtime.context is None
+        assert "cannot identify the account on testnet" in runtime.alerts["context"]
+        await runtime.tick()
+        assert runtime.context == ExecutionContext("1001", "testnet")
+        assert "context" not in runtime.alerts
+        # With real trading on, the same failure refuses the Start.
+        enabled = state.runtime()
+        enabled.configure(ENABLED)
+        fake.fault("get_account", "reject")
+        with pytest.raises(TradeCallError):
+            await enabled.prepare_start(network="testnet", params=USDT)
+
+    run(scenario)
+
+
+def test_a_refused_start_with_trading_on_leaves_execution_on_its_network() -> None:
+    # Review 869fgqxah, P2-2: the target moved before the new network was
+    # entered, so the watchdog led LIVE while the strategy stayed on testnet.
+    async def scenario(state: World) -> None:
+        runtime = state.runtime()
+        runtime.configure(ENABLED)
+        await runtime.prepare_start(network="testnet", params=USDT)
+        assert runtime.context == ExecutionContext("1001", "testnet")
+        state.exchange("live").fault("get_account", "reject")
+        with pytest.raises(TradeCallError):
+            await runtime.prepare_start(network="live", params=USDT)
+        assert runtime.target_network == "testnet"
+        await runtime.tick()
+        assert runtime.context == ExecutionContext("1001", "testnet")
+        assert runtime.may_mutate()
+
+    run(scenario)
+
+
+def test_configuring_changes_the_risk_version() -> None:
+    async def scenario(state: World) -> None:
+        runtime = state.runtime()
+        before = runtime.risk_version
+        runtime.configure(ExecutionSettings())
+        assert runtime.risk_version == before  # the same settings: no change
+        runtime.configure(ExecutionSettings(daily_losing_trades_limit=1))
+        assert runtime.risk_version == before + 1
+
+    run(scenario)

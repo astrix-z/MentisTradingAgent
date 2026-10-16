@@ -78,7 +78,8 @@ def test_a_stopped_idle_engine_with_a_protected_position_is_not_finished(
         engine, *_ = setup_engine(monkeypatch)
         runtime = state.runtime()
         engine.execution = runtime
-        await runtime.prepare_start(network="live", settings=ENABLED, params=USDT)
+        runtime.settings = ENABLED
+        await runtime.prepare_start(network="live", params=USDT)
         await start(engine, network="live")
         await add(state, position())
         await engine.stop()
