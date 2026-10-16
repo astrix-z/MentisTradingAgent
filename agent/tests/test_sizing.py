@@ -165,6 +165,10 @@ def test_real_rules_parse_without_unknown_filters() -> None:
     for filters in REAL.values():
         assert filters.unknown == ()
         assert filters.oco_allowed and "STOP_LOSS" in filters.order_types
+        # The live account is in trading group 072, not on SPOT (2026-10-16).
+        assert filters.permits(frozenset({"TRD_GRP_072"}))
+        assert filters.permits(frozenset({"SPOT"}))
+        assert not filters.permits(frozenset({"TRD_GRP_999"}))
 
 
 @pytest.mark.parametrize(
@@ -400,6 +404,32 @@ def test_symbol_level_refusals() -> None:
         with pytest.raises(EntryRejected) as caught:
             check_symbol(filters, PARAMS)
         assert caught.value.reason is reason
+
+
+def test_symbol_permission_sets_against_the_account() -> None:
+    """Every set needs one of the account's permissions (Binance semantics)."""
+    group = frozenset({"TRD_GRP_072"})
+    spot = frozenset({"SPOT"})
+    one_set = simple(permission_sets=(frozenset({"SPOT", "TRD_GRP_072"}),))
+    check_symbol(one_set, PARAMS, group)
+    check_symbol(one_set, PARAMS, spot)
+    check_symbol(simple(), PARAMS, group)  # no sets: unrestricted
+    check_symbol(
+        simple(permission_sets=(frozenset({"SPOT", "TRD_GRP_004"}),)), PARAMS
+    )  # no account permissions given: not checked
+    for filters in (
+        simple(permission_sets=(frozenset({"SPOT", "TRD_GRP_004"}),)),
+        simple(
+            permission_sets=(
+                frozenset({"SPOT", "TRD_GRP_072"}),
+                frozenset({"TRD_GRP_005"}),
+            )
+        ),
+    ):
+        with pytest.raises(EntryRejected) as caught:
+            check_symbol(filters, PARAMS, group)
+        assert caught.value.reason is Skip.SYMBOL_NOT_PERMITTED
+        assert "TRD_GRP_072" in caught.value.detail
 
 
 def test_max_position_limits_the_entry() -> None:

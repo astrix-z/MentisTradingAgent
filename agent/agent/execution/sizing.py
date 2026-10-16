@@ -44,6 +44,7 @@ class Skip(StrEnum):
 
     QUOTE_NOT_SUPPORTED = "quote_not_supported"
     SYMBOL_NOT_TRADING = "symbol_not_trading"
+    SYMBOL_NOT_PERMITTED = "symbol_not_permitted"
     OCO_NOT_ALLOWED = "oco_not_allowed"
     ORDER_TYPE_NOT_ALLOWED = "order_type_not_allowed"
     UNKNOWN_FILTER = "unknown_filter"
@@ -363,8 +364,16 @@ class EntryPlan:
         }
 
 
-def check_symbol(filters: SymbolFilters, params: SizingParams) -> str:
-    """Raise unless the symbol can be traded and protected; return stop type."""
+def check_symbol(
+    filters: SymbolFilters,
+    params: SizingParams,
+    account_permissions: frozenset[str] | None = None,
+) -> str:
+    """Raise unless the symbol can be traded and protected; return stop type.
+
+    ``account_permissions`` (the account's ``permissions``) are checked
+    against the symbol's permission sets when given.
+    """
     if filters.quote_asset != params.quote_asset:
         raise EntryRejected(
             Skip.QUOTE_NOT_SUPPORTED,
@@ -373,6 +382,12 @@ def check_symbol(filters: SymbolFilters, params: SizingParams) -> str:
         )
     if not filters.tradable:
         raise EntryRejected(Skip.SYMBOL_NOT_TRADING, filters.status)
+    if account_permissions is not None and not filters.permits(account_permissions):
+        raise EntryRejected(
+            Skip.SYMBOL_NOT_PERMITTED,
+            f"account permissions {sorted(account_permissions)} "
+            f"are not allowed on {filters.symbol}",
+        )
     if not filters.oco_allowed:
         raise EntryRejected(Skip.OCO_NOT_ALLOWED)
     if filters.unknown:
@@ -398,6 +413,7 @@ def plan_entry(
     free_quote: Decimal,
     reserved_quote: Decimal,
     occupied_slots: int,
+    account_permissions: frozenset[str] | None = None,
 ) -> EntryPlan:
     """Size one ENTRY and check every order it will lead to.
 
@@ -405,7 +421,7 @@ def plan_entry(
     ``reserved_quote`` is what those pending and UNKNOWN entries still hold.
     Raises :class:`EntryRejected`.
     """
-    stop_type = check_symbol(filters, params)
+    stop_type = check_symbol(filters, params, account_permissions)
     slots = slots_for(total_equity, params)
     if slots.slots == 0:
         raise EntryRejected(
