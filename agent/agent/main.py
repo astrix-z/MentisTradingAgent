@@ -175,6 +175,7 @@ _INDEPENDENT_COMMANDS = (
     "execution_pause",
     "execution_resume",
     "close_position",
+    "write_off_position",
     "release_entry",
 )
 

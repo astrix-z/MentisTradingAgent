@@ -466,6 +466,8 @@ def test_cache_reads_sdk_models_and_raw_json_and_refetches_after_invalidate() ->
         calls.append(symbol)
         if len(calls) == 2:
             return {"symbols": RAW["symbols"]}  # the SDK fell back to raw JSON
+        if symbol not in fake.rules:
+            return {"symbols": []}  # an answer without the symbol
         return fake.exchange_info(symbol=symbol).data()
 
     cache = FilterCache(fetch, ttl=60, clock=lambda: moment[0])

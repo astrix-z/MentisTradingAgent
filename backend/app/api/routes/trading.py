@@ -141,6 +141,7 @@ CommandType = Literal[
     "execution_resume",
     "execution_configure",
     "close_position",
+    "write_off_position",
     "release_entry",
 ]
 
@@ -1204,6 +1205,10 @@ async def issue_command(
                 ],
             )
         return await _apply_command("close_position", {"symbol": symbol})
+    if request.type == "write_off_position":
+        return await _apply_command(
+            "write_off_position", _write_off_payload(request.payload)
+        )
     if request.type == "release_entry":
         # The agent proves the order absent itself; this only checks the shape.
         cid = str(request.payload.get("client_order_id") or "").strip()
@@ -1233,6 +1238,40 @@ async def issue_command(
     raise HTTPException(  # pragma: no cover
         status_code=422, detail=f"unknown command type {request.type!r}"
     )
+
+
+def _write_off_payload(payload: dict[str, Any]) -> dict[str, str]:
+    """Shape of ``write_off_position``; the agent checks the exchange itself.
+
+    ``confirm`` repeats the symbol so a write-off cannot be sent by a slip;
+    ``proceeds_quote`` (default 0) is what the owner got for the asset.
+    """
+
+    def refuse(field: str, message: str) -> HTTPException:
+        return HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "loc": ["body", "payload", field],
+                    "msg": message,
+                    "type": "value_error",
+                }
+            ],
+        )
+
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    if _SYMBOL_RE.fullmatch(symbol) is None:
+        raise refuse("symbol", "a valid symbol is required")
+    if str(payload.get("confirm") or "").strip().upper() != symbol:
+        raise refuse("confirm", "confirm must repeat the symbol")
+    raw = payload.get("proceeds_quote")
+    try:
+        proceeds = Decimal(str(raw)) if raw not in (None, "") else Decimal(0)
+    except InvalidOperation:
+        proceeds = Decimal("NaN")
+    if isinstance(raw, bool) or not proceeds.is_finite() or proceeds < 0:
+        raise refuse("proceeds_quote", "a non-negative amount is required")
+    return {"symbol": symbol, "confirm": symbol, "proceeds_quote": str(proceeds)}
 
 
 @router.post("/start/", status_code=202, response_model=CommandEnvelope)

@@ -1595,6 +1595,46 @@ def test_close_position_needs_a_valid_symbol(
     assert trading.REDIS_RUNTIME_KEY not in redis.values
 
 
+def test_write_off_position_needs_a_symbol_its_confirmation_and_an_amount(
+    client: TestClient, redis: MemoryRedis
+) -> None:
+    for payload in (
+        {"symbol": "not a symbol", "confirm": "not a symbol"},
+        {"symbol": "BTCUSDT"},
+        {"symbol": "BTCUSDT", "confirm": "ETHUSDT"},
+        {"symbol": "BTCUSDT", "confirm": "BTCUSDT", "proceeds_quote": "-1"},
+        {"symbol": "BTCUSDT", "confirm": "BTCUSDT", "proceeds_quote": "NaN"},
+        {"symbol": "BTCUSDT", "confirm": "BTCUSDT", "proceeds_quote": "ten"},
+        {"symbol": "BTCUSDT", "confirm": "BTCUSDT", "proceeds_quote": True},
+    ):
+        refused = client.post(
+            "/api/v1/trading/commands/",
+            json={"type": "write_off_position", "payload": payload},
+            headers=headers(client),
+        )
+        assert refused.status_code == 422, payload
+    assert not redis.publications
+    accepted = client.post(
+        "/api/v1/trading/commands/",
+        json={
+            "type": "write_off_position",
+            "payload": {
+                "symbol": "btcusdt",
+                "confirm": " BTCUSDT ",
+                "proceeds_quote": 12.5,
+            },
+        },
+        headers=headers(client),
+    )
+    assert accepted.status_code == 202
+    assert redis.publications[0][1]["payload"] == {
+        "symbol": "BTCUSDT",
+        "confirm": "BTCUSDT",
+        "proceeds_quote": "12.5",
+    }
+    assert trading.REDIS_RUNTIME_KEY not in redis.values
+
+
 def test_release_entry_needs_an_entry_client_id(
     client: TestClient, redis: MemoryRedis
 ) -> None:
