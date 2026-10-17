@@ -189,7 +189,11 @@ class Exits:
             position = await self._position(position_id)
             if position.status == PositionStatus.CLOSED:
                 raise NoSuchPosition(f"no open position in {symbol}")
-            if await worker.not_trading(position) is None:
+            try:
+                status = await worker.not_trading(position, fresh=True)
+            except StatusUnknown as exc:
+                raise WriteOffRefused(f"{exc}; try again") from exc
+            if status is None:
                 raise WriteOffRefused(
                     f"{symbol} trades: sell it with close_position instead"
                 )

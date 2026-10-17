@@ -22,7 +22,13 @@ from agent.execution.exits import (
     WriteOffRefused,
 )
 from agent.execution.ledger import losing_trades_today
-from agent.execution.models import ExecutionEvent, PositionStatus
+from agent.execution.models import (
+    ExecutionEvent,
+    Fill,
+    Position,
+    PositionStatus,
+    SymbolCooldown,
+)
 from agent.execution.monitor import MonitorFeed
 from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.protection import Step
@@ -536,5 +542,96 @@ def test_write_off_position_command_reports_the_outcome() -> None:
             "step": "closed",
             "proceeds_quote": "3.25",
         }
+
+    run(scenario)
+
+
+def test_write_off_reads_the_status_anew() -> None:
+    # Review of #37: a halt cached before trading resumed let the write-off
+    # through with zero proceeds.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        halt(state)
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.step is Step.WAITING  # the halt is cached and alerted
+        state.fake.rules["BTCUSDT"].status = "TRADING"  # the cache is not told
+        with pytest.raises(WriteOffRefused, match="trades"):
+            await exits.write_off("BTCUSDT", confirm="BTCUSDT")
+        state.fake.fault("exchange_info", "reject", code=-1000, times=100)
+        with pytest.raises(WriteOffRefused, match="unknown"):
+            await exits.write_off("BTCUSDT", confirm="BTCUSDT")
+        assert (
+            await state.position(stack, position_id)
+        ).status == PositionStatus.PROTECTED
+
+    run(scenario)
+
+
+def test_write_off_closes_on_its_own_day_after_an_old_partial_sell() -> None:
+    # Review of #37: the close, the loss day and the cooldown followed the
+    # last SELL, two days before the write-off.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        sold_at = state.clock.now()
+        async with stack.runtime.session() as session, session.begin():
+            position = await session.get(Position, position_id)
+            assert position is not None
+            session.add(
+                Fill(
+                    account=position.account,
+                    network=position.network,
+                    symbol=position.symbol,
+                    trade_id=9_000_001,
+                    order_id=9_000_001,
+                    position_id=position_id,
+                    side="SELL",
+                    price=Decimal(110),
+                    quantity=Decimal("0.01"),
+                    quote_quantity=Decimal("1.1"),
+                    commission=Decimal(0),
+                    commission_asset="USDT",
+                    commission_quote=Decimal(0),
+                    is_maker=True,
+                    trade_time=sold_at,
+                    source="my_trades",
+                )
+            )
+            position.sold_qty += Decimal("0.01")
+            position.sold_quote += Decimal("1.1")
+            position.quantity -= Decimal("0.01")
+        state.clock.advance(2 * 86400)
+        delist(state, stack)
+        result = await exits.write_off("BTCUSDT", confirm="BTCUSDT")
+        assert result.step is Step.CLOSED
+        written_off = state.clock.now()
+        position = await state.position(stack, position_id)
+        assert position.realized_pnl is not None and position.realized_pnl < 0
+        assert position.closed_at is not None
+        assert abs((position.closed_at - written_off).total_seconds()) < 1
+        async with stack.runtime.session() as session:
+            assert await losing_trades_today(session, "1001", "live", written_off) == 1
+            assert await losing_trades_today(session, "1001", "live", sold_at) == 0
+            cooldown = await session.scalar(
+                select(SymbolCooldown.cooldown_until).where(
+                    SymbolCooldown.symbol == "BTCUSDT"
+                )
+            )
+        assert cooldown is not None and cooldown > written_off
+
+        # A late reconcile retimes the position: it keeps the write-off's day.
+        async with stack.runtime.session() as session, session.begin():
+            locked = await session.get(Position, position_id, with_for_update=True)
+            assert locked is not None
+            await stack.worker.protector.finalizer.retime(session, locked)
+        position = await state.position(stack, position_id)
+        assert position.closed_at is not None
+        assert abs((position.closed_at - written_off).total_seconds()) < 1
+        async with stack.runtime.session() as session:
+            assert await losing_trades_today(session, "1001", "live", written_off) == 1
+            assert await losing_trades_today(session, "1001", "live", sold_at) == 0
 
     run(scenario)

@@ -461,8 +461,13 @@ class Finalizer:
         reason: ExitReason,
         mechanism: ExitMechanism,
         order_ids: Iterable[str] = (),
+        closed_at: datetime | None = None,
     ) -> ExecutionOutcome | None:
-        """Close ``position`` (locked by the caller); ``None`` if already closed."""
+        """Close ``position`` (locked by the caller); ``None`` if already closed.
+
+        It closes at its last SELL, or at ``closed_at`` when that is later (a
+        write-off: the remainder leaves without a fill).
+        """
         if position.status == PositionStatus.CLOSED:
             return None
         estimated, pending = await self._fill_missing_commissions(session, position)
@@ -471,7 +476,7 @@ class Finalizer:
                 Fill.position_id == position.id, Fill.side == "SELL"
             )
         )
-        closed_at: datetime = last_sell or datetime.now(UTC)
+        closed_at = _latest(last_sell, closed_at) or datetime.now(UTC)
         pnl = position.sold_quote - position.bought_quote - position.commission_quote
         exit_vwap = (
             position.sold_quote / position.sold_qty if position.sold_qty > 0 else None
@@ -599,6 +604,10 @@ class Finalizer:
         )
         before = position.closed_at
         closed_at = last_sell or before or datetime.now(UTC)
+        if outcome.get("mechanism") == ExitMechanism.WRITE_OFF:
+            # Written off after its last SELL: corrected fill times move only
+            # a SELL that lands later still.
+            closed_at = _latest(last_sell, before) or closed_at
         pnl = position.sold_quote - position.bought_quote - position.commission_quote
         # A fee whose value was withdrawn with its old time is pending again.
         pending = sorted(
@@ -695,6 +704,10 @@ class Finalizer:
             position.commission_quote += fill.commission_quote
             estimated = True
         return estimated, pending
+
+
+def _latest(*moments: datetime | None) -> datetime | None:
+    return max((m for m in moments if m is not None), default=None)
 
 
 async def _count_losing(
