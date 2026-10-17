@@ -152,7 +152,7 @@ CLOCK_SKEW_WARN = timedelta(seconds=1)
 #: Alerts for exchange state no position or attempt explains (reconcile.py).
 _UNRESOLVED = ("divergence:", "quarantine:")
 #: Reconcile findings about one account/network, dropped when it is left.
-_CONTEXT_PREFIXES = (*_UNRESOLVED, "foreign_trades:")
+_CONTEXT_PREFIXES = (*_UNRESOLVED, "foreign_trades:", "halted:", "testnet_balances")
 
 LeadershipHook = Callable[["ExecutionContext"], Awaitable[None]]
 
@@ -239,6 +239,9 @@ class ExecutionRuntime:
         self._admission_wake: Callable[[], None] | None = None
         #: Sells a symbol's open position at market (``close_position``).
         self.close_position: Callable[[str], Awaitable[Any]] | None = None
+        #: Closes a delisted symbol's position without an order
+        #: (``write_off_position``): ``(symbol, confirm, proceeds)``.
+        self.write_off_position: Callable[..., Awaitable[Any]] | None = None
         #: Releases an entry proven never placed (``release_entry``).
         self.release_entry: Callable[[str], Awaitable[Any]] | None = None
 

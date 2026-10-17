@@ -19,6 +19,14 @@ from the ``unprotected_since`` recorded at step 1: when it passes the position
 becomes ``protection_overdue`` (alert, priority reconcile), but nothing is
 sold until the barrier has proven the remainder. A restart resumes the
 operation from the database.
+
+A symbol that does not trade (``HALT``, ``BREAK``, delisted) keeps its list:
+an operation that would cancel it is not started — nothing could be sold or
+placed in its stead, and the position would stay without a stop until trading
+resumes. The operation is asked for again on every round (time exit, trailing)
+and runs once the symbol trades. One recorded before the halt whose cancel was
+never sent is withdrawn the same way. Only a ``TRADING`` read just now lets a
+list be cancelled; a status that cannot be read keeps it too.
 """
 
 from __future__ import annotations
@@ -41,6 +49,15 @@ from agent.execution.runtime import NOT_LEADER
 logger = logging.getLogger(__name__)
 
 NOT_FOUND = frozenset({-2011, -2013})
+#: Alert of a symbol whose list is kept because it does not trade.
+HALTED = "halted:"
+#: Seconds a known halt may be old when it keeps a list; ``TRADING`` that lets
+#: a list be cancelled is always read anew.
+STATUS_MAX_AGE = 60.0
+
+
+class StatusUnknown(RuntimeError):
+    """The symbol's status could not be read: nothing may rely on it."""
 
 
 class Operation(StrEnum):
@@ -90,12 +107,78 @@ class PositionWorker:
 
     # --- the protocol ---------------------------------------------------------------------
 
+    async def not_trading(
+        self, position: Position, *, fresh: bool = False
+    ) -> str | None:
+        """Why the position's symbol takes no orders now, or ``None``.
+
+        ``None`` (it trades) is always read from the exchange just now. A halt
+        already alerted may come from the cache, up to ``STATUS_MAX_AGE``
+        seconds old, unless ``fresh``. Sets or clears the ``halted:`` alert;
+        raises :class:`StatusUnknown` when the status cannot be read.
+        """
+        alert = f"{HALTED}{position.symbol}"
+        known_halt = alert in self.runtime.alerts and not fresh
+        try:
+            filters = await self.orders.filters.get(
+                position.network,
+                position.symbol,
+                max_age=STATUS_MAX_AGE if known_halt else 0,
+            )
+            if filters.tradable and known_halt:
+                filters = await self.orders.filters.get(
+                    position.network, position.symbol, max_age=0
+                )
+        except LookupError:
+            status = "not listed"
+        except Exception as exc:
+            raise StatusUnknown(f"status of {position.symbol} unknown: {exc}") from exc
+        else:
+            if filters.tradable:
+                if self.runtime.alerts.pop(alert, None) is not None:
+                    logger.info("%s trades again", position.symbol)
+                return None
+            status = filters.status
+        if alert not in self.runtime.alerts:
+            logger.warning(
+                "%s is %s: its list stays, exits wait for trading",
+                position.symbol,
+                status,
+            )
+        self.runtime.alerts[alert] = (
+            f"{position.symbol} is {status}: protection kept on the exchange, "
+            "exits wait for trading"
+        )
+        return status
+
+    async def _halted(self, position: Position) -> StepResult | None:
+        """WAITING when cancelling the live list now would leave it unprotected."""
+        state = position.op_state or {}
+        if position.protection_list_id is None or (
+            state.get("list") == position.protection_list_id
+            and state.get("cancel") is not None
+        ):
+            return None
+        try:
+            status = await self.not_trading(position)
+        except StatusUnknown as exc:
+            logger.warning("%s: list kept", exc)
+            return StepResult(
+                Step.WAITING, f"{position.symbol} status unknown: list kept"
+            )
+        if status is None:
+            return None
+        return StepResult(Step.WAITING, f"{position.symbol} is {status}: list kept")
+
     async def _run(
         self, position_id: uuid.UUID, operation: Operation, target: dict[str, Any]
     ) -> StepResult:
         async with self.orders.lock_for(position_id):
             if not self.runtime.may_mutate():
                 return StepResult(Step.WAITING, "no execution lock")
+            halted = await self._halted(await self.protector._position(position_id))
+            if halted is not None:
+                return halted
             started = await self._record(position_id, operation, target)
             if started is not None:
                 return started
@@ -152,6 +235,11 @@ class PositionWorker:
         position = await self.protector._position(position_id)
         state = dict(position.op_state or {})
         list_id = state.get("list")
+        if list_id and state.get("cancel") is None:
+            halted = await self._halted(position)
+            if halted is not None:
+                await self._withdraw(position_id, list_id)
+                return halted
         if list_id:
             cancelled = await self._cancel(position, list_id, state)
             if cancelled is not None:
@@ -306,6 +394,38 @@ class PositionWorker:
             position.protection_list_id = None
             position.exchange_stop = None
 
+    async def _withdraw(self, position_id: uuid.UUID, list_id: str) -> None:
+        """Drop an operation whose cancel was never sent: its list still protects."""
+        async with self.runtime.session() as session, session.begin():
+            position = await lock_position(session, position_id)
+            state = position.op_state or {}
+            if (
+                position.operation is None
+                or state.get("list") != list_id
+                or state.get("cancel") is not None
+                or position.protection_list_id != list_id
+            ):
+                return
+            await record_event(
+                session,
+                account=position.account,
+                network=position.network,
+                kind="operation_withdrawn",
+                payload={"operation": position.operation, "list": list_id},
+                position=position,
+            )
+            position.operation = None
+            position.op_state = None
+            position.unprotected_since = None
+            if position.status in (
+                PositionStatus.REPRICING,
+                PositionStatus.CLOSING,
+                PositionStatus.PROTECTION_OVERDUE,
+            ):
+                position.status = PositionStatus.PROTECTED
+            symbol = position.symbol
+        self.runtime.alerts.pop(f"overdue:{symbol}", None)
+
     async def _clear(self, position_id: uuid.UUID) -> None:
         async with self.runtime.session() as session, session.begin():
             position = await lock_position(session, position_id)
@@ -320,4 +440,4 @@ def _exit_target(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["Operation", "PositionWorker"]
+__all__ = ["HALTED", "Operation", "PositionWorker", "StatusUnknown"]

@@ -14,6 +14,7 @@ through :func:`asyncio.to_thread` to keep the agent's event loop free.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
@@ -56,6 +57,14 @@ _REST_URL: dict[str, str] = {
 
 class ExchangeError(RuntimeError):
     """Raised when a Binance REST request cannot be completed."""
+
+
+class UnknownSymbol(ExchangeError, LookupError):
+    """The exchange does not list the symbol (-1121): never, or no longer."""
+
+
+#: Binance's "Invalid symbol."
+INVALID_SYMBOL = -1121
 
 
 def _credentials(network: Network) -> tuple[str, str]:
@@ -192,12 +201,18 @@ class ExchangeRest:
         *,
         priority: Priority = Priority.MARKET,
         max_wait: float | None = None,
+        weight: int | None = None,
         **kwargs: Any,
     ) -> Any:
-        """Run a read under the shared budget (market-data priority by default)."""
+        """Run a read under the shared budget (market-data priority by default).
+
+        ``weight`` overrides the method's usual weight (a call without its
+        ``symbol`` costs more)."""
         try:
             await self.budget.acquire(
-                priority, weight_of(method.__name__), max_wait=max_wait
+                priority,
+                weight if weight is not None else weight_of(method.__name__),
+                max_wait=max_wait,
             )
         except BudgetExhausted as exc:
             raise ExchangeError(f"Binance REST call not sent: {exc}") from exc
@@ -243,9 +258,36 @@ class ExchangeRest:
         """Return the latest price for a symbol."""
         return await self._market(self._client.rest_api.ticker_price, symbol=symbol)
 
+    async def ticker_prices(
+        self, *, priority: Priority = Priority.MARKET
+    ) -> dict[str, Decimal]:
+        """The latest price of every symbol, in one request (weight 4)."""
+        answer = await self._market(
+            self._client.rest_api.ticker_price, priority=priority, weight=4
+        )
+        rows = getattr(answer, "actual_instance", answer) or []
+        prices: dict[str, Decimal] = {}
+        for row in rows if isinstance(rows, list) else [rows]:
+            raw = row if isinstance(row, Mapping) else vars(row)
+            if raw.get("symbol") and raw.get("price"):
+                prices[str(raw["symbol"])] = Decimal(str(raw["price"]))
+        return prices
+
     async def exchange_info(self, symbol: str | None = None) -> Any:
-        """Return exchange metadata (filters, symbol status, ...)."""
-        return await self._market(self._client.rest_api.exchange_info, symbol=symbol)
+        """Return exchange metadata (filters, symbol status, ...).
+
+        A ``symbol`` the exchange does not list raises :class:`UnknownSymbol`
+        — after a delisting that is the only answer there is.
+        """
+        try:
+            return await self._market(
+                self._client.rest_api.exchange_info, symbol=symbol
+            )
+        except ExchangeError as exc:
+            code = getattr(exc.__cause__, "status_code", None)
+            if symbol is not None and code == INVALID_SYMBOL:
+                raise UnknownSymbol(f"{symbol} is not listed") from exc
+            raise
 
     async def symbols(self) -> list[ExchangeInfoResponseSymbolsInner]:
         """Every symbol the exchange lists, with its metadata.

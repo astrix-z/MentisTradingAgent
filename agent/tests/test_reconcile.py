@@ -16,14 +16,19 @@ from agent.exchange.trade import TradeClient
 from agent.execution.admission import record_signal
 from agent.execution.ledger import FillRecord, lock_position
 from agent.execution.models import Fill, PositionStatus, SymbolCooldown, TradeCursor
-from agent.execution.reconcile import Reconciler
+from agent.execution.reconcile import TESTNET_BALANCES, Reconciler, ReconcileReport
+from agent.execution.runtime import ExecutionContext
 
 
 def reconciler(stack: Stack, page: int = 1000) -> Reconciler:
-    async def price(symbol: str) -> Decimal | None:
-        return Decimal(100)
+    async def prices() -> dict[str, Decimal]:
+        return {f"{asset}USDT": Decimal(100) for asset in stack_assets}
 
-    return Reconciler(stack.worker, prices=price, page=page)
+    return Reconciler(stack.worker, prices=prices, page=page)
+
+
+#: Assets the reconciler can value in these tests; others have no USDT market.
+stack_assets = ("BTC", "ETH", "SOL")
 
 
 async def fills_of(stack: Stack, position_id: uuid.UUID) -> int:
@@ -351,5 +356,66 @@ def test_a_finished_list_read_before_a_reprice_is_not_adopted_after_it() -> None
         assert [ol.list_client_order_id for ol in live] == [position.protection_list_id]
         await reconciler(stack).run()  # a later round leaves it alone
         assert (await state.position(stack, position_id)).operation is None
+
+    run(scenario)
+
+
+# --- the balance check on a large account (ClickUp 869fgqu5u) ---------------------------
+
+
+def handouts(state: World, count: int) -> None:
+    """Testnet-style account: hundreds of assets nobody bought, each worth 10."""
+    for index in range(count):
+        state.fake.free[f"TK{index}"] = Decimal(10)
+        state.fake.last[f"TK{index}USDT"] = Decimal(1)
+
+
+def test_the_balance_check_prices_every_asset_in_one_request() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        handouts(state, 490)
+        state.fake.free["NOMARKET"] = Decimal(10)  # no USDT pair: not valued
+        rec = Reconciler(stack.worker, prices=stack.rest.ticker_prices)
+        before = state.fake.calls_to("ticker_price")
+        report = await rec.run()
+        assert state.fake.calls_to("ticker_price") - before == 1
+        assert len(report.divergence) == 490
+        assert stack.runtime.admission_block() == "divergence"  # live: it counts
+
+    run(scenario)
+
+
+def test_testnet_handouts_are_reported_once_and_do_not_close_admission() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        handouts(state, 490)
+        testnet = ExecutionContext(CONTEXT.account, "testnet")
+        rec = Reconciler(stack.worker, prices=stack.rest.ticker_prices)
+        report = ReconcileReport()
+        await rec._balances(testnet, report)
+        assert report.divergence == []
+        alerts = stack.runtime.alerts
+        assert not [k for k in alerts if k.startswith("divergence:")]
+        assert "490 assets" in alerts[TESTNET_BALANCES]
+        assert stack.runtime.admission_block() is None
+        for index in range(490):
+            del state.fake.free[f"TK{index}"]
+        await rec._balances(testnet, report)
+        assert TESTNET_BALANCES not in alerts
+
+    run(scenario)
+
+
+def test_unreadable_prices_keep_the_previous_finding() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        state.fake.free["SOL"] = Decimal(1)
+        rec = Reconciler(stack.worker, prices=stack.rest.ticker_prices)
+        state.fake.last["SOLUSDT"] = Decimal(100)
+        await rec.run()
+        assert "divergence:balance:SOLUSDT" in stack.runtime.alerts
+        state.fake.fault("ticker_price", "timeout_before")
+        await rec.run()
+        assert "divergence:balance:SOLUSDT" in stack.runtime.alerts
 
     run(scenario)
