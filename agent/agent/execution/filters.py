@@ -234,12 +234,18 @@ class FilterCache:
         self._entries: dict[tuple[str, str], tuple[float, SymbolFilters]] = {}
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
 
-    async def get(self, network: str, symbol: str) -> SymbolFilters:
+    async def get(
+        self, network: str, symbol: str, *, max_age: float | None = None
+    ) -> SymbolFilters:
+        """The symbol's rules, read again when older than ``max_age`` seconds
+        (default: the cache's ``ttl``) — a caller that acts on the symbol's
+        ``status`` asks for a fresher answer than one that only rounds."""
         key = (network, symbol)
+        ttl = self._ttl if max_age is None else min(max_age, self._ttl)
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:
             cached = self._entries.get(key)
-            if cached is not None and self._clock() - cached[0] < self._ttl:
+            if cached is not None and self._clock() - cached[0] < ttl:
                 return cached[1]
             info = await self._fetch(network, symbol)
             symbols = (

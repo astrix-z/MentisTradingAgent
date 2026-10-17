@@ -26,6 +26,8 @@ class ExitReason(StrEnum):
     TIME = "time"
     MANUAL = "manual"
     EMERGENCY = "emergency"
+    #: The symbol is gone; the owner wrote the position off (``write_off_position``).
+    DELISTED = "delisted"
 
 
 class ExitMechanism(StrEnum):
@@ -38,6 +40,7 @@ class ExitMechanism(StrEnum):
     MANUAL_CLOSE = "manual_close"
     GUARD = "guard"
     DUST = "dust"
+    WRITE_OFF = "write_off"
 
 
 @dataclass(frozen=True)

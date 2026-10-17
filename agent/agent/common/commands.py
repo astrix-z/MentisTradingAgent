@@ -37,6 +37,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from redis.asyncio import Redis
@@ -421,6 +422,43 @@ async def _close_position(ctx: CommandContext, payload: dict[str, Any]) -> None:
             "symbol": symbol,
             "step": getattr(getattr(result, "step", None), "value", None),
             "reason": getattr(result, "reason", None),
+        },
+    )
+
+
+@command("write_off_position")
+async def _write_off_position(ctx: CommandContext, payload: dict[str, Any]) -> None:
+    """Close a delisted symbol's position in the database, without an order."""
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    confirm = str(payload.get("confirm") or "")
+    runtime = ctx.engine.execution
+    if not symbol:
+        await ctx.report(ok=False, message="symbol is required")
+        return
+    try:
+        proceeds = Decimal(str(payload.get("proceeds_quote") or "0"))
+    except InvalidOperation:
+        await ctx.report(ok=False, message="proceeds_quote must be a number")
+        return
+    if not proceeds.is_finite():
+        await ctx.report(ok=False, message="proceeds_quote must be a number")
+        return
+    if runtime is None or runtime.write_off_position is None:
+        await ctx.report(ok=False, message="execution is not available")
+        return
+    try:
+        result = await runtime.write_off_position(
+            symbol, confirm=confirm, proceeds=proceeds
+        )
+    except (LookupError, ValueError) as exc:
+        await ctx.report(ok=False, message=str(exc))
+        return
+    await ctx.report(
+        ok=True,
+        data={
+            "symbol": symbol,
+            "step": getattr(getattr(result, "step", None), "value", None),
+            "proceeds_quote": str(proceeds),
         },
     )
 
