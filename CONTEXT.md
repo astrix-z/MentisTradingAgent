@@ -162,6 +162,12 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-10-17] Сверка балансов: цены одним запросом, тестовые активы testnet не блокируют — Claude-Opus (869fgqu5u)
+- `Reconciler._balances`: сначала активы сверх открытых позиций, затем **один** запрос цен всех символов (`ExchangeRest.ticker_prices()`, `ticker_price` без символа, вес 4 вместо 2 × N, приоритет RECONCILE). Ошибка цен — проверка не прочитана, прежний вывод остаётся. Актив без USDT-пары не оценивается (как раньше).
+- testnet: вместо `divergence:balance:*` по каждому активу — один информационный алерт `testnet_balances` («N assets held without a position on testnet»), admission не закрывается; на live — без изменений. `testnet_balances` снимается при выходе из контекста.
+- П.3 карточки (рассогласование после отказа Start) закрыт ещё в 869fgqxah: `target_network` меняется только при прошедшем Start; при выключенных сделках Start не берёт lock и не сверяет.
+- Проверено на настоящем API (публичный endpoint, только чтение): `ticker_prices()` — 1373 цены на testnet, 3732 на live; `exchange_info('NOPEXYZUSDT')` → `UnknownSymbol`.
+
 ### [2026-10-17] Списание позиции по делистингованному символу — Claude-Opus (869fjdy10)
 - Команда `write_off_position` `{symbol, confirm, proceeds_quote}`: `Exits.write_off` закрывает позицию через `Protector._finalize(..., proceeds=)` без ордеров, причина `delisted` / механизм `write_off`, событие `written_off`; `proceeds_quote` добавляется к `sold_quote` в той же транзакции. Отказ (`WriteOffRefused`): `confirm` ≠ символ, отрицательная выручка, символ в `TRADING`, открытые ордера на бирже по символу (`-1121` = символа нет, ордеров нет), незавершённые попытки позиции (`journal.open_of` по всем ролям), нет блокировки исполнения.
 - `ExchangeRest.exchange_info(symbol)`: `-1121` → `UnknownSymbol(ExchangeError, LookupError)` — после делистинга `FilterCache` и `PositionWorker.not_trading` видят «не листингуется», а не сетевую ошибку. Fake SDK отвечает `-1121` на `exchangeInfo`/`openOrders` неизвестного символа; `FakeExchange.delist()` отменяет ордера символа и убирает его.
