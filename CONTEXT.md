@@ -162,6 +162,11 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-10-17] Runbook исполнения дописан до live-пилота — Claude-Mentis
+- `docs/EXECUTION_RUNBOOK.md`: §0 (где смотреть режим и алерты: UI, `trading:heartbeat`, лог, БД агента; какие алерты закрывают входы), §5 (БД/Redis/биржа недоступны), §6 (HALT/делистинг с позицией, ручное закрытие через `close_position` по API), §7 (429/418, бюджет веса), §8 (часы: пороги 1 с / 2,5 с, `chronyd` на AlmaLinux), §9 (ручная сверка: SQL по `position`/`order_attempt`/`fill`, read-only скрипт `all_orders` + `myTrades` за сутки, таблица расхождений). Поведение сверено с кодом `development` (`runtime.py`, `budget.py`, `trade.py`, `protection.py`, `worker.py`, `reconcile.py`, `main.py`). План §9.7 обновлён; в §2 убрано «закрыть из UI» — кнопки `close_position` в UI нет.
+- SQL §9 проверен на одноразовом PG 18 с миграциями агента (`0005_signal_watch`); скрипт сверки запущен на testnet; `jq`-команда heartbeat — на production.
+- Найдено по ходу (код не менялся): (1) выход по времени, trailing и `close_position` не проверяют статус символа и во время HALT снимают OCO, после чего продать нельзя — позиция без защиты до возобновления торгов; (2) после делистинга позицию нельзя закрыть ни продажей, ни командой — нужна процедура закрытия в БД; (3) Redis в production на анонимном томе: `compose down` + `up` теряет переключатель, снимок запуска и поток команд; (4) в UI нет кнопки `close_position`.
+
 ### [2026-10-16] Проверка ключа: торговые группы Binance вместо SPOT — Claude-Mentis
 - На production после выкладки `d2eb225` алерт `execution: key: API key cannot trade spot (canTrade=True, permissions=['TRD_GRP_072'])`. Live-аккаунт состоит в торговой группе Binance: в `permissions` указана только группа, `SPOT` нет. По `exchangeInfo` (live, 2026-10-16) группа 072 есть в `permissionSets` 510 из 511 USDT-пар (нет только RWUSDUSDT). Прежняя проверка `"SPOT" in permissions` закрывала бы все входы (`key` блокирует admission).
 - `ExecutionRuntime._check_key`: нужны `canTrade` и непустые permissions. Разрешён ли символ, проверяет `check_symbol` при каждом входе: `SymbolFilters.permission_sets` (из `permissionSets`, запасной вариант — старое `permissions`), у аккаунта должно быть хотя бы одно право из каждого набора, иначе `Skip.SYMBOL_NOT_PERMITTED`. Admission передаёт `account.permissions` из того же `get_account`.
