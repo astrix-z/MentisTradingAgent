@@ -51,6 +51,8 @@ logger = logging.getLogger(__name__)
 NOT_FOUND = frozenset({-2011, -2013})
 #: Alert of a symbol whose list is kept because it does not trade.
 HALTED = "halted:"
+#: Alert of a symbol whose list is kept because its status cannot be read.
+STATUS_UNKNOWN = "status_unknown:"
 #: Seconds a known halt may be old when it keeps a list; ``TRADING`` that lets
 #: a list be cancelled is always read anew.
 STATUS_MAX_AGE = 60.0
@@ -115,9 +117,11 @@ class PositionWorker:
         ``None`` (it trades) is always read from the exchange just now. A halt
         already alerted may come from the cache, up to ``STATUS_MAX_AGE``
         seconds old, unless ``fresh``. Sets or clears the ``halted:`` alert;
-        raises :class:`StatusUnknown` when the status cannot be read.
+        raises :class:`StatusUnknown` when the status cannot be read, with the
+        ``status_unknown:`` alert set until a read succeeds.
         """
         alert = f"{HALTED}{position.symbol}"
+        unknown = f"{STATUS_UNKNOWN}{position.symbol}"
         known_halt = alert in self.runtime.alerts and not fresh
         try:
             filters = await self.orders.filters.get(
@@ -130,15 +134,26 @@ class PositionWorker:
                     position.network, position.symbol, max_age=0
                 )
         except LookupError:
-            status = "not listed"
+            filters = None
         except Exception as exc:
+            if unknown not in self.runtime.alerts:
+                logger.warning(
+                    "status of %s unknown: %s; its list stays, exits wait",
+                    position.symbol,
+                    exc,
+                )
+            self.runtime.alerts[unknown] = (
+                f"status of {position.symbol} unknown ({exc}): protection kept "
+                "on the exchange, exits wait"
+            )
             raise StatusUnknown(f"status of {position.symbol} unknown: {exc}") from exc
-        else:
-            if filters.tradable:
-                if self.runtime.alerts.pop(alert, None) is not None:
-                    logger.info("%s trades again", position.symbol)
-                return None
-            status = filters.status
+        if self.runtime.alerts.pop(unknown, None) is not None:
+            logger.info("status of %s readable again", position.symbol)
+        if filters is not None and filters.tradable:
+            if self.runtime.alerts.pop(alert, None) is not None:
+                logger.info("%s trades again", position.symbol)
+            return None
+        status = "not listed" if filters is None else filters.status
         if alert not in self.runtime.alerts:
             logger.warning(
                 "%s is %s: its list stays, exits wait for trading",
@@ -152,17 +167,23 @@ class PositionWorker:
         return status
 
     async def _halted(self, position: Position) -> StepResult | None:
-        """WAITING when cancelling the live list now would leave it unprotected."""
+        """WAITING when cancelling the live list now would leave it unprotected.
+
+        A closed position has no live list, whatever its row still names: its
+        status is not read (an alert it set would outlive it).
+        """
         state = position.op_state or {}
-        if position.protection_list_id is None or (
+        if (
+            position.status == PositionStatus.CLOSED
+            or position.protection_list_id is None
+        ) or (
             state.get("list") == position.protection_list_id
             and state.get("cancel") is not None
         ):
             return None
         try:
             status = await self.not_trading(position)
-        except StatusUnknown as exc:
-            logger.warning("%s: list kept", exc)
+        except StatusUnknown:
             return StepResult(
                 Step.WAITING, f"{position.symbol} status unknown: list kept"
             )
@@ -440,4 +461,4 @@ def _exit_target(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["HALTED", "Operation", "PositionWorker", "StatusUnknown"]
+__all__ = ["HALTED", "STATUS_UNKNOWN", "Operation", "PositionWorker", "StatusUnknown"]

@@ -802,6 +802,7 @@ class Protector:
         if outcome is not None:
             self.runtime.alerts.pop(f"overdue:{outcome.symbol}", None)
             self.runtime.alerts.pop(f"halted:{outcome.symbol}", None)
+            self.runtime.alerts.pop(f"status_unknown:{outcome.symbol}", None)
             policy = ExitPolicy.from_transport(outcome.exit_policy)
             await self.runtime.notify(
                 PositionEvent(

@@ -25,7 +25,8 @@
   держит входы закрытыми (`ExecutionRuntime.admission_block`). Алерты `schema`,
   `database`, `key`, `clock`, `account`, `lock`, `divergence:*`, `quarantine:*`
   и бан IP (`ip_banned`) закрывают новые входы. Остальные (`bnb`, `feed:*`,
-  `guard:*`, `clock_warning`, `foreign_trades:*`, `halted:*` (§6),
+  `guard:*`, `clock_warning`, `foreign_trades:*`, `halted:*` и
+  `status_unknown:*` (§6),
   `testnet_balances`, `reconcile`, `context`, `restore`) информируют, но на открытые позиции и их защиту закрытые входы
   не влияют.
   Сверка балансов: актив стоимостью от 5 USDT, который не объясняют открытые
@@ -431,7 +432,14 @@ Redis — только канал управления между backend и а�
   может начаться до минуты позже возобновления торгов.
 - **Статус символа не читается** (ошибка `exchangeInfo`): OCO тоже не
   снимается, выход ждёт с причиной `<SYMBOL> status unknown: list kept`,
-  `close_position` отклоняется с `status of <SYMBOL> unknown: …`.
+  `close_position` отклоняется с `status of <SYMBOL> unknown: …`. В heartbeat —
+  информационный алерт `status_unknown:<SYMBOL>` с текстом ошибки; входы по
+  другим символам он не закрывает. Алерт снимается при первом успешном чтении
+  статуса (тогда выход выполнится или сменится на `halted:<SYMBOL>`), при
+  закрытии позиции и при выходе из контекста. Если он держится дольше
+  нескольких минут — проверить доступность Binance с сервера
+  (`curl -s 'https://api.binance.com/api/v3/exchangeInfo?symbol=<SYMBOL>' | jq -r '.symbols[0].status'`)
+  и алерты бюджета веса (§7).
 - **Операция, записанная до остановки**: если операция (выход или перенос стопа)
   записана, но отмена OCO ещё не отправлялась, агент отзывает её (событие
   `operation_withdrawn`) — позиция снова `protected`. Если отмена уже ушла на

@@ -152,7 +152,13 @@ CLOCK_SKEW_WARN = timedelta(seconds=1)
 #: Alerts for exchange state no position or attempt explains (reconcile.py).
 _UNRESOLVED = ("divergence:", "quarantine:")
 #: Reconcile findings about one account/network, dropped when it is left.
-_CONTEXT_PREFIXES = (*_UNRESOLVED, "foreign_trades:", "halted:", "testnet_balances")
+_CONTEXT_PREFIXES = (
+    *_UNRESOLVED,
+    "foreign_trades:",
+    "halted:",
+    "status_unknown:",
+    "testnet_balances",
+)
 
 LeadershipHook = Callable[["ExecutionContext"], Awaitable[None]]
 
