@@ -29,6 +29,12 @@ services:
     ports:
       - "127.0.0.1:5433:5432"
 
+  redis:
+    # Published for a backend/agent run on the host (uv run), whose REDIS_URL
+    # defaults to redis://localhost:6379/0. Only reachable from localhost.
+    ports:
+      - "127.0.0.1:6379:6379"
+
   adminer:
     ports:
       - "8080:8080"
