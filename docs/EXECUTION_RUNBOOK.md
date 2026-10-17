@@ -3,7 +3,7 @@
 Действия оператора при сбоях реального исполнения (план `docs/ORDER_EXECUTION_PLAN.md`
 §9.7). Файл пополняется до live-пилота. Остальные разделы из §9.7 пока не написаны:
 недоступны БД/Redis/биржа, HALT/delisting символа с позицией, 429/418, рассинхрон
-часов, отказ прав ключа, ручная сверка с историей ордеров.
+часов, ручная сверка с историей ордеров.
 
 ## 1. Вход завис в UNKNOWN после ручной покупки того же символа
 
@@ -160,3 +160,86 @@ Start/Stop и может ждать текущий Start. Чтобы немед�
 Пауза («Pause entries») только приостанавливает новые входы до «Resume entries» и
 не переживает рестарт агента. Переключатель рестарт переживает: он хранится в
 `agent:execution`.
+
+## 4. Права ключа и торговые группы Binance
+
+### Как Binance описывает права
+
+- **Права аккаунта** — поле `permissions` в `GET /api/v3/account`. Обычный
+  spot-аккаунт получает `SPOT`. Аккаунт в торговой группе Binance получает
+  вместо `SPOT` только имя группы, например `TRD_GRP_072`. Это нормально, а не
+  отказ прав. Группа может смениться без нашего участия.
+- **Права символа** — поле `permissionSets` в `GET /api/v3/exchangeInfo`. Это
+  список наборов. Аккаунт может торговать символом, если у него есть хотя бы
+  одно право **из каждого** набора (И по наборам, ИЛИ внутри набора). Старое
+  поле `permissions` у символа Binance больше не заполняет; агент читает его,
+  только если `permissionSets` нет.
+- Подробности: [Spot API CHANGELOG](https://developers.binance.com/docs/binance-spot-api-docs/CHANGELOG)
+  и [Spot testnet CHANGELOG](https://developers.binance.com/docs/binance-spot-api-docs/testnet/CHANGELOG).
+
+Пример: `permissionSets=[["SPOT","TRD_GRP_072","TRD_GRP_073"]]` разрешает
+аккаунту с `permissions=["TRD_GRP_072"]` торговать символом. Набор без 072 его
+запрещает.
+
+На 2026-10-16 live-аккаунт имеет `permissions=["TRD_GRP_072"]`, `canTrade=true`.
+Группа 072 разрешена на 510 из 511 USDT-пар. Не разрешена RWUSDUSDT.
+
+### Что проверяет агент
+
+1. **Ключ** — при старте runtime и раз в 5 минут (`ACCOUNT_CHECK_EVERY`):
+   `canTrade=true` и непустые `permissions`. `SPOT` не требуется. Если
+   проверка не прошла, в heartbeat появляется алерт `key`:
+   `API key cannot trade spot (canTrade=…, permissions=[…])`. Пока он висит,
+   новые входы закрыты (fail-closed). Выходы и защита открытых позиций
+   продолжают работать.
+2. **Символ** — на каждом входе (`check_symbol` в `agent/agent/execution/sizing.py`):
+   права аккаунта сверяются с `permissionSets` символа. Если символ не
+   разрешён, вход отклоняется без ордера. В `execution_intent` он получает
+   `state=REJECTED` и `reason=symbol_not_permitted`, а в деталях — права
+   аккаунта и символ.
+
+Список символов стратегии права не фильтруют: скрининг идёт по всем символам, а
+отказ происходит только при попытке входа.
+
+### Как проверить вручную
+
+Права аккаунта (подписанный запрос, ключи из окружения агента; на сервере —
+из каталога `releases/current`):
+
+```bash
+docker compose exec agent python -c "
+import asyncio
+from agent.exchange.rest import ExchangeRest
+a = asyncio.run(ExchangeRest.connect('live').account())
+print('canTrade', a.can_trade, 'permissions', a.permissions)"
+```
+
+Наборы прав символа (без ключа):
+
+```bash
+curl -s 'https://api.binance.com/api/v3/exchangeInfo?symbol=BTCUSDT' \
+  | jq -c '.symbols[0].permissionSets'
+```
+
+Какие торгуемые USDT-пары закрыты для группы (подставьте свою; та же логика,
+что в агенте: право из каждого набора):
+
+```bash
+curl -s 'https://api.binance.com/api/v3/exchangeInfo' | jq -r --arg g TRD_GRP_072 '
+  .symbols[] | select(.quoteAsset=="USDT" and .status=="TRADING")
+  | select(any(.permissionSets[]; index($g) == null)) | .symbol'
+```
+
+### Действия
+
+- **Алерт `key` с `canTrade=false` или пустыми `permissions`.** Ключ или аккаунт
+  ограничены на стороне Binance. Проверьте ключ в кабинете Binance: должна быть
+  включена Spot Trading, IP сервера должен быть в whitelist. Без этого не
+  включайте реальные сделки. Алерт снимается сам при следующей проверке (до
+  5 минут) или при рестарте агента.
+- **Много `symbol_not_permitted`.** Скорее всего, Binance перевела аккаунт в
+  другую группу. Сравните `permissions` аккаунта с `permissionSets` отклонённых
+  символов. Код менять не нужно: агент сверяет права на каждом входе.
+- **Единичный `symbol_not_permitted`.** Символ закрыт для группы аккаунта (как
+  RWUSDUSDT). Действий не нужно; при желании уберите символ из списка
+  стратегии.
