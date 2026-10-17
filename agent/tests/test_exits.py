@@ -214,9 +214,15 @@ def test_a_late_sell_response_dates_the_close_by_the_exchange() -> None:
 # --- a symbol that does not trade keeps its list (ClickUp 869fjdy0k) ---------------------
 
 
-def halt(state: World, stack: Stack, status: str, symbol: str = "BTCUSDT") -> None:
-    """The exchange changes the symbol's status; the agent's rules are re-read."""
+def halt(state: World, symbol: str = "BTCUSDT", status: str = "HALT") -> None:
+    """The exchange changes the symbol's status; the agent's cache still says
+    what it read when the position was protected."""
     state.fake.rules[symbol].status = status
+
+
+def resume(state: World, stack: Stack, symbol: str = "BTCUSDT") -> None:
+    """Trading resumes and the halt the agent cached has expired."""
+    state.fake.rules[symbol].status = "TRADING"
     stack.orders.filters.invalidate("live", symbol)
 
 
@@ -233,7 +239,7 @@ def test_time_exit_waits_for_trading_and_keeps_the_list() -> None:
         stack = await state.stack()
         position_id = await state.protected(stack)
         exits = Exits(stack.worker, feed(state))
-        halt(state, stack, "HALT")
+        halt(state)
         state.clock.advance(8 * 3600 + 60)
         result = await exits.check_time(position_id)
         assert result is not None and result.step is Step.WAITING
@@ -245,7 +251,7 @@ def test_time_exit_waits_for_trading_and_keeps_the_list() -> None:
         await kept(state, stack, position_id)
         assert not [k for k in stack.runtime.alerts if k.startswith("overdue:")]
 
-        halt(state, stack, "TRADING")
+        resume(state, stack)
         state.fake.set_price("BTCUSDT", Decimal(101))
         result = await exits.check_time(position_id)
         assert result is not None and result.step is Step.CLOSED
@@ -262,11 +268,11 @@ def test_trailing_keeps_the_list_of_a_symbol_in_break() -> None:
     async def scenario(state: World) -> None:
         stack = await state.stack()
         position_id = await state.protected(stack)
-        halt(state, stack, "BREAK")
+        halt(state, status="BREAK")
         result = await stack.worker.reprice(position_id, Decimal("99.5"))
         assert result.step is Step.WAITING
         await kept(state, stack, position_id)
-        halt(state, stack, "TRADING")
+        resume(state, stack)
         result = await stack.worker.reprice(position_id, Decimal("99.5"))
         assert result.step is Step.PROTECTED
         position = await state.position(stack, position_id)
@@ -287,7 +293,7 @@ def test_an_operation_recorded_before_the_halt_is_withdrawn() -> None:
         )
         await state.kill(stack)
         second = await state.stack()
-        halt(state, second, "HALT")
+        halt(state)
         state.clock.advance(60)
         result = await second.worker.resume(position_id)
         assert result.step is Step.WAITING
@@ -314,7 +320,7 @@ def test_a_cancel_already_sent_is_not_withdrawn() -> None:
             position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
         )
         assert waiting.reason == "cancel outcome unknown"
-        halt(state, stack, "HALT")
+        halt(state)
         await stack.worker.resume(position_id)
         position = await state.position(stack, position_id)
         assert position.operation == "exit"  # the list may be gone: no way back
@@ -328,9 +334,66 @@ def test_close_position_is_refused_while_the_symbol_is_halted() -> None:
         stack = await state.stack()
         position_id = await state.protected(stack)
         exits = Exits(stack.worker, feed(state))
-        halt(state, stack, "HALT")
+        halt(state)
         with pytest.raises(SymbolNotTrading, match="HALT"):
             await exits.close_symbol("BTCUSDT")
         await kept(state, stack, position_id)
+
+    run(scenario)
+
+
+def test_a_cached_trading_status_does_not_cancel_the_list() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        await stack.orders.filters.get("live", "BTCUSDT")  # TRADING, cached
+        halt(state)
+        with pytest.raises(SymbolNotTrading, match="HALT"):
+            await exits.close_symbol("BTCUSDT")
+        state.clock.advance(8 * 3600 + 60)
+        assert (await exits.check_time(position_id)).step is Step.WAITING  # type: ignore[union-attr]
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.step is Step.WAITING
+        await kept(state, stack, position_id)
+
+    run(scenario)
+
+
+def test_an_unreadable_status_keeps_the_list() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        halt(state)
+        state.fake.fault("exchange_info", "reject", code=-1000, times=100)
+        with pytest.raises(SymbolNotTrading, match="unknown"):
+            await exits.close_symbol("BTCUSDT")
+        state.clock.advance(8 * 3600 + 60)
+        result = await exits.check_time(position_id)
+        assert result is not None and result.step is Step.WAITING
+        assert result.reason == "BTCUSDT status unknown: list kept"
+        await kept(state, stack, position_id)
+
+        state.fake.faults.pop("exchange_info")
+        resume(state, stack)
+        state.fake.set_price("BTCUSDT", Decimal(101))
+        result = await exits.check_time(position_id)
+        assert result is not None and result.step is Step.CLOSED
+
+    run(scenario)
+
+
+def test_a_known_halt_is_not_read_again_every_round() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        halt(state)
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.step is Step.WAITING
+        reads = state.fake.calls_to("exchange_info")
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.step is Step.WAITING
+        assert state.fake.calls_to("exchange_info") == reads  # the cached halt
 
     run(scenario)
