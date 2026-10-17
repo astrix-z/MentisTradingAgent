@@ -966,7 +966,13 @@ class FakeExchange:
     def ticker_price(self, **kwargs: Any) -> ApiResponse[TickerPriceResponse]:
         with self._lock:
             self._before("ticker_price", kwargs)
-            symbol = kwargs["symbol"]
+            symbol = kwargs.get("symbol")
+            if symbol is None:
+                every = [
+                    {"symbol": name, "price": fmt(price)}
+                    for name, price in self.last.items()
+                ]
+                return response(TickerPriceResponse, every)
             if symbol not in self.last:
                 raise BadRequestError("Invalid symbol.", -1121)
             payload = {"symbol": symbol, "price": fmt(self.last[symbol])}

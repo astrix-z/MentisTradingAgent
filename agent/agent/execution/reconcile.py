@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -40,6 +40,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 
 from agent.exchange.budget import Priority
+from agent.exchange.rest import ExchangeError
 from agent.exchange.trade import TradeCallError
 from agent.execution.attempts import Role
 from agent.execution.ledger import FillRecord, lock_position
@@ -56,6 +57,8 @@ from agent.execution.worker import PositionWorker
 logger = logging.getLogger(__name__)
 
 PAGE = 1000
+#: Informational alert: testnet balances no position explains.
+TESTNET_BALANCES = "testnet_balances"
 
 
 @dataclass
@@ -72,7 +75,7 @@ class Reconciler:
         self,
         worker: PositionWorker,
         *,
-        prices: Callable[[str], Awaitable[Decimal | None]] | None = None,
+        prices: Callable[[], Awaitable[Mapping[str, Decimal]]] | None = None,
         page: int = PAGE,
     ) -> None:
         self.worker = worker
@@ -382,7 +385,15 @@ class Reconciler:
     async def _balances(
         self, context: ExecutionContext, report: ReconcileReport
     ) -> None:
-        """A traded asset held beyond what the open positions explain."""
+        """A traded asset held beyond what the open positions explain.
+
+        Prices come in one request for all symbols, however many assets the
+        account holds (ClickUp 869fgqu5u: about 490 on the testnet account).
+        An asset without a USDT market cannot be valued and is no position of
+        ours. On testnet the exchange hands out hundreds of assets: what no
+        position explains there is reported in one informational alert and
+        does not close admission.
+        """
         trade = self.runtime.trade
         if trade is None or self._prices is None:
             return
@@ -391,7 +402,7 @@ class Reconciler:
         except TradeCallError:
             return
         held = {p.symbol: p.quantity for p in await self._open_positions(context)}
-        fresh: dict[str, str] = {}
+        extras: dict[str, tuple[str, Decimal]] = {}
         for row in account.balances or []:
             asset = str(row.asset)
             if asset in ("USDT", "BNB"):
@@ -399,16 +410,34 @@ class Reconciler:
             amount = Decimal(row.free or "0") + Decimal(row.locked or "0")
             symbol = f"{asset}USDT"
             extra = amount - held.get(symbol, Decimal(0))
-            if extra <= 0:
-                continue
-            price = await self._prices(symbol)
-            if price is None or extra * price < Decimal(5):
-                continue  # dust (plan §8.4)
-            report.divergence.append(symbol)
-            fresh[f"divergence:balance:{symbol}"] = (
-                f"{extra} {asset} held without a position"
-            )
-        self._refresh(("divergence:balance:",), fresh)
+            if extra > 0:
+                extras[symbol] = (asset, extra)
+        prices: Mapping[str, Decimal] = {}
+        if extras:
+            try:
+                prices = await self._prices()
+            except ExchangeError as exc:
+                logger.warning("prices for the balance check unavailable: %s", exc)
+                return  # unread: the previous finding stays
+        unexplained = {
+            symbol: (asset, extra)
+            for symbol, (asset, extra) in extras.items()
+            if symbol in prices and extra * prices[symbol] >= Decimal(5)
+        }  # the rest is dust (plan §8.4) or has no market
+        fresh: dict[str, str] = {}
+        if context.network == "testnet":
+            if unexplained:
+                fresh[TESTNET_BALANCES] = (
+                    f"{len(unexplained)} assets held without a position on "
+                    "testnet (exchange handouts); not counted as divergence"
+                )
+        else:
+            for symbol, (asset, extra) in unexplained.items():
+                report.divergence.append(symbol)
+                fresh[f"divergence:balance:{symbol}"] = (
+                    f"{extra} {asset} held without a position"
+                )
+        self._refresh(("divergence:balance:", TESTNET_BALANCES), fresh)
 
     # --- reads ------------------------------------------------------------------------------
 

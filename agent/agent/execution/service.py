@@ -30,11 +30,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from binance_common.errors import BadRequestError
 from sqlalchemy import select
 
+from agent.exchange.budget import Priority
 from agent.exchange.hub import StreamHub
-from agent.exchange.rest import ExchangeError, ExchangeRest
+from agent.exchange.rest import ExchangeRest
 from agent.execution.admission import Admission
 from agent.execution.exits import Exits
 from agent.execution.filters import FilterCache
@@ -114,22 +114,15 @@ class ExecutionService:
         self.protector = Protector(self.orders, self.finalizer)
         self.worker = PositionWorker(self.protector)
 
-        async def last_price(symbol: str) -> Decimal | None:
+        async def all_prices() -> dict[str, Decimal]:
             context = runtime.context
             if context is None:
-                return None
-            try:
-                ticker = await market(context.network).ticker_price(symbol)
-            except ExchangeError as exc:
-                if isinstance(exc.__cause__, BadRequestError):
-                    # No such market (-1121): an asset held without a USDT
-                    # pair is no position of ours and cannot be valued.
-                    return None
-                raise
-            value = getattr(getattr(ticker, "actual_instance", ticker), "price", None)
-            return Decimal(value) if value else None
+                return {}
+            return await market(context.network).ticker_prices(
+                priority=Priority.RECONCILE
+            )
 
-        self.reconciler = Reconciler(self.worker, prices=last_price)
+        self.reconciler = Reconciler(self.worker, prices=all_prices)
         self.feed: MonitorFeed | None = None
         if hub is not None:
 

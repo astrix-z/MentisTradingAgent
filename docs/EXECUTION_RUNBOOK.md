@@ -25,9 +25,13 @@
   держит входы закрытыми (`ExecutionRuntime.admission_block`). Алерты `schema`,
   `database`, `key`, `clock`, `account`, `lock`, `divergence:*`, `quarantine:*`
   и бан IP (`ip_banned`) закрывают новые входы. Остальные (`bnb`, `feed:*`,
-  `guard:*`, `clock_warning`, `foreign_trades:*`, `reconcile`, `context`,
-  `restore`) информируют, но на открытые позиции и их защиту закрытые входы
+  `guard:*`, `clock_warning`, `foreign_trades:*`, `halted:*` (§6),
+  `testnet_balances`, `reconcile`, `context`, `restore`) информируют, но на открытые позиции и их защиту закрытые входы
   не влияют.
+  Сверка балансов: актив стоимостью от 5 USDT, который не объясняют открытые
+  позиции, на live — `divergence:balance:<SYMBOL>` (входы закрыты), на testnet
+  — один алерт `testnet_balances` с числом таких активов (testnet раздаёт
+  сотни тестовых активов; входы не закрывает).
 - **Лог агента**: `$COMPOSE logs --since 30m agent`.
 - **БД агента**: `docker exec -it mentis-db-1 psql -U postgres -d agent`.
 
