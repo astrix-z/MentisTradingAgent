@@ -69,10 +69,10 @@ in this repo.
   ## Готово, когда
   *   Проверяемые критерии.
 
-  — Claude-Mentis
+  — Claude-Opus
   ```
 
-  Sections without content may be dropped; the signature line stays. Link related tasks as
+  Sections without content may be dropped; the signature line stays: every entry (descriptions and comments) is signed `— Claude-Opus`; older tasks signed `— Claude-Mentis` are left as they are. Link related tasks as
   `[869xxxxx](https://app.clickup.com/t/869xxxxx)`.
 - No secrets, tokens, `.env` values, API keys or account balances in tasks or comments.
 
