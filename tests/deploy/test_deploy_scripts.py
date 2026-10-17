@@ -191,6 +191,8 @@ STUBS: dict[str, str] = {
             config)
               if [[ "$1" == --services ]]; then
                 cat "$STATE/services" 2>/dev/null || printf 'db\nredis\nbackend\nagent\n'
+              elif [[ "$1" == --volumes ]]; then
+                cat "$STATE/compose_volumes" 2>/dev/null || printf 'app-db-data\nredis-data\n'
               elif [[ -n "${MENTIS_TAG:-}" && -f "$STATE/compose_tag_agent_only" ]]; then
                 printf 'mentis-backend:latest\nmentis-agent:%s\n' "$MENTIS_TAG"
               elif [[ -n "${MENTIS_TAG:-}" && ! -f "$STATE/compose_no_tag" ]]; then
@@ -218,6 +220,7 @@ STUBS: dict[str, str] = {
                 cat "$STATE/error_redis_$op"; exit "$strict"
               fi
               case "$op" in
+                SAVE) echo OK ;;
                 SET) echo "$3" >"$STATE/redis/$key"; echo OK ;;
                 DEL) rm -f "$STATE/redis/$key"; echo 1 ;;
                 GET) cat "$STATE/redis/$key" 2>/dev/null || true ;;
@@ -240,6 +243,11 @@ STUBS: dict[str, str] = {
                 cp "$(img "mentis-$s:latest")" "$STATE/containers/c-$s.image" 2>/dev/null || true
                 rm -f "$STATE/containers/c-$s.stopped"
               done
+              # Redis is recreated on the volume compose now names, if it exists.
+              if [[ -z "$named" || "$named " == *" redis "* ]] \
+                && [[ -f "$STATE/volumes/mentis_redis-data" ]]; then
+                echo mentis_redis-data >"$STATE/containers/c-redis.mount"
+              fi
               mkdir -p "$STATE/redis"
               if [[ -f "$STATE/catalog_payload" ]]; then
                 cp "$STATE/catalog_payload" "$STATE/redis/agent:strategies"
@@ -282,6 +290,20 @@ STUBS: dict[str, str] = {
           rm)
             shift; [[ "$1" == -f ]] && shift
             rm -f "$STATE/containers/$1.image" ;;
+          volume)
+            mkdir -p "$STATE/volumes"
+            name="${@: -1}"
+            case "$2" in
+              inspect) [[ -f "$STATE/volumes/$name" ]] ;;
+              create) [[ -f "$STATE/fail_volume_create" ]] && exit 1
+                      echo "$*" >"$STATE/volumes/$name" ;;
+              rm) rm "$STATE/volumes/$name" ;;
+            esac ;;
+          run)
+            # The Redis copy (cp -a) and AOF conversion (redis-server).
+            [[ -f "$STATE/fail_redis_copy" && "$*" == *"cp -a"* ]] && exit 1
+            [[ -f "$STATE/fail_redis_convert" && "$*" == *redis-server* ]] && exit 1
+            exit 0 ;;
           logs) ;;
           image)
             if [[ "$2" == inspect && "$4" == *RepoTags* ]]; then
@@ -294,6 +316,7 @@ STUBS: dict[str, str] = {
             elif [[ "$2" == rm ]]; then rm "$(img "$3")" 2>/dev/null || exit 1; fi ;;
           inspect)
             case "$3" in
+              *.Mounts*) cat "$STATE/containers/$4.mount" ;;
               '{{.Image}}')
                 id=$(cat "$STATE/containers/$4.image"); echo "$id"
                 # gone_<container>: the image was deleted under a running container.
@@ -421,6 +444,10 @@ def server(tmp_path: Path, request: pytest.FixtureRequest) -> Server:
         server.put(f"images/mentis-{svc}:{T0}", f"id-{svc}-{T0}")
         server.put(f"containers/c-{svc}.image", f"id-{svc}-{T0}")
     server.put("redis/agent:strategies", '{"schema_hash": "h-old"}')
+    # Redis already writes to its named volume (869fjdy14): nothing to move.
+    server.put("containers/c-redis.image", "id-redis")
+    server.put("containers/c-redis.mount", "mentis_redis-data")
+    server.put("volumes/mentis_redis-data", "volume create mentis_redis-data")
     server.put("valid_catalog", CATALOG_FIXTURE.read_text())
     return server
 
@@ -1433,3 +1460,92 @@ def test_a_unit_killed_during_g4_is_not_a_success(
     else:
         assert "завершился без кода" in out
     assert server.redis("trading:start_fence") is not None
+
+
+# --- Redis moves to its named volume once (ClickUp 869fjdy14) -----------------------
+
+
+def anonymous_redis(server: Server) -> None:
+    """The stack before 869fjdy14: Redis writes to an anonymous volume."""
+    server.put("containers/c-redis.mount", "0a1b2c3d")
+    (server.state / "volumes/mentis_redis-data").unlink()
+
+
+def test_redis_moves_to_the_named_volume_after_the_fence_and_before_up(
+    server: Server,
+) -> None:
+    anonymous_redis(server)
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = server.calls()
+    steps = order(
+        calls,
+        "redis SET trading:start_fence",
+        "stop agent",
+        "redis DEL agent:strategies",
+        "redis SAVE",
+        "docker volume create --label com.docker.compose.project=mentis",
+        "cp -a /data/. /target/",
+        "redis-server --appendonly no",
+        "up -d --remove-orphans",
+        "redis DEL trading:start_fence",
+    )
+    assert steps == sorted(steps)
+    assert (server.state / "volumes/mentis_redis-data").exists()
+    assert (server.state / "containers/c-redis.mount").read_text().strip() == (
+        "mentis_redis-data"
+    )
+    assert "(3a) Redis: том 0a1b2c3d → mentis_redis-data" in result.stdout
+    assert not any("volume rm" in call for call in calls)  # the old one is kept
+
+
+def test_redis_on_its_volume_is_not_moved_again(server: Server) -> None:
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = server.calls()
+    assert not any("redis SAVE" in call or "volume create" in call for call in calls)
+    assert not any(call.startswith("docker run") for call in calls)
+
+
+def test_a_target_without_the_volume_leaves_redis_alone(server: Server) -> None:
+    anonymous_redis(server)
+    server.put("compose_volumes", "app-db-data\n")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any("redis SAVE" in call for call in server.calls())
+    assert not (server.state / "volumes/mentis_redis-data").exists()
+
+
+@pytest.mark.parametrize("fault", ["fail_redis_copy", "fail_redis_convert"])
+def test_a_failed_redis_move_keeps_the_old_volume_and_the_previous_agent(
+    server: Server, fault: str
+) -> None:
+    anonymous_redis(server)
+    server.put(fault)
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    calls = server.calls()
+    order(calls, "volume create", "volume rm", "start agent")
+    assert not any("up -d --remove-orphans" in call for call in calls)
+    assert not (
+        server.state / "volumes/mentis_redis-data"
+    ).exists()  # retry starts clean
+    assert (server.state / "containers/c-redis.mount").read_text().strip() == "0a1b2c3d"
+    assert server.redis("trading:start_fence") is not None
+    assert server.image("mentis-agent:latest") == f"id-agent-{T0}"
+    assert "перенос Redis в mentis_redis-data не удался" in result.stdout, result.stdout
+
+
+def test_a_named_volume_redis_does_not_use_is_not_trusted(server: Server) -> None:
+    # A volume left by an attempt that could not clean up: its contents are
+    # unknown, so it is neither filled nor mounted.
+    anonymous_redis(server)
+    server.put("volumes/mentis_redis-data", "left over")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    calls = server.calls()
+    assert not any(
+        "redis SAVE" in call or "up -d --remove-orphans" in call for call in calls
+    )
+    assert "том mentis_redis-data уже есть" in result.stdout, result.stdout
+    order(calls, "stop agent", "start agent")

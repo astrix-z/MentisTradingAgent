@@ -23,7 +23,7 @@
 # агента, а до установки и APP_DIR работающей ревизии) →
 # G4: [(0) stop backend, который не знает флага] (1) флаг, (2) stop agent,
 # [(2a) барьер исполнения при откате на ревизию без исполнителя] (3) DEL каталога,
-# (4) retag :latest и up, (5) ожидание каталога до 2 мин, healthcheck backend,
+# [(3a) перенос Redis в именованный том, один раз] (4) retag :latest и up, (5) ожидание каталога до 2 мин, healthcheck backend,
 # (6) снятие флага → releases/current, history, ротация образов и файлов попыток.
 # Цель, чей backend не знает флага (T0): на (4) backend не поднимается, (5)
 # проверяет изолированный экземпляр без портов, и только потом (6) — запуск
@@ -67,6 +67,27 @@ FENCE_SINCE=c26ff5679de3dd20863396cf6fdc00067530fc56
 #: Ревизия раньше неё бросила бы позиции, UNKNOWN-входы и операции работающего
 #: исполнителя (ревью релиза 869fgbyaf).
 EXECUTOR_SINCE=e1333130fcd0472ecfaaaebb51eac498478931dd
+#: Именованный том Redis (compose.yml, проект mentis) и его ключ в compose-файлах.
+REDIS_VOLUME_KEY="redis-data"
+REDIS_VOLUME="mentis_$REDIS_VOLUME_KEY"
+#: Перенос в именованный том (869fjdy14): временный Redis на новом томе грузит
+#: снимок прежнего (RDB) и сам переписывает его в AOF. Redis 7, запущенный сразу
+#: с appendonly yes без AOF, снимок не грузит — данные пропали бы молча.
+# shellcheck disable=SC2016 # раскрывается в контейнере
+REDIS_CONVERT='set -eu
+redis-server --appendonly no --port 0 --unixsocket /tmp/r.sock --daemonize yes --dir /data
+cli() { redis-cli -s /tmp/r.sock "$@"; }
+n=0; until cli ping >/dev/null 2>&1; do n=$((n + 1)); [ "$n" -lt 300 ] || exit 1; sleep 0.1; done
+echo "    ключей в снимке: $(cli dbsize)"
+cli config set appendonly yes >/dev/null
+n=0
+until cli info persistence | grep -q "^aof_enabled:1" \
+  && cli info persistence | grep -q "^aof_rewrite_in_progress:0" \
+  && cli info persistence | grep -q "^aof_rewrite_scheduled:0" \
+  && [ -f /data/appendonlydir/appendonly.aof.manifest ]; do
+  n=$((n + 1)); [ "$n" -lt 600 ] || exit 1; sleep 0.1
+done
+cli shutdown save >/dev/null 2>&1 || true'
 #: Остановлен ли backend, который не знает флага (шаг 0).
 BACKEND_QUIESCED=0
 #: Изолированный экземпляр backend цели без флага (шаг 5), пока он есть.
@@ -520,6 +541,42 @@ echo "==> Установка $REVISION в $APP_DIR"
 mkdir -p "$APP_DIR"
 rsync -a --delete --exclude=/.env.prod "$STAGE/tree/" "$APP_DIR/"
 
+# --- Redis в именованном томе (869fjdy14) ---------------------------------------
+# Цель объявляет том, а работающий Redis пишет в другой (анонимный): (4)
+# пересоздаст его на пустом томе и потеряет флаг, переключатель сделок, снимок
+# запуска и команды. Поэтому перед (4) — снимок (SAVE, флаг уже в нём), копия
+# в новый том и перевод в AOF. Прежний том не трогается: откат на ревизию без
+# тома compose монтирует тот же именованный том (docs/DEPLOY.md §6).
+redis_volume() {
+  local volumes container mounted image
+  volumes="$(compose config --volumes)" || fail "compose config --volumes цели не ответил"
+  grep -qx "$REDIS_VOLUME_KEY" <<<"$volumes" || return 0
+  container="$(compose ps -q redis)"
+  [[ -n "$container" ]] || fail "Redis не работает — данные для переноса в $REDIS_VOLUME не прочитать"
+  mounted="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$container")" \
+    || fail "тома Redis не прочитаны"
+  [[ "$mounted" == "$REDIS_VOLUME" ]] && return 0
+  if docker volume inspect "$REDIS_VOLUME" >/dev/null 2>&1; then
+    fail "том $REDIS_VOLUME уже есть, а Redis пишет в ${mounted:-?}: что в нём, не доказано (docs/DEPLOY.md §6)"
+  fi
+  echo "==> (3a) Redis: том ${mounted:-?} → $REDIS_VOLUME (AOF)"
+  local reply
+  reply="$(redis_cli SAVE)" || fail "SAVE Redis не выполнен: ${reply:-нет ответа}"
+  [[ "$reply" == OK ]] || fail "SAVE Redis не выполнен: $reply"
+  image="$(docker inspect -f '{{.Image}}' "$container")" || fail "образ Redis не прочитан"
+  docker volume create --label com.docker.compose.project=mentis \
+    --label "com.docker.compose.volume=$REDIS_VOLUME_KEY" "$REDIS_VOLUME" >/dev/null \
+    || fail "том $REDIS_VOLUME не создан"
+  if ! docker run --rm --volumes-from "$container" -v "$REDIS_VOLUME:/target" \
+      --entrypoint sh "$image" -c 'cp -a /data/. /target/' \
+    || ! docker run --rm -v "$REDIS_VOLUME:/data" --user redis \
+      --entrypoint sh "$image" -c "$REDIS_CONVERT"; then
+    docker volume rm "$REDIS_VOLUME" >/dev/null 2>&1 \
+      || echo "!!! том $REDIS_VOLUME не удалён — удалите его до повторной выкладки"
+    fail "перенос Redis в $REDIS_VOLUME не удался; Redis работает на прежнем томе ${mounted:-?}"
+  fi
+}
+
 # --- G4 --------------------------------------------------------------------------
 if (( LEGACY_BACKEND )); then
   # Флаг такой backend не читает: Start закрывает только его остановка. docker
@@ -556,6 +613,7 @@ if (( EXECUTION_BARRIER )); then
 fi
 echo "==> (3) удаление $CATALOG_KEY"
 redis_cli DEL "$CATALOG_KEY" >/dev/null
+redis_volume
 echo "==> (4) :latest → :$REVISION и up"
 PHASE=up
 for svc in "${SERVICES[@]}"; do

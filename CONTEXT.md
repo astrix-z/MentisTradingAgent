@@ -162,6 +162,12 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-10-17] Redis в именованном томе с AOF — Claude-Opus (869fjdy14)
+- `compose.yml`: `redis` — том `redis-data:/data` (проект `mentis` → `mentis_redis-data`) и `redis-server --appendonly yes --appendfsync everysec`. `compose down` + `up` сохраняет `agent:execution`, `agent:runtime`, поток команд.
+- `scripts/deploy-fence.sh`, шаг (3a) `redis_volume` (после (3), до (4)): цель объявляет `redis-data`, а Redis пишет в другой том → `SAVE`, `docker volume create` с метками compose, копия `/data` через `--volumes-from` и перевод в AOF временным Redis (`REDIS_CONVERT`: грузит RDB с `appendonly no`, `CONFIG SET appendonly yes`, ждёт перезаписи AOF). Без конверсии Redis 7 с `appendonly yes` и без AOF не грузит `dump.rdb` — проверено на Docker. Уже на томе — пропуск; том есть, но Redis не на нём — отказ; сбой — том удаляется, `fail` (фаза `stopped`: прежний агент поднимается). Прежний анонимный том не удаляется.
+- Проверено на Docker 29: перенос 50 ключей точной строкой `REDIS_CONVERT`; `down`/`up` с томом сохраняет данные; откат на compose без тома монтирует тот же именованный том и грузит `dump.rdb`.
+- Тесты `tests/deploy/test_deploy_scripts.py`: заглушка `docker` знает `compose config --volumes`, `volume inspect|create|rm`, `run`, `SAVE`, тома `/data`; 6 новых сценариев (перенос между флагом и `up`, повторно не переносится, цель без тома, сбой копии/конверсии, чужой том). 84 passed. Runbook §5.2, `docs/DEPLOY.md` §2 и §7 п. 3.
+
 ### [2026-10-17] Сверка балансов: цены одним запросом, тестовые активы testnet не блокируют — Claude-Opus (869fgqu5u)
 - `Reconciler._balances`: сначала активы сверх открытых позиций, затем **один** запрос цен всех символов (`ExchangeRest.ticker_prices()`, `ticker_price` без символа, вес 4 вместо 2 × N, приоритет RECONCILE). Ошибка цен — проверка не прочитана, прежний вывод остаётся. Актив без USDT-пары не оценивается (как раньше).
 - testnet: вместо `divergence:balance:*` по каждому активу — один информационный алерт `testnet_balances` («N assets held without a position on testnet»), admission не закрывается; на live — без изменений. `testnet_balances` снимается при выходе из контекста.
