@@ -41,7 +41,7 @@ from agent.execution.monitor import MonitorFeed
 from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.protection import Step, StepResult
 from agent.execution.runtime import ExecutionRuntime
-from agent.execution.worker import HALTED, PositionWorker
+from agent.execution.worker import HALTED, PositionWorker, StatusUnknown
 from agent.strategies.base import ExitPolicy
 
 logger = logging.getLogger(__name__)
@@ -157,7 +157,12 @@ class Exits:
     async def close_symbol(self, symbol: str) -> StepResult:
         """The ``close_position`` command."""
         position_id = await self._open_position(symbol.upper())
-        status = await self.worker.not_trading(await self._position(position_id))
+        try:
+            status = await self.worker.not_trading(await self._position(position_id))
+        except StatusUnknown as exc:
+            raise SymbolNotTrading(
+                f"{exc}: not closed, its protection stays on the exchange"
+            ) from exc
         if status is not None:
             raise SymbolNotTrading(
                 f"{symbol.upper()} is {status}: not closed, its protection stays "
@@ -184,7 +189,11 @@ class Exits:
             position = await self._position(position_id)
             if position.status == PositionStatus.CLOSED:
                 raise NoSuchPosition(f"no open position in {symbol}")
-            if await worker.not_trading(position) is None:
+            try:
+                status = await worker.not_trading(position, fresh=True)
+            except StatusUnknown as exc:
+                raise WriteOffRefused(f"{exc}; try again") from exc
+            if status is None:
                 raise WriteOffRefused(
                     f"{symbol} trades: sell it with close_position instead"
                 )

@@ -25,7 +25,8 @@ an operation that would cancel it is not started — nothing could be sold or
 placed in its stead, and the position would stay without a stop until trading
 resumes. The operation is asked for again on every round (time exit, trailing)
 and runs once the symbol trades. One recorded before the halt whose cancel was
-never sent is withdrawn the same way.
+never sent is withdrawn the same way. Only a ``TRADING`` read just now lets a
+list be cancelled; a status that cannot be read keeps it too.
 """
 
 from __future__ import annotations
@@ -50,8 +51,13 @@ logger = logging.getLogger(__name__)
 NOT_FOUND = frozenset({-2011, -2013})
 #: Alert of a symbol whose list is kept because it does not trade.
 HALTED = "halted:"
-#: Seconds a symbol's status may be old when it decides whether to cancel.
+#: Seconds a known halt may be old when it keeps a list; ``TRADING`` that lets
+#: a list be cancelled is always read anew.
 STATUS_MAX_AGE = 60.0
+
+
+class StatusUnknown(RuntimeError):
+    """The symbol's status could not be read: nothing may rely on it."""
 
 
 class Operation(StrEnum):
@@ -101,22 +107,32 @@ class PositionWorker:
 
     # --- the protocol ---------------------------------------------------------------------
 
-    async def not_trading(self, position: Position) -> str | None:
+    async def not_trading(
+        self, position: Position, *, fresh: bool = False
+    ) -> str | None:
         """Why the position's symbol takes no orders now, or ``None``.
 
-        Sets or clears the ``halted:`` alert. A status that cannot be read is
-        no reason to hold an exit back: ``None``.
+        ``None`` (it trades) is always read from the exchange just now. A halt
+        already alerted may come from the cache, up to ``STATUS_MAX_AGE``
+        seconds old, unless ``fresh``. Sets or clears the ``halted:`` alert;
+        raises :class:`StatusUnknown` when the status cannot be read.
         """
         alert = f"{HALTED}{position.symbol}"
+        known_halt = alert in self.runtime.alerts and not fresh
         try:
             filters = await self.orders.filters.get(
-                position.network, position.symbol, max_age=STATUS_MAX_AGE
+                position.network,
+                position.symbol,
+                max_age=STATUS_MAX_AGE if known_halt else 0,
             )
+            if filters.tradable and known_halt:
+                filters = await self.orders.filters.get(
+                    position.network, position.symbol, max_age=0
+                )
         except LookupError:
             status = "not listed"
-        except Exception as exc:  # noqa: BLE001 - unknown status: act as before
-            logger.warning("status of %s unknown: %s", position.symbol, exc)
-            return None
+        except Exception as exc:
+            raise StatusUnknown(f"status of {position.symbol} unknown: {exc}") from exc
         else:
             if filters.tradable:
                 if self.runtime.alerts.pop(alert, None) is not None:
@@ -143,7 +159,13 @@ class PositionWorker:
             and state.get("cancel") is not None
         ):
             return None
-        status = await self.not_trading(position)
+        try:
+            status = await self.not_trading(position)
+        except StatusUnknown as exc:
+            logger.warning("%s: list kept", exc)
+            return StepResult(
+                Step.WAITING, f"{position.symbol} status unknown: list kept"
+            )
         if status is None:
             return None
         return StepResult(Step.WAITING, f"{position.symbol} is {status}: list kept")
@@ -418,4 +440,4 @@ def _exit_target(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-__all__ = ["HALTED", "Operation", "PositionWorker"]
+__all__ = ["HALTED", "Operation", "PositionWorker", "StatusUnknown"]
