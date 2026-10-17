@@ -162,6 +162,12 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-10-17] Списание позиции по делистингованному символу — Claude-Opus (869fjdy10)
+- Команда `write_off_position` `{symbol, confirm, proceeds_quote}`: `Exits.write_off` закрывает позицию через `Protector._finalize(..., proceeds=)` без ордеров, причина `delisted` / механизм `write_off`, событие `written_off`; `proceeds_quote` добавляется к `sold_quote` в той же транзакции. Отказ (`WriteOffRefused`): `confirm` ≠ символ, отрицательная выручка, символ в `TRADING`, открытые ордера на бирже по символу (`-1121` = символа нет, ордеров нет), незавершённые попытки позиции (`journal.open_of` по всем ролям), нет блокировки исполнения.
+- `ExchangeRest.exchange_info(symbol)`: `-1121` → `UnknownSymbol(ExchangeError, LookupError)` — после делистинга `FilterCache` и `PositionWorker.not_trading` видят «не листингуется», а не сетевую ошибку. Fake SDK отвечает `-1121` на `exchangeInfo`/`openOrders` неизвестного символа; `FakeExchange.delist()` отменяет ордера символа и убирает его.
+- Backend: тип `write_off_position`, проверка формы (символ, `confirm`, неотрицательная конечная сумма) → 422; в агент уходит `{symbol, confirm, proceeds_quote: str}`. `types.gen.ts` дополнен вручную тем же литералом.
+- Runbook §6 «Символ уже делистингован» — процедура через команду.
+
 ### [2026-10-17] HALT: OCO не снимается на символе вне TRADING — Claude-Opus (869fjdy0k)
 - `PositionWorker` (`worker.py`): перед записью операции, которая отменит живой OCO (выход по времени, trailing, guard, `close_position`), статус символа читается из `FilterCache.get(..., max_age=60)`. Не `TRADING` (или символа нет в `exchangeInfo`) → операция не начинается, `StepResult(WAITING, "<SYMBOL> is HALT: list kept")`, алерт `halted:<SYMBOL>` (не блокирует admission; снимается, когда символ снова торгуется, при закрытии позиции и при выходе из контекста). Ошибка чтения статуса не задерживает выход — поведение как прежде.
 - Операция, записанная до остановки, но без отправленной отмены (`op_state.cancel is None`), отзывается: `operation_withdrawn`, статус `protected`, `unprotected_since` сброшен, `overdue:` снят. Отправленная отмена (`done`/`unknown`) не отзывается.

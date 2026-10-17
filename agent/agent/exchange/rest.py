@@ -58,6 +58,14 @@ class ExchangeError(RuntimeError):
     """Raised when a Binance REST request cannot be completed."""
 
 
+class UnknownSymbol(ExchangeError, LookupError):
+    """The exchange does not list the symbol (-1121): never, or no longer."""
+
+
+#: Binance's "Invalid symbol."
+INVALID_SYMBOL = -1121
+
+
 def _credentials(network: Network) -> tuple[str, str]:
     """Return ``(api_key, api_secret)`` for a network, or raise."""
     if network == "live":
@@ -244,8 +252,20 @@ class ExchangeRest:
         return await self._market(self._client.rest_api.ticker_price, symbol=symbol)
 
     async def exchange_info(self, symbol: str | None = None) -> Any:
-        """Return exchange metadata (filters, symbol status, ...)."""
-        return await self._market(self._client.rest_api.exchange_info, symbol=symbol)
+        """Return exchange metadata (filters, symbol status, ...).
+
+        A ``symbol`` the exchange does not list raises :class:`UnknownSymbol`
+        — after a delisting that is the only answer there is.
+        """
+        try:
+            return await self._market(
+                self._client.rest_api.exchange_info, symbol=symbol
+            )
+        except ExchangeError as exc:
+            code = getattr(exc.__cause__, "status_code", None)
+            if symbol is not None and code == INVALID_SYMBOL:
+                raise UnknownSymbol(f"{symbol} is not listed") from exc
+            raise
 
     async def symbols(self) -> list[ExchangeInfoResponseSymbolsInner]:
         """Every symbol the exchange lists, with its metadata.

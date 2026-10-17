@@ -15,7 +15,12 @@ from sqlalchemy import select
 
 from agent.common.commands import HANDLERS, AgentCommand, CommandContext
 from agent.exchange.hub import StreamHub
-from agent.execution.exits import Exits, NoSuchPosition, SymbolNotTrading
+from agent.execution.exits import (
+    Exits,
+    NoSuchPosition,
+    SymbolNotTrading,
+    WriteOffRefused,
+)
 from agent.execution.ledger import losing_trades_today
 from agent.execution.models import ExecutionEvent, PositionStatus
 from agent.execution.monitor import MonitorFeed
@@ -332,5 +337,141 @@ def test_close_position_is_refused_while_the_symbol_is_halted() -> None:
         with pytest.raises(SymbolNotTrading, match="HALT"):
             await exits.close_symbol("BTCUSDT")
         await kept(state, stack, position_id)
+
+    run(scenario)
+
+
+# --- write-off of a delisted symbol's position (ClickUp 869fjdy10) -----------------------
+
+
+def delist(state: World, stack: Stack, symbol: str = "BTCUSDT") -> None:
+    state.fake.delist(symbol)
+    stack.orders.filters.invalidate("live", symbol)
+
+
+def test_write_off_closes_a_delisted_position_without_an_order() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        delist(state, stack)
+        stack.runtime.alerts["overdue:BTCUSDT"] = "BTCUSDT unprotected"
+        sent = state.fake.calls_to("new_order"), state.fake.calls_to("order_list_oco")
+        result = await exits.write_off(
+            "btcusdt", confirm="BTCUSDT", proceeds=Decimal("12.5")
+        )
+        assert result.step is Step.CLOSED
+        assert (
+            state.fake.calls_to("new_order"),
+            state.fake.calls_to("order_list_oco"),
+        ) == sent
+        position = await state.position(stack, position_id)
+        assert outcome(position) == ("delisted", "write_off")
+        assert position.realized_pnl == (
+            Decimal("12.5") - position.bought_quote - position.commission_quote
+        )
+        assert not [
+            k for k in stack.runtime.alerts if k.endswith(":BTCUSDT")
+        ]  # overdue and halted gone
+        async with stack.runtime.session() as session:
+            kinds = (
+                await session.scalars(
+                    select(ExecutionEvent.type).where(
+                        ExecutionEvent.position_id == position_id
+                    )
+                )
+            ).all()
+        assert "written_off" in kinds
+        with pytest.raises(NoSuchPosition):
+            await exits.write_off("BTCUSDT", confirm="BTCUSDT")
+
+    run(scenario)
+
+
+def test_write_off_is_refused_while_the_symbol_trades() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        with pytest.raises(WriteOffRefused, match="trades"):
+            await exits.write_off("BTCUSDT", confirm="BTCUSDT")
+        delist(state, stack)
+        with pytest.raises(WriteOffRefused, match="confirm"):
+            await exits.write_off("BTCUSDT", confirm="ETHUSDT")
+        with pytest.raises(WriteOffRefused, match="negative"):
+            await exits.write_off("BTCUSDT", confirm="BTCUSDT", proceeds=Decimal(-1))
+        assert (
+            await state.position(stack, position_id)
+        ).status != PositionStatus.CLOSED
+
+    run(scenario)
+
+
+def test_write_off_is_refused_while_the_list_is_live() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        halt(state, stack, "BREAK")  # not trading, but the OCO still stands
+        with pytest.raises(WriteOffRefused, match="open order"):
+            await exits.write_off("BTCUSDT", confirm="BTCUSDT")
+        assert (
+            await state.position(stack, position_id)
+        ).status == PositionStatus.PROTECTED
+
+    run(scenario)
+
+
+def test_write_off_waits_for_an_unproven_order() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        state.fake.fault("new_order", "timeout_after")
+        waiting = await stack.worker.close(
+            position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
+        )
+        assert waiting.reason == "exit outcome unknown"
+        delist(state, stack)
+        with pytest.raises(WriteOffRefused, match="unproven"):
+            await exits.write_off("BTCUSDT", confirm="BTCUSDT")
+
+    run(scenario)
+
+
+def test_write_off_position_command_reports_the_outcome() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        stack.runtime.write_off_position = exits.write_off
+        engine = Mock(execution=stack.runtime)
+        reports: list[dict[str, Any]] = []
+
+        async def run_command(payload: dict[str, Any]) -> None:
+            ctx = CommandContext(
+                engine,
+                Mock(pipeline=Mock()),
+                AgentCommand("c", "write_off_position", payload, state.clock.now()),
+            )
+            ctx.report = AsyncMock(side_effect=lambda **kw: reports.append(kw))  # type: ignore[method-assign]
+            await HANDLERS["write_off_position"](ctx, payload)
+
+        await run_command({"symbol": "BTCUSDT", "confirm": "BTCUSDT"})
+        assert reports[-1]["ok"] is False and "trades" in reports[-1]["message"]
+        delist(state, stack)
+        await run_command(
+            {"symbol": "BTCUSDT", "confirm": "BTCUSDT", "proceeds_quote": "x"}
+        )
+        assert reports[-1]["ok"] is False and "number" in reports[-1]["message"]
+        await run_command(
+            {"symbol": "btcusdt", "confirm": "BTCUSDT", "proceeds_quote": "3.25"}
+        )
+        assert reports[-1]["ok"] is True
+        assert reports[-1]["data"] == {
+            "symbol": "BTCUSDT",
+            "step": "closed",
+            "proceeds_quote": "3.25",
+        }
 
     run(scenario)

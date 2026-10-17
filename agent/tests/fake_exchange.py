@@ -567,6 +567,17 @@ class FakeExchange:
         order_list.status = "ALL_DONE"
         order_list.status_type = "ALL_DONE"
 
+    def delist(self, symbol: str) -> None:
+        """The exchange delists ``symbol``: its orders are cancelled, it is gone."""
+        with self._lock:
+            for order_list in self.lists.values():
+                if order_list.symbol == symbol and order_list.status == "EXECUTING":
+                    self._finish_list(order_list, "CANCELED")
+            for order in self.orders.values():
+                if order.symbol == symbol and order.open:
+                    order.status = "CANCELED"
+            del self.rules[symbol]
+
     def _settle_list(self, order_list: OrderList) -> None:
         """Binance OCO: once a leg is triggered or executes at all, even
         partly, its sibling is cancelled (EXPIRED). The list ends when no leg
@@ -815,6 +826,8 @@ class FakeExchange:
         with self._lock:
             self._before("get_open_orders", kwargs)
             symbol = kwargs.get("symbol")
+            if symbol is not None and symbol not in self.rules:
+                raise BadRequestError("Invalid symbol.", -1121)
             payload = [
                 o.document()
                 for o in self.orders.values()
@@ -877,6 +890,8 @@ class FakeExchange:
         with self._lock:
             self._before("exchange_info", kwargs)
             symbol = kwargs.get("symbol")
+            if symbol is not None and symbol not in self.rules:
+                raise BadRequestError("Invalid symbol.", -1121)
             payload = {
                 "timezone": "UTC",
                 "serverTime": self.now(),

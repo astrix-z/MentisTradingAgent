@@ -762,10 +762,27 @@ class Protector:
         )
 
     async def _finalize(
-        self, position_id: uuid.UUID, reason: ExitReason, mechanism: ExitMechanism
+        self,
+        position_id: uuid.UUID,
+        reason: ExitReason,
+        mechanism: ExitMechanism,
+        *,
+        proceeds: Decimal | None = None,
     ) -> StepResult:
+        """Close the position; ``proceeds`` (a write-off) is quote the owner got
+        for the asset outside the agent's orders, booked in the same transaction."""
         async with self.runtime.session() as session, session.begin():
             position = await lock_position(session, position_id)
+            if proceeds is not None and position.status != PositionStatus.CLOSED:
+                position.sold_quote += proceeds
+                await record_event(
+                    session,
+                    account=position.account,
+                    network=position.network,
+                    kind="written_off",
+                    payload={"quantity": position.quantity, "proceeds": proceeds},
+                    position=position,
+                )
             attempts = (
                 await session.scalars(
                     select(OrderAttempt.client_order_id).where(
