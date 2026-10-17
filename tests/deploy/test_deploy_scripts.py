@@ -183,6 +183,23 @@ STUBS: dict[str, str] = {
     "docker": r"""
         echo "docker $*" >>"$STATE/calls.log"
         img() { echo "$STATE/images/${1//\//_}"; }
+        # Redis's data: live keys in $STATE/redis, a volume's snapshot and AOF
+        # in $STATE/voldata/<volume>/{rdb,aof}; the container's /data volume in
+        # c-redis.mount, its appendonly in c-redis.aof (869fjdy14).
+        mount() { cat "$STATE/containers/c-redis.mount"; }
+        aof_mode() { cat "$STATE/containers/c-redis.aof" 2>/dev/null || echo yes; }
+        keep() {  # keep <from dir> <to dir>: replace the contents
+          rm -rf "$2"; mkdir -p "$2"; cp -r "$1/." "$2/" 2>/dev/null || true
+        }
+        persist() {  # what the running Redis has on disk when it stops
+          keep "$STATE/redis" "$STATE/voldata/$(mount)/rdb"
+          [[ "$(aof_mode)" == yes ]] && keep "$STATE/redis" "$STATE/voldata/$(mount)/aof"
+          return 0
+        }
+        declares_volume() {
+          grep -qx redis-data "$STATE/compose_volumes" 2>/dev/null \
+            || [[ ! -f "$STATE/compose_volumes" ]]
+        }
         if [[ "$1" == compose ]]; then
           shift
           while [[ "$1" == --env-file || "$1" == -f ]]; do shift 2; done
@@ -220,7 +237,8 @@ STUBS: dict[str, str] = {
                 cat "$STATE/error_redis_$op"; exit "$strict"
               fi
               case "$op" in
-                SAVE) echo OK ;;
+                SAVE) keep "$STATE/redis" "$STATE/voldata/$(mount)/rdb"; echo OK ;;
+                CONFIG) printf 'appendonly\n%s\n' "$(aof_mode)" ;;
                 SET) echo "$3" >"$STATE/redis/$key"; echo OK ;;
                 DEL) rm -f "$STATE/redis/$key"; echo 1 ;;
                 GET) cat "$STATE/redis/$key" 2>/dev/null || true ;;
@@ -243,10 +261,26 @@ STUBS: dict[str, str] = {
                 cp "$(img "mentis-$s:latest")" "$STATE/containers/c-$s.image" 2>/dev/null || true
                 rm -f "$STATE/containers/c-$s.stopped"
               done
-              # Redis is recreated on the volume compose now names, if it exists.
-              if [[ -z "$named" || "$named " == *" redis "* ]] \
-                && [[ -f "$STATE/volumes/mentis_redis-data" ]]; then
-                echo mentis_redis-data >"$STATE/containers/c-redis.mount"
+              # Redis is recreated. A target that declares redis-data mounts it
+              # with appendonly yes and loads its AOF; one that does not keeps
+              # the mounted volume (compose carries it over) without AOF and
+              # loads the snapshot. Running, the old one saves on its way out.
+              if [[ -z "$named" || "$named " == *" redis "* ]]; then
+                if [[ -f "$STATE/containers/c-redis.stopped" ]]; then
+                  rm -f "$STATE/containers/c-redis.stopped"
+                else
+                  persist
+                fi
+                if declares_volume; then
+                  [[ -f "$STATE/volumes/mentis_redis-data" ]] \
+                    || echo "volume create mentis_redis-data" >"$STATE/volumes/mentis_redis-data"
+                  echo mentis_redis-data >"$STATE/containers/c-redis.mount"
+                  echo yes >"$STATE/containers/c-redis.aof"
+                  keep "$STATE/voldata/mentis_redis-data/aof" "$STATE/redis"
+                else
+                  echo no >"$STATE/containers/c-redis.aof"
+                  keep "$STATE/voldata/$(mount)/rdb" "$STATE/redis"
+                fi
               fi
               mkdir -p "$STATE/redis"
               if [[ -f "$STATE/catalog_payload" ]]; then
@@ -260,6 +294,12 @@ STUBS: dict[str, str] = {
               [[ -f "$STATE/containers/c-$2.image" ]] && echo "c-$2" ;;
             stop)
               for s in "$@"; do
+                # docker stop waits for requests in flight: their writes land.
+                if [[ "$s" == backend && -f "$STATE/backend_inflight" ]]; then
+                  read -r k v <"$STATE/backend_inflight"
+                  echo "$v" >"$STATE/redis/$k"; rm "$STATE/backend_inflight"
+                fi
+                [[ "$s" == redis ]] && persist
                 [[ -f "$STATE/stuck_$s" ]] || touch "$STATE/containers/c-$s.stopped"
               done ;;
             start)
@@ -297,12 +337,23 @@ STUBS: dict[str, str] = {
               inspect) [[ -f "$STATE/volumes/$name" ]] ;;
               create) [[ -f "$STATE/fail_volume_create" ]] && exit 1
                       echo "$*" >"$STATE/volumes/$name" ;;
-              rm) rm "$STATE/volumes/$name" ;;
+              rm) rm "$STATE/volumes/$name"; rm -rf "$STATE/voldata/$name" ;;
             esac ;;
           run)
-            # The Redis copy (cp -a) and AOF conversion (redis-server).
-            [[ -f "$STATE/fail_redis_copy" && "$*" == *"cp -a"* ]] && exit 1
-            [[ -f "$STATE/fail_redis_convert" && "$*" == *redis-server* ]] && exit 1
+            # The Redis copy (cp -a: the container's /data into the volume at
+            # /target) and the AOF conversion (redis-server: AOF from the
+            # snapshot of the volume at /data).
+            vol=""; prev=""
+            for a in "$@"; do
+              [[ "$prev" == -v ]] && vol="${a%%:*}"; prev="$a"
+            done
+            if [[ "$*" == *"cp -a"* ]]; then
+              [[ -f "$STATE/fail_redis_copy" ]] && exit 1
+              keep "$STATE/voldata/$(mount)/rdb" "$STATE/voldata/$vol/rdb"
+            elif [[ "$*" == *redis-server* ]]; then
+              [[ -f "$STATE/fail_redis_convert" ]] && exit 1
+              keep "$STATE/voldata/$vol/rdb" "$STATE/voldata/$vol/aof"
+            fi
             exit 0 ;;
           logs) ;;
           image)
@@ -1462,19 +1513,40 @@ def test_a_unit_killed_during_g4_is_not_a_success(
     assert server.redis("trading:start_fence") is not None
 
 
-# --- Redis moves to its named volume once (ClickUp 869fjdy14) -----------------------
+# --- Redis on its named volume with AOF (ClickUp 869fjdy14) -----------------------
+# The stub keeps Redis's data per volume (snapshot and AOF) and what a recreated
+# Redis loads, so these check the data the new Redis comes up with, not only
+# the order of the calls.
+
+
+def redis_state(server: Server, *, mount: str, aof: str, **keys: str) -> None:
+    """The running Redis: its /data volume, appendonly and live keys; the
+    backend knows the fence, so it runs until (3a) stops it."""
+    runs(server, NO_LOCK)
+    (server.releases / "current").write_text(f"{NO_LOCK}\n")
+    server.put("containers/c-redis.mount", mount)
+    server.put("containers/c-redis.aof", aof)
+    for key, value in keys.items():
+        server.put(f"redis/{key.replace('__', ':')}", value)
 
 
 def anonymous_redis(server: Server) -> None:
-    """The stack before 869fjdy14: Redis writes to an anonymous volume."""
-    server.put("containers/c-redis.mount", "0a1b2c3d")
+    """The stack before 869fjdy14: Redis on an anonymous volume, no AOF."""
     (server.state / "volumes/mentis_redis-data").unlink()
+    redis_state(
+        server,
+        mount="0a1b2c3d",
+        aof="no",
+        agent__execution="enabled",
+        agent__runtime="running",
+    )
 
 
-def test_redis_moves_to_the_named_volume_after_the_fence_and_before_up(
-    server: Server,
-) -> None:
+def test_redis_moves_to_the_named_volume_with_every_write(server: Server) -> None:
     anonymous_redis(server)
+    # A Stop that switches trading off is in flight when the backend is
+    # stopped: the fence does not close it, so it must land in the move.
+    server.put("backend_inflight", "agent:execution disabled-by-owner")
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 0, result.stdout + result.stderr
     calls = server.calls()
@@ -1483,7 +1555,10 @@ def test_redis_moves_to_the_named_volume_after_the_fence_and_before_up(
         "redis SET trading:start_fence",
         "stop agent",
         "redis DEL agent:strategies",
+        "redis CONFIG GET",
+        "stop backend",
         "redis SAVE",
+        "stop redis",
         "docker volume create --label com.docker.compose.project=mentis",
         "cp -a /data/. /target/",
         "redis-server --appendonly no",
@@ -1491,20 +1566,58 @@ def test_redis_moves_to_the_named_volume_after_the_fence_and_before_up(
         "redis DEL trading:start_fence",
     )
     assert steps == sorted(steps)
-    assert (server.state / "volumes/mentis_redis-data").exists()
+    assert server.redis("agent:execution") == "disabled-by-owner"
+    assert server.redis("agent:runtime") == "running"
+    assert server.redis("agent:strategies") is not None  # the new agent's catalog
+    assert server.redis("trading:start_fence") is None  # lifted by (6), not lost
     assert (server.state / "containers/c-redis.mount").read_text().strip() == (
         "mentis_redis-data"
     )
-    assert "(3a) Redis: том 0a1b2c3d → mentis_redis-data" in result.stdout
+    assert "(3a) Redis: том 0a1b2c3d (appendonly no)" in result.stdout
     assert not any("volume rm" in call for call in calls)  # the old one is kept
 
 
-def test_redis_on_its_volume_is_not_moved_again(server: Server) -> None:
+def test_after_a_rollback_the_aof_is_rebuilt_from_the_newer_snapshot(
+    server: Server,
+) -> None:
+    # Review of #42: a rollback ran Redis on the same volume without AOF; the
+    # redeploy took "the volume is mounted" for done and loaded the stale AOF.
+    redis_state(
+        server, mount="mentis_redis-data", aof="no", agent__execution="disabled"
+    )
+    server.put("voldata/mentis_redis-data/aof/agent:execution", "enabled")  # stale
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = server.calls()
+    order(calls, "stop backend", "redis SAVE", "stop redis", "redis-server", "up -d")
+    assert not any("volume create" in call or "cp -a" in call for call in calls)
+    assert server.redis("agent:execution") == "disabled"
+    assert server.redis("trading:start_fence") is None
+
+
+def test_without_the_rebuild_the_stale_aof_would_win(server: Server) -> None:
+    # The stub itself: a Redis recreated with AOF on a volume whose AOF is
+    # older than what it ran with loses the newer data. That is what (3a)
+    # prevents — here a target without the volume leaves (3a) out.
+    redis_state(
+        server, mount="mentis_redis-data", aof="no", agent__execution="disabled"
+    )
+    server.put("voldata/mentis_redis-data/aof/agent:execution", "enabled")
+    server.put("compose_volumes", "app-db-data\n")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert server.redis("agent:execution") == "disabled"  # no AOF: the snapshot
+
+
+def test_redis_on_its_volume_with_aof_is_left_alone(server: Server) -> None:
+    redis_state(server, mount="mentis_redis-data", aof="yes", agent__runtime="running")
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 0, result.stdout + result.stderr
     calls = server.calls()
     assert not any("redis SAVE" in call or "volume create" in call for call in calls)
     assert not any(call.startswith("docker run") for call in calls)
+    assert not any("stop backend" in call for call in calls)
+    assert server.redis("agent:runtime") == "running"
 
 
 def test_a_target_without_the_volume_leaves_redis_alone(server: Server) -> None:
@@ -1514,10 +1627,11 @@ def test_a_target_without_the_volume_leaves_redis_alone(server: Server) -> None:
     assert result.returncode == 0, result.stdout + result.stderr
     assert not any("redis SAVE" in call for call in server.calls())
     assert not (server.state / "volumes/mentis_redis-data").exists()
+    assert server.redis("agent:runtime") == "running"
 
 
 @pytest.mark.parametrize("fault", ["fail_redis_copy", "fail_redis_convert"])
-def test_a_failed_redis_move_keeps_the_old_volume_and_the_previous_agent(
+def test_a_failed_redis_move_brings_the_old_stack_back(
     server: Server, fault: str
 ) -> None:
     anonymous_redis(server)
@@ -1525,15 +1639,36 @@ def test_a_failed_redis_move_keeps_the_old_volume_and_the_previous_agent(
     result = server.deploy("--revision", REVISION)
     assert result.returncode == 1
     calls = server.calls()
-    order(calls, "volume create", "volume rm", "start agent")
+    order(
+        calls,
+        "volume create",
+        "volume rm",
+        "start redis",
+        "start backend",
+        "start agent",
+    )
     assert not any("up -d --remove-orphans" in call for call in calls)
     assert not (
         server.state / "volumes/mentis_redis-data"
     ).exists()  # retry starts clean
     assert (server.state / "containers/c-redis.mount").read_text().strip() == "0a1b2c3d"
+    assert server.redis("agent:runtime") == "running"
     assert server.redis("trading:start_fence") is not None
-    assert server.image("mentis-agent:latest") == f"id-agent-{T0}"
-    assert "перенос Redis в mentis_redis-data не удался" in result.stdout, result.stdout
+    assert server.image("mentis-agent:latest") == f"id-agent-{NO_LOCK}"
+    assert "перенос Redis в mentis_redis-data" in result.stdout, result.stdout
+
+
+def test_a_failed_rebuild_after_a_rollback_keeps_the_volume(server: Server) -> None:
+    redis_state(
+        server, mount="mentis_redis-data", aof="no", agent__execution="disabled"
+    )
+    server.put("fail_redis_convert")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    calls = server.calls()
+    assert not any("volume rm" in call for call in calls)  # Redis's own volume
+    order(calls, "start redis", "start backend", "start agent")
+    assert server.redis("agent:execution") == "disabled"
 
 
 def test_a_named_volume_redis_does_not_use_is_not_trusted(server: Server) -> None:
@@ -1547,5 +1682,23 @@ def test_a_named_volume_redis_does_not_use_is_not_trusted(server: Server) -> Non
     assert not any(
         "redis SAVE" in call or "up -d --remove-orphans" in call for call in calls
     )
+    assert not any("stop backend" in call for call in calls)
     assert "том mentis_redis-data уже есть" in result.stdout, result.stdout
     order(calls, "stop agent", "start agent")
+
+
+def test_a_backend_stopped_at_step_0_is_not_started_by_the_redis_trap(
+    server: Server,
+) -> None:
+    # T0's backend ignores the fence: (0) stops it and it stays stopped; a
+    # failed move must not bring it back up.
+    (server.state / "volumes/mentis_redis-data").unlink()
+    server.put("containers/c-redis.mount", "0a1b2c3d")
+    server.put("containers/c-redis.aof", "no")
+    server.put("fail_redis_copy")
+    result = server.deploy("--revision", REVISION)
+    assert result.returncode == 1
+    calls = server.calls()
+    assert sum("stop backend" in call for call in calls) == 1  # only at (0)
+    assert not any("start backend" in call for call in calls)
+    order(calls, "start redis", "start agent")
