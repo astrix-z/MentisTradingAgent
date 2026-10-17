@@ -32,7 +32,7 @@ from agent.execution.monitor import MonitorFeed
 from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.protection import Step, StepResult
 from agent.execution.runtime import ExecutionRuntime
-from agent.execution.worker import PositionWorker
+from agent.execution.worker import HALTED, PositionWorker
 from agent.strategies.base import ExitPolicy
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,10 @@ OPEN = (
 
 class NoSuchPosition(LookupError):
     pass
+
+
+class SymbolNotTrading(LookupError):
+    """``close_position`` on a symbol that takes no orders: the list stays."""
 
 
 class Exits:
@@ -77,7 +81,10 @@ class Exits:
         due = position.opened_at + timedelta(hours=float(policy.max_hold_hours))
         if self._clock() < due:
             return None
-        logger.info("%s held since %s: time exit", position.symbol, position.opened_at)
+        if f"{HALTED}{position.symbol}" not in self.runtime.alerts:
+            logger.info(
+                "%s held since %s: time exit", position.symbol, position.opened_at
+            )
         return await self.worker.close(
             position_id, ExitReason.TIME, ExitMechanism.MARKET_TIME
         )
@@ -150,6 +157,12 @@ class Exits:
             )
         if position_id is None:
             raise NoSuchPosition(f"no open position in {symbol.upper()}")
+        status = await self.worker.not_trading(await self._position(position_id))
+        if status is not None:
+            raise SymbolNotTrading(
+                f"{symbol.upper()} is {status}: not closed, its protection stays "
+                "on the exchange"
+            )
         return await self.worker.close(
             position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
         )
