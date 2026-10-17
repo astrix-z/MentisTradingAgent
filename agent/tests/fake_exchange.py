@@ -333,6 +333,12 @@ class FakeExchange:
     def now(self) -> int:
         return self._clock()
 
+    @staticmethod
+    def _trading(rules: SymbolRules) -> None:
+        """New orders on a symbol out of ``TRADING`` are refused; cancels are not."""
+        if rules.status != "TRADING":
+            raise BadRequestError("Market is closed.", NEW_ORDER_REJECTED)
+
     # --- scripting ---------------------------------------------------------
 
     def fault(
@@ -614,6 +620,7 @@ class FakeExchange:
             self._before("new_order", kwargs)
             symbol = kwargs["symbol"]
             rules = self.rules[symbol]
+            self._trading(rules)
             side = enum_value(kwargs["side"])
             kind = enum_value(kwargs["type"])
             qty = dec(kwargs.get("quantity"))
@@ -693,6 +700,7 @@ class FakeExchange:
             self._before("order_list_oco", kwargs)
             symbol = kwargs["symbol"]
             rules = self.rules[symbol]
+            self._trading(rules)
             qty = dec(kwargs["quantity"])
             tp = dec(kwargs["above_price"])
             stop = dec(kwargs["below_stop_price"])

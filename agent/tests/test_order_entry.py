@@ -227,8 +227,10 @@ def test_quote_gone_stale_during_the_filter_fetch_is_not_bought() -> None:
         signal_id = await state.reserve(stack)
         real = stack.orders.filters.get
 
-        async def slow_filters(network: str, symbol: str) -> Any:
-            filters = await real(network, symbol)
+        async def slow_filters(
+            network: str, symbol: str, *, max_age: float | None = None
+        ) -> Any:
+            filters = await real(network, symbol, max_age=max_age)
             state.clock.advance(6)  # past quote_max_fetch_age_s (5)
             return filters
 
