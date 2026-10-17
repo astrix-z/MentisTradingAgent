@@ -162,6 +162,11 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-10-16] Проверка ключа: торговые группы Binance вместо SPOT — Claude-Mentis
+- На production после выкладки `d2eb225` алерт `execution: key: API key cannot trade spot (canTrade=True, permissions=['TRD_GRP_072'])`. Live-аккаунт состоит в торговой группе Binance: в `permissions` указана только группа, `SPOT` нет. По `exchangeInfo` (live, 2026-10-16) группа 072 есть в `permissionSets` 510 из 511 USDT-пар (нет только RWUSDUSDT). Прежняя проверка `"SPOT" in permissions` закрывала бы все входы (`key` блокирует admission).
+- `ExecutionRuntime._check_key`: нужны `canTrade` и непустые permissions. Разрешён ли символ, проверяет `check_symbol` при каждом входе: `SymbolFilters.permission_sets` (из `permissionSets`, запасной вариант — старое `permissions`), у аккаунта должно быть хотя бы одно право из каждого набора, иначе `Skip.SYMBOL_NOT_PERMITTED`. Admission передаёт `account.permissions` из того же `get_account`.
+- Доки: план §9.5; runbook §4 «Права ключа и торговые группы Binance» (модель прав, что проверяет агент, ручная проверка через `exchangeInfo`, действия оператора). Тесты: `test_sizing.py` (наборы прав, реальные фикстуры), `test_execution_runtime.py` (+2). Agent 855 passed / 1 skip (одноразовые PG 18 + Redis 7); ruff/format/mypy без замечаний.
+
 ### [2026-10-16] Start не падает из-за символов, которых нет в сети запуска — Claude-Mentis
 - Симптом на production: testnet, `tripple_screen` → `error`, `strategy start failed: Binance REST call failed: (-1121, 'Invalid symbol.')`. Причина: вселенная рабочих символов читается с live (`symbols.UNIVERSE_NETWORK`), testnet listит подмножество; отбор стратегии грузит свечи всех символов одним `gather`, и один неизвестный символ обрывает весь `on_start`.
 - `Engine._start_run` до `on_start` сверяет символы Start с `exchangeInfo` сети запуска (`status == "TRADING"`): остальные не входят в прогон, лог `warning`, в heartbeat — предупреждение `not trading on <network>, left out: …` (первые 20 по имени, дальше счётчиком), снимается при Stop. Если не осталось ни одного — `ValueError` с именами, состояние `error`.

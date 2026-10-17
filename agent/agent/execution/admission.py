@@ -372,6 +372,7 @@ class Admission:
                 free_quote=free,
                 reserved_quote=reserved,
                 occupied_slots=occupied,
+                account_permissions=frozenset(account.permissions or []),
             ),
             free,
             quote,
