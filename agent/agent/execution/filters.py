@@ -94,10 +94,20 @@ class SymbolFilters:
     percent_by_side: PercentBySide | None = None
     max_position: Decimal | None = None
     unknown: tuple[str, ...] = field(default_factory=tuple)
+    #: ``permissionSets``: the account needs one permission of every set.
+    permission_sets: tuple[frozenset[str], ...] = ()
 
     @property
     def tradable(self) -> bool:
         return self.status == "TRADING"
+
+    def permits(self, account_permissions: frozenset[str]) -> bool:
+        """Whether an account with ``account_permissions`` may trade here.
+
+        Binance puts an account either on ``SPOT`` or in a trading group
+        (``TRD_GRP_072``); a symbol lists the groups allowed on it.
+        """
+        return all(group & account_permissions for group in self.permission_sets)
 
 
 def _dec(value: Any, default: str = "0") -> Decimal:
@@ -177,6 +187,13 @@ def parse_symbol(entry: Any) -> SymbolFilters:
             unknown.append(kind)
     if not price or not lot:
         unknown.append("missing PRICE_FILTER/LOT_SIZE")
+    # ``permissions`` is the older single-set form of ``permissionSets``.
+    sets = raw.get("permissionSets") or (
+        [raw["permissions"]] if raw.get("permissions") else []
+    )
+    values["permission_sets"] = tuple(
+        frozenset(str(item) for item in group) for group in sets
+    )
     return SymbolFilters(
         symbol=str(raw.get("symbol")),
         status=str(raw.get("status")),

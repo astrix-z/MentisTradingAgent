@@ -22,7 +22,8 @@ What it owns here:
   names the network: the account behind it is identified, which is cheap,
   but the lock and the reconciliation are taken only while real trading is
   enabled or unfinished work is there, and given back once neither is;
-* the **key preflight** (``canTrade`` and ``SPOT``), the **clock check** and
+* the **key preflight** (``canTrade`` and some permission: ``SPOT`` or a
+  trading group, per symbol in sizing), the **clock check** and
   the **BNB low** warning.
 
 Context switches (another network or another account) are refused while the
@@ -727,8 +728,11 @@ class ExecutionRuntime:
     # --- periodic checks ------------------------------------------------------------
 
     def _check_key(self, account: Any) -> None:
+        # Not "SPOT" in permissions: an account in a trading group lists only
+        # the group (``TRD_GRP_072``); which symbols it may trade is the
+        # symbols' ``permissionSets``, checked per entry (sizing).
         permissions = set(account.permissions or [])
-        if account.can_trade is not True or "SPOT" not in permissions:
+        if account.can_trade is not True or not permissions:
             self.alerts["key"] = (
                 f"API key cannot trade spot (canTrade={account.can_trade}, "
                 f"permissions={sorted(permissions)})"

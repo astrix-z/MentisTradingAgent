@@ -382,6 +382,31 @@ def test_key_without_spot_trading_keeps_entries_closed() -> None:
     run(scenario)
 
 
+def test_key_in_a_trading_group_may_trade() -> None:
+    """A live account lists its trading group, not SPOT (TRD_GRP_072)."""
+
+    async def scenario(state: World) -> None:
+        state.exchange("live").permissions = ["TRD_GRP_072"]
+        runtime = state.runtime()
+        runtime.settings = ENABLED
+        await runtime.prepare_start(network="live", params=USDT)
+        assert "key" not in runtime.alerts
+
+    run(scenario)
+
+
+def test_key_without_any_permission_keeps_entries_closed() -> None:
+    async def scenario(state: World) -> None:
+        state.exchange("live").permissions = []
+        runtime = state.runtime()
+        runtime.settings = ENABLED
+        await runtime.prepare_start(network="live", params=USDT)
+        runtime.open_admission("tripple_screen")
+        assert runtime.admission_block() == "key"
+
+    run(scenario)
+
+
 def test_skewed_clock_closes_admission_and_low_bnb_warns() -> None:
     async def scenario(state: World) -> None:
         fake = state.exchange("live")
