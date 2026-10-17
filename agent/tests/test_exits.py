@@ -707,3 +707,34 @@ def test_a_slow_status_read_leaves_no_alert_on_a_position_closed_meanwhile() -> 
         assert "status_unknown:BTCUSDT" not in stack.runtime.alerts
 
     run(scenario)
+
+
+def test_an_exit_of_a_position_closed_meanwhile_reads_no_status() -> None:
+    # Re-review of #41: the reconciler closed the position between
+    # close_position's check and the worker's lock; the worker then read the
+    # status of the closed position and a failed read left status_unknown.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        position = await state.position(stack, position_id)
+        assert position.protection_list_id is not None
+        assert position.take_profit is not None
+        state.fake.fill_leg(
+            position.protection_list_id.replace("-pl", "-pt"),
+            position.quantity,
+            position.take_profit,
+        )
+        await Reconciler(stack.worker).run()
+        assert (await state.position(stack, position_id)).status == (
+            PositionStatus.CLOSED
+        )
+        reads = state.fake.calls_to("exchange_info")
+        state.fake.fault("exchange_info", "reject", code=-1000, times=100)
+        result = await stack.worker.close(
+            position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
+        )
+        assert result.step is Step.CLOSED
+        assert state.fake.calls_to("exchange_info") == reads
+        assert "status_unknown:BTCUSDT" not in stack.runtime.alerts
+
+    run(scenario)

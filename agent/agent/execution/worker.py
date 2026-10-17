@@ -167,9 +167,16 @@ class PositionWorker:
         return status
 
     async def _halted(self, position: Position) -> StepResult | None:
-        """WAITING when cancelling the live list now would leave it unprotected."""
+        """WAITING when cancelling the live list now would leave it unprotected.
+
+        A closed position has no live list, whatever its row still names: its
+        status is not read (an alert it set would outlive it).
+        """
         state = position.op_state or {}
-        if position.protection_list_id is None or (
+        if (
+            position.status == PositionStatus.CLOSED
+            or position.protection_list_id is None
+        ) or (
             state.get("list") == position.protection_list_id
             and state.get("cancel") is not None
         ):
