@@ -385,12 +385,40 @@ def test_an_unreadable_status_keeps_the_list() -> None:
         assert result is not None and result.step is Step.WAITING
         assert result.reason == "BTCUSDT status unknown: list kept"
         await kept(state, stack, position_id)
+        # Visible in the heartbeat (ClickUp 869fjf3xq), entries stay open.
+        assert "status_unknown:BTCUSDT" in stack.runtime.alerts
+        assert "halted:BTCUSDT" not in stack.runtime.alerts
+        assert stack.runtime.admission_block() is None
 
         state.fake.faults.pop("exchange_info")
         resume(state, stack)
         state.fake.set_price("BTCUSDT", Decimal(101))
         result = await exits.check_time(position_id)
         assert result is not None and result.step is Step.CLOSED
+        assert "status_unknown:BTCUSDT" not in stack.runtime.alerts
+
+    run(scenario)
+
+
+def test_status_unknown_clears_on_a_halt_read_and_on_close() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        halt(state)
+        state.fake.fault("exchange_info", "reject", code=-1000, times=100)
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.reason == "BTCUSDT status unknown: list kept"
+        assert "status_unknown:BTCUSDT" in stack.runtime.alerts
+        state.fake.faults.pop("exchange_info")
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.reason == "BTCUSDT is HALT: list kept"
+        assert "status_unknown:BTCUSDT" not in stack.runtime.alerts
+        assert "halted:BTCUSDT" in stack.runtime.alerts
+
+        # The position closes while the status is unreadable (here: as dust).
+        stack.runtime.alerts["status_unknown:BTCUSDT"] = "status of BTCUSDT unknown"
+        await stack.worker.protector._close_dust(position_id)
+        assert not [k for k in stack.runtime.alerts if k.endswith(":BTCUSDT")]
 
     run(scenario)
 

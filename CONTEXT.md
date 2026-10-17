@@ -162,6 +162,11 @@
 
 ## ЖУРНАЛ (последняя задача сверху)
 
+### [2026-10-17] Нечитаемый статус символа виден в heartbeat — Claude-Opus (869fjf3xq)
+- `PositionWorker.not_trading`: ошибка `exchangeInfo` (не `LookupError`) ставит информационный алерт `status_unknown:<SYMBOL>` (текст ошибки, «protection kept on the exchange, exits wait») и бросает `StatusUnknown`, как раньше. Warning в лог — один раз при появлении алерта; повтор в `_halted` убран. Любое успешное чтение (TRADING, остановка, «not listed») снимает алерт.
+- Алерт не закрывает входы (в `admission_block` не участвует). Снимается также в `Protector._finalize` (рядом с `overdue:`/`halted:`) и при выходе из контекста (`_CONTEXT_PREFIXES`).
+- Тесты: `test_an_unreadable_status_keeps_the_list` (алерт стоит, admission открыт, снят после восстановления), `test_status_unknown_clears_on_a_halt_read_and_on_close`, `test_the_switch_takes_and_gives_back_the_lead_without_a_start` (контекст). Runbook §0 и §6 обновлены. Рекомендация повторного ревью #36.
+
 ### [2026-10-17] Сверка балансов: цены одним запросом, тестовые активы testnet не блокируют — Claude-Opus (869fgqu5u)
 - `Reconciler._balances`: сначала активы сверх открытых позиций, затем **один** запрос цен всех символов (`ExchangeRest.ticker_prices()`, `ticker_price` без символа, вес 4 вместо 2 × N, приоритет RECONCILE). Ошибка цен — проверка не прочитана, прежний вывод остаётся. Актив без USDT-пары не оценивается (как раньше).
 - testnet: вместо `divergence:balance:*` по каждому активу — один информационный алерт `testnet_balances` («N assets held without a position on testnet»), admission не закрывается; на live — без изменений. `testnet_balances` снимается при выходе из контекста.
