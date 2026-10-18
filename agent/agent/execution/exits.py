@@ -157,12 +157,18 @@ class Exits:
     async def close_symbol(self, symbol: str) -> StepResult:
         """The ``close_position`` command."""
         position_id = await self._open_position(symbol.upper())
-        try:
-            status = await self.worker.not_trading(await self._position(position_id))
-        except StatusUnknown as exc:
-            raise SymbolNotTrading(
-                f"{exc}: not closed, its protection stays on the exchange"
-            ) from exc
+        # Under the position's lock: every close holds it, so an alert this
+        # read sets cannot outlive a position closed meanwhile.
+        async with self.worker.orders.lock_for(position_id):
+            position = await self._position(position_id)
+            if position.status == PositionStatus.CLOSED:
+                raise NoSuchPosition(f"no open position in {symbol.upper()}")
+            try:
+                status = await self.worker.not_trading(position)
+            except StatusUnknown as exc:
+                raise SymbolNotTrading(
+                    f"{exc}: not closed, its protection stays on the exchange"
+                ) from exc
         if status is not None:
             raise SymbolNotTrading(
                 f"{symbol.upper()} is {status}: not closed, its protection stays "

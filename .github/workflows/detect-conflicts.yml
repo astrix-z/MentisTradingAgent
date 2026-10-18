@@ -1,6 +1,10 @@
 name: "Conflict detector"
 on:
   push:
+    branches:
+      - development
+      - stage
+      - production
   pull_request_target: # zizmor: ignore[dangerous-triggers]
     types: [synchronize]
 
