@@ -1,11 +1,6 @@
 name: Playwright Tests
 
 on:
-  push:
-    branches:
-    - development
-    - stage
-    - production
   pull_request:
   workflow_dispatch:
     inputs:
@@ -13,6 +8,10 @@ on:
         description: 'Run the build with tmate debugging enabled (https://github.com/marketplace/actions/debugging-with-tmate)'
         required: false
         default: 'false'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -36,7 +35,7 @@ jobs:
     - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
       id: filter
       with:
-        # On push compare with the same branch (previous commit): the default base is
+        # Outside pull requests compare with the same branch (previous commit): the default base is
         # the repo default branch, and fetching it fails without persisted credentials
         base: ${{ github.ref_name }}
         filters: |
