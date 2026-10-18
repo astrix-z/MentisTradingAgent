@@ -82,8 +82,13 @@ git diff --quiet <ревизия> HEAD         # дерево merge-коммит
 Откат — та же команда с ревизией из истории `production` (§6).
 
 Прямой `git push` в `production` и `stage` запрещён — эти ветки меняются только
-merge PR. Запрет держится на договорённости: защита веток на GitHub для
-приватного репозитория без Pro недоступна (API отвечает `403`).
+merge PR. Запрет держит защита веток на GitHub (репозиторий публичный с
+2026-10-18): на `development`, `stage` и `production` запрещены force-push и
+удаление, а merge PR ждёт обязательных проверок — `test-backend`,
+`test-docker-compose`, `alls-green-playwright`, `pre-commit-alls-green`,
+`Run zizmor`. В `stage` и `production` PR ещё и должен содержать вершину
+целевой ветки. На админа защита не распространяется (`enforce_admins` выключен):
+`gh pr merge --admin` и прямой push — только осознанно, в аварии.
 
 ### Хотфикс
 
