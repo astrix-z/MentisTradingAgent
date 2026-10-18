@@ -2270,6 +2270,150 @@ def release_review(stand: Stand, journal: Journal, candidate: str) -> None:
     rollback_to_t0_with_execution(stand, journal, candidate)
 
 
+# --- Redis on its named volume with AOF (ClickUp 869fjdy14) ---------------------------
+
+
+def redis_cli(stand: Stand, *args: str) -> str:
+    return stand.compose(
+        "exec -T redis redis-cli " + " ".join(args), check=False
+    ).strip()
+
+
+def redis_facts(stand: Stand) -> dict[str, str]:
+    cid = stand.sh(f"cd {APP} && {COMPOSE} ps -q redis", check=False)
+    mount = stand.sh(
+        'docker inspect -f \'{{range .Mounts}}{{if eq .Destination "/data"}}'
+        "{{.Name}}{{end}}{{end}}' " + cid,
+        check=False,
+    )
+    aof = redis_cli(stand, "CONFIG GET appendonly").splitlines()[-1:]
+    return {
+        **stand.state(),
+        "redis /data": mount
+        if mount == "mentis_redis-data"
+        else f"анонимный {mount[:12]}",
+        "appendonly": aof[0] if aof else "?",
+    }
+
+
+def redis_volume_review(
+    stand: Stand, journal: Journal, previous: str, head: str
+) -> None:
+    """Anonymous → named with AOF, a rollback with writes, back, then down/up."""
+    stand.remove()
+    stand.build()
+    stand.publish({"production": "HEAD"})
+    setup_production_copy(stand)
+    result = deploy(stand, "--revision", previous, "--t0-revision", T0, "--t0-confirm")
+    facts = redis_facts(stand)
+    journal.add(
+        "V1",
+        f"Исходное состояние: ревизия до 869fjdy14 ({previous})",
+        "Redis на анонимном томе без AOF",
+        previous,
+        result,
+        facts,
+        {
+            "код 0": result.code == 0,
+            "анонимный том": facts["redis /data"].startswith("анонимный"),
+            "appendonly no": facts["appendonly"] == "no",
+        },
+    )
+    for i in range(1, 201):
+        redis_cli(stand, "SET", f"review:k{i}", f"v{i}")
+    redis_cli(stand, "SET", "review:before", "anonymous")
+
+    result = deploy(stand, "--revision", head)
+    facts = redis_facts(stand)
+    journal.add(
+        "V2",
+        "Выкладка HEAD: перенос (3a) с анонимного тома",
+        "backend и Redis остановлены до SAVE; данные на mentis_redis-data с AOF; "
+        "флаг снят после приёмки",
+        head,
+        result,
+        facts,
+        {
+            "код 0": result.code == 0,
+            "шаг (3a)": has(result, "(3a) Redis: том"),
+            "том mentis_redis-data": facts["redis /data"] == "mentis_redis-data",
+            "appendonly yes": facts["appendonly"] == "yes",
+            "200 ключей": redis_cli(stand, "GET", "review:k200") == "v200",
+            "ключ до переноса": redis_cli(stand, "GET", "review:before") == "anonymous",
+            "флаг снят": stand.fence() == "—",
+        },
+    )
+
+    result = deploy(stand, "--revision", previous)
+    facts = redis_facts(stand)
+    redis_cli(stand, "SET", "review:rollback", "written-without-aof")
+    redis_cli(stand, "SET", "review:before", "changed-after-rollback")
+    journal.add(
+        "V3",
+        f"Откат на {previous} (compose без тома), записи после отката",
+        "Redis на том же именованном томе без AOF; прежние данные на месте",
+        previous,
+        result,
+        facts,
+        {
+            "код 0": result.code == 0,
+            "тот же том": facts["redis /data"] == "mentis_redis-data",
+            "appendonly no": facts["appendonly"] == "no",
+            "200 ключей": redis_cli(stand, "GET", "review:k200") == "v200",
+        },
+    )
+
+    result = deploy(stand, "--revision", head)
+    facts = redis_facts(stand)
+    journal.add(
+        "V4",
+        "Снова HEAD после отката (ревью #42, P1)",
+        "AOF перестроен из снимка: записи, сделанные без AOF, не потеряны",
+        head,
+        result,
+        facts,
+        {
+            "код 0": result.code == 0,
+            "шаг (3a)": has(result, "(appendonly no)"),
+            "appendonly yes": facts["appendonly"] == "yes",
+            "запись после отката": redis_cli(stand, "GET", "review:rollback")
+            == "written-without-aof",
+            "изменение после отката": redis_cli(stand, "GET", "review:before")
+            == "changed-after-rollback",
+            "флаг снят": stand.fence() == "—",
+        },
+    )
+
+    stand.compose("down")
+    stand.compose("up -d")
+    for _ in range(60):
+        if redis_cli(stand, "PING") == "PONG":
+            break
+        time.sleep(2)
+    facts = redis_facts(stand)
+    journal.add(
+        "V5",
+        "`compose down` + `up` на HEAD",
+        "данные Redis сохраняются",
+        head,
+        None,
+        facts,
+        {
+            "том mentis_redis-data": facts["redis /data"] == "mentis_redis-data",
+            "200 ключей": redis_cli(stand, "GET", "review:k200") == "v200",
+            "запись после отката": redis_cli(stand, "GET", "review:rollback")
+            == "written-without-aof",
+        },
+    )
+
+
+REDIS_COVERAGE: list[tuple[str, list[str]]] = [
+    ("869fjdy14: перенос с анонимного тома при выкладке", ["V1", "V2"]),
+    ("Ревью #42 P1: откат без AOF и повторная выкладка", ["V3", "V4"]),
+    ("Задача: `compose down` + `up` сохраняет данные", ["V5"]),
+]
+
+
 def throwaway_targets(work: Path) -> tuple[str, str]:
     """Two commits on a throwaway branch that break the target contract."""
     tree = work / "throwaway"
@@ -2310,9 +2454,15 @@ def main() -> int:
     parser.add_argument("--keep", action="store_true")
     parser.add_argument(
         "--only",
-        choices=["release-review"],
+        choices=["release-review", "redis-volume"],
         help="release-review: only the first deploy from T0 and the rollback to it "
-        "(release review 869fg9avr)",
+        "(release review 869fg9avr); redis-volume: Redis's move to its named "
+        "volume, a rollback and back (869fjdy14)",
+    )
+    parser.add_argument(
+        "--previous",
+        default="47bdac6",
+        help="redis-volume: the revision before the named volume",
     )
     options = parser.parse_args()
     head = short("HEAD")
@@ -2338,6 +2488,35 @@ def main() -> int:
     sequence = list(dict.fromkeys(short(r) for r in picks))
     a, b = short(chain[-3]), short(chain[-2])
     sequence = [r for r in sequence if r not in (a, b)][:11]
+    if options.only == "redis-volume":
+        try:
+            redis_volume_review(stand, journal, short(options.previous), head)
+        except Exception as exc:
+            journal.add(
+                "!",
+                "Прогон прерван",
+                "—",
+                "—",
+                None,
+                {},
+                {"без исключения": False},
+                textwrap.shorten(str(exc), 900),
+            )
+            raise
+        finally:
+            journal.write(
+                options.out,
+                head=head,
+                started=started,
+                title="869fjdy14: Redis в именованном томе с AOF на стенде",
+                card="869fjdy14",
+                coverage=REDIS_COVERAGE,
+            )
+            log(f"journal: {options.out}")
+            if not options.keep:
+                stand.remove()
+            shutil.rmtree(work, ignore_errors=True)
+        return 0 if all(row.ok for row in journal.rows) else 1
     if options.only == "release-review":
         try:
             release_review(stand, journal, head)

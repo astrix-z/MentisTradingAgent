@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -33,6 +34,7 @@ from agent.execution.monitor import MonitorFeed
 from agent.execution.outcome import ExitMechanism, ExitReason
 from agent.execution.protection import Step
 from agent.execution.quotes import LastTrade
+from agent.execution.reconcile import Reconciler
 from agent.execution.worker import Operation
 
 
@@ -385,12 +387,40 @@ def test_an_unreadable_status_keeps_the_list() -> None:
         assert result is not None and result.step is Step.WAITING
         assert result.reason == "BTCUSDT status unknown: list kept"
         await kept(state, stack, position_id)
+        # Visible in the heartbeat (ClickUp 869fjf3xq), entries stay open.
+        assert "status_unknown:BTCUSDT" in stack.runtime.alerts
+        assert "halted:BTCUSDT" not in stack.runtime.alerts
+        assert stack.runtime.admission_block() is None
 
         state.fake.faults.pop("exchange_info")
         resume(state, stack)
         state.fake.set_price("BTCUSDT", Decimal(101))
         result = await exits.check_time(position_id)
         assert result is not None and result.step is Step.CLOSED
+        assert "status_unknown:BTCUSDT" not in stack.runtime.alerts
+
+    run(scenario)
+
+
+def test_status_unknown_clears_on_a_halt_read_and_on_close() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        halt(state)
+        state.fake.fault("exchange_info", "reject", code=-1000, times=100)
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.reason == "BTCUSDT status unknown: list kept"
+        assert "status_unknown:BTCUSDT" in stack.runtime.alerts
+        state.fake.faults.pop("exchange_info")
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.reason == "BTCUSDT is HALT: list kept"
+        assert "status_unknown:BTCUSDT" not in stack.runtime.alerts
+        assert "halted:BTCUSDT" in stack.runtime.alerts
+
+        # The position closes while the status is unreadable (here: as dust).
+        stack.runtime.alerts["status_unknown:BTCUSDT"] = "status of BTCUSDT unknown"
+        await stack.worker.protector._close_dust(position_id)
+        assert not [k for k in stack.runtime.alerts if k.endswith(":BTCUSDT")]
 
     run(scenario)
 
@@ -633,5 +663,78 @@ def test_write_off_closes_on_its_own_day_after_an_old_partial_sell() -> None:
         async with stack.runtime.session() as session:
             assert await losing_trades_today(session, "1001", "live", written_off) == 1
             assert await losing_trades_today(session, "1001", "live", sold_at) == 0
+
+    run(scenario)
+
+
+def test_a_slow_status_read_leaves_no_alert_on_a_position_closed_meanwhile() -> None:
+    # Review of #41: close_position read the status outside the position's
+    # lock; the TP filled and the reconciler closed the position while the
+    # read hung, then the failed read set status_unknown for a closed one.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        exits = Exits(stack.worker, feed(state))
+        position = await state.position(stack, position_id)
+        assert position.protection_list_id is not None
+        assert position.take_profit is not None
+        filters = stack.orders.filters
+        real_get = filters.get
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def slow_get(*args: Any, **kwargs: Any) -> Any:
+            entered.set()
+            await release.wait()
+            raise RuntimeError("exchangeInfo timed out")
+
+        filters.get = slow_get  # type: ignore[method-assign]
+        command = asyncio.create_task(exits.close_symbol("BTCUSDT"))
+        await entered.wait()
+        state.fake.fill_leg(
+            position.protection_list_id.replace("-pl", "-pt"),
+            position.quantity,
+            position.take_profit,
+        )
+        reconcile = asyncio.create_task(Reconciler(stack.worker).run())
+        await asyncio.sleep(0.2)  # the reconciler waits for the position's lock
+        release.set()
+        with pytest.raises(SymbolNotTrading, match="unknown"):
+            await command
+        filters.get = real_get  # type: ignore[method-assign]
+        await reconcile
+        position = await state.position(stack, position_id)
+        assert position.status == PositionStatus.CLOSED
+        assert "status_unknown:BTCUSDT" not in stack.runtime.alerts
+
+    run(scenario)
+
+
+def test_an_exit_of_a_position_closed_meanwhile_reads_no_status() -> None:
+    # Re-review of #41: the reconciler closed the position between
+    # close_position's check and the worker's lock; the worker then read the
+    # status of the closed position and a failed read left status_unknown.
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        position = await state.position(stack, position_id)
+        assert position.protection_list_id is not None
+        assert position.take_profit is not None
+        state.fake.fill_leg(
+            position.protection_list_id.replace("-pl", "-pt"),
+            position.quantity,
+            position.take_profit,
+        )
+        await Reconciler(stack.worker).run()
+        assert (await state.position(stack, position_id)).status == (
+            PositionStatus.CLOSED
+        )
+        reads = state.fake.calls_to("exchange_info")
+        state.fake.fault("exchange_info", "reject", code=-1000, times=100)
+        result = await stack.worker.close(
+            position_id, ExitReason.MANUAL, ExitMechanism.MANUAL_CLOSE
+        )
+        assert result.step is Step.CLOSED
+        assert state.fake.calls_to("exchange_info") == reads
+        assert "status_unknown:BTCUSDT" not in stack.runtime.alerts
 
     run(scenario)

@@ -520,12 +520,14 @@ def test_the_switch_takes_and_gives_back_the_lead_without_a_start() -> None:
         assert runtime.may_mutate() and len(seen) == 1
         assert runtime.heartbeat()["mode"] == "enabled"
         runtime.alerts["divergence:balance:ETHUSDT"] = "0.1 ETH held without a position"
+        runtime.alerts["status_unknown:ETHUSDT"] = "status of ETHUSDT unknown"
         runtime.configure(ExecutionSettings())
         assert runtime.admission_block() == "execution_off"
         await runtime.tick()
         assert runtime.lock is None and not runtime.may_mutate()
         assert runtime.context == ExecutionContext("1001", "live")
         assert "divergence:balance:ETHUSDT" not in runtime.alerts
+        assert "status_unknown:ETHUSDT" not in runtime.alerts
         other = state.runtime()
         other.configure(ENABLED)
         await other.prepare_start(network="live", params=USDT)

@@ -44,6 +44,13 @@ services:
 
   redis:
     image: redis:7-alpine
+    # AOF every second: the trading switch, the start snapshot and commands
+    # survive a crash, not only a clean stop. The named volume survives
+    # `compose down` (docs/EXECUTION_RUNBOOK.md §5.2); a stack whose Redis still
+    # writes to an anonymous volume moves to it in the deploy fence (3a).
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -148,3 +155,4 @@ services:
 volumes:
   app-db-data:
   agent-signal-log:
+  redis-data:
