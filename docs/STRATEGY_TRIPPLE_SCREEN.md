@@ -58,8 +58,8 @@ strategies/tripple_screen/strategy.py`, метод `_screen_universe`) была
 
 Секции ниже отражают версию v1.4.
 
-Документ описывает точный алгоритм стратегии для исполнителя. Разделы 1–8
-разделы 9–13 —
+Документ описывает точный алгоритм стратегии для исполнителя. Разделы 1–7 —
+сам алгоритм (отбор символов, экраны, BUY/HOLD, cooldown, выходы); разделы 8–12 —
 инженерные следствия (сигнальный контракт, данные, конфиг, критерии приёмки,
 границы).
 
@@ -74,7 +74,7 @@ strategies/tripple_screen/strategy.py`, метод `_screen_universe`) была
 - В формулах событий Экрана 2 индекс `t` обозначает бар оценки в последовательности
   закрытых H1-баров, `t−1` — предшествующий ему.
 - Все сравнения EMA — строгие (`>`). Пересечение порога oversold — по формуле
-  из §4.4 (с `≥`/`<`), как утверждено владельцем.
+  из §3.3 (с `≥`/`<`), как утверждено владельцем.
 - Все цены — `Decimal`; точная decimal/rounding policy и seed-конвенция EMA
   фиксируются индикаторной спецификацией с hand-calculated fixtures (`STRATEGY-05`).
 
@@ -117,7 +117,7 @@ flowchart TD
 | 1. REST-скан | на старте стратегии и на каждом H4-close | H4-снапшоты закрытых свечей для **всех** символов в исходном списке (universe), семафор `rest_concurrency` одновременных загрузок (конфиг, default 3, допустимо 3–5) |
 | 2. Slope-filter | на старте и каждый H4-close | `EMA(13)[1] > EMA(13)[2]` **И** `EMA(34)[1] > EMA(34)[2]` (строго, оба условия) → qualifiers |
 | 3. Top-N / WS-set | на старте и каждый H4-close | ранжирование qualifiers по силе тренда — относительный спред `(EMA(13)[1] − EMA(34)[1]) / EMA(34)[1]` (desc); top-N (`ws_top_n`, default 30) → WS-set. Символ с открытой позицией сохраняется в WS-set вне зависимости от ранга/прохождения slope-filter |
-| 4. Экран 1 | каждый H4-close | для WS-set: BullishTide = AND 5 условий (§4.2) |
+| 4. Экран 1 | каждый H4-close | для WS-set: BullishTide = AND 5 условий (§3.1) |
 | 5. Экраны 2–3 | каждый M15-close | только для BullishTide-символов: PullbackUp + M15-триггер → BUY / HOLD |
 
 Правила жизненного цикла WS-set:
@@ -231,7 +231,7 @@ BUY(symbol) = BullishTide(H4)                              # Экран 1
           ∧ EpochFresh(symbol, trigger_bar)                # §4.1
 ```
 
-- **BUY** → эмитируется ENTRY-сигнал (§9).
+- **BUY** → эмитируется ENTRY-сигнал (§8).
 - **SELL** — не существует: Spot, long-only, структурно нет short-пути.
 - **HOLD** — когда BUY не эмитирован, для BullishTide-символов, на каждом M15-close.
   Reason-коды: `no_pullback`, `no_trigger`, `position_open`, `cooldown`,
@@ -262,7 +262,7 @@ BUY(symbol) = BullishTide(H4)                              # Экран 1
 | Поток | Данные | Каденция |
 |---|---|---|
 | **Entry evaluation** (Экраны 1–3, BUY/HOLD) | только закрытые свечи из окна 1000 (`OWNER-KLINE-01`) | на каждом закрытии M15 (для BullishTide-символов) |
-| **Universe scan** (slope, top-N) | закрытые H4 + 24h quote volume snapshot | на каждом закрытии H4 |
+| **Universe scan** (slope, top-N) | закрытые H4: slope-filter и ранжирование по спреду EMA(13)/EMA(34) (§1.2) | на каждом закрытии H4 |
 | **Position monitoring** (стопы, трейлинг, TP) | **live-цена** (ticker / User Data Stream) + закрытые M15 для пересчёта трейлинга | непрерывно, пока позиция открыта |
 
 - Формирующийся Kline **никогда** не участвует во входной логике.
@@ -292,7 +292,8 @@ BUY(symbol) = BullishTide(H4)                              # Экран 1
   - Отсчёт — от timestamp exit fill.
   - Scope — per symbol.
   - **Персистентен через рестарт Engine** (Persist/Outbox lane, `STRATEGY-02`).
-  **Risk-level** значением и не является параметром стратегии.
+- 60 s из `DECISIONS.md` §3 — не этот cooldown: это **Risk-level** значение,
+  а не параметр стратегии (§10).
 - После отклонённого Risk-ом intent'а cooldown не начисляется; эпоха потреблена →
   `HOLD(epoch_consumed)` (§4.1).
 - Пока cooldown активен → `HOLD(cooldown)`.
