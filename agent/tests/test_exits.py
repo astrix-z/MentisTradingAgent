@@ -13,6 +13,7 @@ import pytest
 from execution_world import Stack, World, run
 from fake_exchange import SymbolRules
 from sqlalchemy import select
+from test_ledger import fill
 
 from agent.common.commands import HANDLERS, AgentCommand, CommandContext
 from agent.exchange.hub import StreamHub
@@ -22,7 +23,7 @@ from agent.execution.exits import (
     SymbolNotTrading,
     WriteOffRefused,
 )
-from agent.execution.ledger import losing_trades_today
+from agent.execution.ledger import lock_position, losing_trades_today
 from agent.execution.models import (
     ExecutionEvent,
     Fill,
@@ -440,6 +441,70 @@ def test_a_known_halt_is_not_read_again_every_round() -> None:
     run(scenario)
 
 
+def test_a_cached_halt_expires_without_an_invalidation() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        # The cache ages on the test's clock: nothing invalidates the halt.
+        stack.orders.filters._clock = lambda: state.clock.now().timestamp()
+        halt(state)
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.step is Step.WAITING
+        reads = state.fake.calls_to("exchange_info")
+        state.fake.rules["BTCUSDT"].status = "TRADING"
+        state.clock.advance(59)
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.step is Step.WAITING
+        assert state.fake.calls_to("exchange_info") == reads
+        state.clock.advance(2)
+        state.fake.set_price("BTCUSDT", Decimal(100))
+        result = await stack.worker.reprice(position_id, Decimal("99.5"))
+        assert result.step is Step.PROTECTED
+        assert "halted:BTCUSDT" not in stack.runtime.alerts
+
+    run(scenario)
+
+
+def test_the_guard_keeps_the_list_of_a_halted_symbol() -> None:
+    async def scenario(state: World) -> None:
+        stack, position_id = await limit_protected(state)
+        watch = feed(state)
+        exits = Exits(stack.worker, watch)
+        halt(state, "ETHUSDT")
+        watch._trades["ETHUSDT"] = LastTrade(Decimal(97), state.clock.now())
+        assert await exits.check_guard(position_id) is None  # grace starts
+        state.clock.advance(6)
+        watch._trades["ETHUSDT"] = LastTrade(Decimal(97), state.clock.now())
+        result = await exits.check_guard(position_id)
+        assert result is not None and result.step is Step.WAITING
+        await kept(state, stack, position_id)
+
+    run(scenario)
+
+
+def test_a_restart_with_an_unknown_status_withdraws_the_unsent_cancel() -> None:
+    async def scenario(state: World) -> None:
+        first = await state.stack()
+        position_id = await state.protected(first)
+        # Recorded, then the process died before the cancel went out.
+        await first.worker._record(
+            position_id, Operation.EXIT, {"reason": "time", "mechanism": "market_time"}
+        )
+        await state.kill(first)
+        second = await state.stack()
+        state.fake.fault("exchange_info", "reject", code=-1000, times=100)
+        result = await second.worker.resume(position_id)
+        assert result.step is Step.WAITING
+        assert "status unknown" in (result.reason or "")
+        await kept(state, second, position_id)
+        assert not [k for k in second.runtime.alerts if k.startswith("overdue:")]
+        state.fake.faults.pop("exchange_info")
+        result = await Exits(second.worker, feed(state)).close_symbol("BTCUSDT")
+        assert result.step is Step.CLOSED
+
+    run(scenario)
+
+
 # --- write-off of a delisted symbol's position (ClickUp 869fjdy10) -----------------------
 
 
@@ -663,6 +728,60 @@ def test_write_off_closes_on_its_own_day_after_an_old_partial_sell() -> None:
         async with stack.runtime.session() as session:
             assert await losing_trades_today(session, "1001", "live", written_off) == 1
             assert await losing_trades_today(session, "1001", "live", sold_at) == 0
+
+    run(scenario)
+
+
+def test_a_sell_after_the_write_off_moves_the_close_and_revalue_keeps_it() -> None:
+    async def scenario(state: World) -> None:
+        stack = await state.stack()
+        position_id = await state.protected(stack)
+        async with stack.runtime.session() as session, session.begin():
+            position = await lock_position(session, position_id)
+            await stack.applier.apply(
+                session,
+                position,
+                [
+                    fill(
+                        9000,
+                        order_id=9000,
+                        side="SELL",
+                        qty="0.001",
+                        price="100",
+                        commission="0",
+                        at=state.clock.now(),
+                    )
+                ],
+            )
+        state.clock.advance(2 * 86400)
+        delist(state, stack)
+        await Exits(stack.worker, feed(state)).write_off("BTCUSDT", confirm="BTCUSDT")
+        written_off = (await state.position(stack, position_id)).closed_at
+        assert written_off is not None
+        # The exchange reports the SELL a day after the write-off.
+        later = written_off + timedelta(days=1)
+        async with stack.runtime.session() as session, session.begin():
+            position = await lock_position(session, position_id)
+            sell = await session.scalar(
+                select(Fill).where(Fill.position_id == position_id, Fill.side == "SELL")
+            )
+            assert sell is not None
+            sell.trade_time = later
+            await stack.finalizer.retime(session, position)
+            await stack.finalizer.revalue(session, position)
+        position = await state.position(stack, position_id)
+        assert position.closed_at == later
+        assert position.outcome is not None
+        assert datetime.fromisoformat(position.outcome["closed_at"]) == later
+        async with stack.runtime.session() as session:
+            assert await losing_trades_today(session, "1001", "live", written_off) == 0
+            assert await losing_trades_today(session, "1001", "live", later) == 1
+            cooldown = await session.scalar(
+                select(SymbolCooldown.cooldown_until).where(
+                    SymbolCooldown.position_id == position_id
+                )
+            )
+        assert cooldown is not None and cooldown > later
 
     run(scenario)
 
