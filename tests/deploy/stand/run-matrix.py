@@ -1638,21 +1638,36 @@ def held_start_scenario(stand: Stand, journal: Journal) -> None:
     monitor = subprocess.Popen(
         [
             str(stand.ssh),
-            f"cd {APP} && timeout 30 {COMPOSE} exec -T redis redis-cli MONITOR",
+            f"cd {APP} && timeout 60 {COMPOSE} exec -T redis redis-cli MONITOR",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
     )
-    time.sleep(1)
+    seen: list[str] = []
+    reader = threading.Thread(
+        target=lambda: seen.extend(line.rstrip() for line in monitor.stdout or ()),
+        daemon=True,
+    )
+    reader.start()
+    # The pause is lifted only once MONITOR is seen to listen: on a loaded stand
+    # ssh + compose exec can take longer than any fixed sleep, and the EVAL would
+    # pass unseen (the 2026-10-19 run: 503, but no EVAL in MONITOR).
+    since = time.monotonic()
+    while time.monotonic() - since < 30 and not any('"PING"' in s for s in seen):
+        stand.compose("exec -T redis redis-cli PING", check=False)
+        time.sleep(0.5)
+    listening = any('"PING"' in s for s in seen)
+    attached = time.monotonic() - since
     stand.sh("rm -f ~/stand-state/pause-start")
     request.join(60)
     time.sleep(1)
     monitor.terminate()
-    seen, _ = monitor.communicate(timeout=30)
+    monitor.wait(30)
+    reader.join(10)
     evals = [
         line
-        for line in seen.splitlines()
+        for line in seen
         if '"eval' in line.lower() and "trading:start_fence" in line
     ]
     code, body = answer.get("r", (None, None))
@@ -1675,6 +1690,7 @@ def held_start_scenario(stand: Stand, journal: Journal) -> None:
         stand.state(),
         {
             "Start удержан перед записью": held,
+            "MONITOR слушал до снятия паузы": listening,
             "ответ 503": code == 503,
             "один EVAL записи (код -1), без повторов": len(evals) == 1,
             "поток команд не вырос": stream_before == stream_after,
@@ -1683,7 +1699,8 @@ def held_start_scenario(stand: Stand, journal: Journal) -> None:
         "Удержание — хук стенда (`tests/deploy/stand/hooks/sitecustomize.py`, override "
         "`stand-hooks.yml`) перед `_apply_command`; отказ дал Lua-скрипт записи "
         "(`COMMIT_RUNTIME_LUA`), код продукта не менялся.",
-        f"ответ: {body}; EVAL с ключом флага после снятия паузы: {len(evals)}",
+        f"ответ: {body}; EVAL с ключом флага после снятия паузы: {len(evals)}; "
+        f"MONITOR слушал через {attached:.1f} с, строк: {len(seen)}",
     )
 
 
