@@ -21,7 +21,7 @@ from typing import Any, Literal
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from agent.exchange import (
     ExchangeError,
@@ -137,6 +137,9 @@ class Engine:
         #: Without real execution the strategy hears of its virtual positions
         #: (the tracker's ENTRY/EXIT) instead (ClickUp 869f6m7vg).
         self._virtual_feedback = False
+        #: The read-only Binance market DB, handed to strategies that read it
+        #: (set by ``agent.main``; ``None`` when not configured).
+        self.market_db: AsyncEngine | None = None
 
         # SDK-backed services for the current run.
         self._rest: ExchangeRest | None = None
@@ -359,6 +362,7 @@ class Engine:
                 rest=rest,
                 streams=self._streams,
                 emit=self._on_signal,
+                market_db=self.market_db,
             )
             await strategy_obj.on_start(services)
             await self._replay_startup_feedback(strategy_obj)

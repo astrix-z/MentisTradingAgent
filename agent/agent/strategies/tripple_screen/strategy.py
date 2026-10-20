@@ -57,7 +57,7 @@ class TripleScreenStrategy(Strategy):
 
     def __init__(self, params: dict[str, Any]) -> None:
         super().__init__(params)
-        self._settings = TripleScreenSettings.from_params(params)
+        self._settings = self._parse_settings(params)
         self._config_version = hashlib.sha256(
             self._settings.model_dump_json().encode()
         ).hexdigest()
@@ -82,6 +82,10 @@ class TripleScreenStrategy(Strategy):
         self._rescreen_error = ""
         #: Outcome of the last stage-1 screen, for the Indicators Monitor.
         self._screening: dict[str, Any] | None = None
+
+    def _parse_settings(self, params: dict[str, Any]) -> TripleScreenSettings:
+        """The run's settings; a variant with its own model overrides this."""
+        return TripleScreenSettings.from_params(params)
 
     @property
     def settings(self) -> TripleScreenSettings:
@@ -269,10 +273,11 @@ class TripleScreenStrategy(Strategy):
         """
         settings = self.settings
         _, mid_period, slow_period = settings.ema_tide_periods
+        excluded = await self._screen_exclusions()
         semaphore = asyncio.Semaphore(settings.rest_concurrency)
         cutoff = int(datetime.now(UTC).timestamp() * 1000) - 1
         # Why each symbol stayed out, for the Indicators Monitor.
-        skipped: dict[str, str] = {}
+        skipped: dict[str, str] = dict(excluded)
 
         async def screen_one(symbol: str) -> tuple[str, Decimal] | None:
             # A REST failure here propagates (via gather) exactly like a
@@ -327,7 +332,7 @@ class TripleScreenStrategy(Strategy):
             return symbol, (mid_now - slow_now) / slow_now
 
         results = await asyncio.gather(
-            *(screen_one(symbol) for symbol in self._universe)
+            *(screen_one(symbol) for symbol in self._universe if symbol not in excluded)
         )
         qualifiers = sorted(
             (item for item in results if item is not None),
@@ -364,6 +369,10 @@ class TripleScreenStrategy(Strategy):
             sorted(selected),
         )
         return selected
+
+    async def _screen_exclusions(self) -> dict[str, str]:
+        """Symbols a subclass rules out before the tide screen, with why."""
+        return {}
 
     async def _apply_selection(self, selected: set[str]) -> None:
         """Stage 2: wire newly-admitted symbols, unwire dropped ones."""

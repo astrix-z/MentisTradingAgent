@@ -29,3 +29,4 @@ __all__ = [
 # Import concrete strategies so their decorators run and fill the registry.
 # Keep this at the bottom to avoid circular imports.
 import agent.strategies.tripple_screen  # noqa: E402, F401
+import agent.strategies.tripple_screen_v2  # noqa: E402, F401

@@ -17,13 +17,16 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import BaseModel
 
 from agent.exchange.rest import ExchangeRest
 from agent.exchange.streams import MarketStreams
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncEngine
 
 SignalType = Literal["ENTRY", "EXIT", "HOLD"]
 
@@ -240,6 +243,10 @@ class StrategyServices:
     rest: ExchangeRest
     streams: MarketStreams
     emit: SignalSink
+    #: The read-only Binance market/history DB (``BINANCE_DB_URL``), or
+    #: ``None`` when it is not configured. Strategies that need it must
+    #: refuse to start without it.
+    market_db: AsyncEngine | None = None
 
 
 class Strategy(abc.ABC):

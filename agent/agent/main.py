@@ -376,6 +376,7 @@ async def run() -> None:
         schema_ready=schema_ready,
     )
     engine.execution = runtime
+    engine.market_db = db.external_engine()
     runtime.feedback = engine.position_feedback
     execution = build_execution(runtime, engine.hub)
     # The owner's real-trading switch, before the resume can start anything.
